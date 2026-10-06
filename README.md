@@ -3,8 +3,12 @@
 ## Development
 
 The repository pins its development toolchain with `mise`.
-The baseline checks use `hk`, `jactionlint`, `shellcheck`, and `zizmor`.
+The baseline checks use `hk`, `betterleaks`, `jactionlint`, `shellcheck`, and
+`zizmor`.
 GitHub Actions policy is defined in `.github/jactionlint.yaml`.
+Repository hygiene checks enforce LF line endings, final newlines, executable
+shebang consistency, conflict-free filenames and contents, valid symlinks,
+secret detection, and a 500 KiB file-size ceiling.
 
 On macOS or Linux:
 
