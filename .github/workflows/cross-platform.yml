@@ -1,0 +1,47 @@
+name: Cross-platform runners
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-platform-runners
+  cancel-in-progress: true
+
+jobs:
+  run:
+    name: Run on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.10.3
+          install_args: --locked
+
+      - name: Show pinned toolchain
+        run: |
+          mise --version
+          hk --version
+
+      - name: Run checks
+        run: mise run ci
+        env:
+          GH_TOKEN: ${{ github.token }}

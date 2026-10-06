@@ -1,0 +1,14 @@
+amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
+
+steps {
+  ["actionlint"] = Builtins.actionlint
+  ["shellcheck"] = (Builtins.shellcheck) {
+    exclude = List("bin/mise")
+  }
+  ["zizmor"] = (Builtins.zizmor) {
+    check = "zizmor --pedantic --no-progress {{files}}"
+  }
+  ["trailing_whitespace"] = Builtins.trailing_whitespace
+  ["newlines"] = Builtins.newlines
+}
