@@ -3,7 +3,8 @@
 ## Development
 
 The repository pins its development toolchain with `mise`.
-The baseline checks use `hk`, `actionlint`, `shellcheck`, and `zizmor`.
+The baseline checks use `hk`, `jactionlint`, `shellcheck`, and `zizmor`.
+GitHub Actions policy is defined in `.github/jactionlint.yaml`.
 
 On macOS or Linux:
 

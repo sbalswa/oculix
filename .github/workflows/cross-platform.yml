@@ -10,6 +10,10 @@ concurrency:
   group: cross-platform-runners
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   run:
     name: Run on ${{ matrix.os }}

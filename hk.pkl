@@ -2,7 +2,10 @@ amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pk
 import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
 
 steps {
-  ["actionlint"] = Builtins.actionlint
+  ["jactionlint"] {
+    glob = List(".github/workflows/*.yml", ".github/workflows/*.yaml")
+    check = "jactionlint {{files}}"
+  }
   ["shellcheck"] = (Builtins.shellcheck) {
     exclude = List("bin/mise")
   }
