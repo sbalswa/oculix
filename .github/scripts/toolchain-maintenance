@@ -77,6 +77,18 @@ current_mise_version() {
   ' .github/workflows/cross-platform.yml
 }
 
+assert_mise_version() {
+  local expected actual
+
+  expected="$(current_mise_version)"
+  actual="$(mise --version | awk '{ print $1 }')"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Running mise %s does not match the checked-in pin %s.\n' \
+      "$actual" "$expected" >&2
+    return 1
+  fi
+}
+
 backend_repository() {
   local backend="$1"
 
@@ -216,16 +228,23 @@ create_pull_request() {
 update_mise_pins() {
   local current="$1"
   local candidate="$2"
-  local file expected=0 updated=0
+  local file action_count pin_count expected=0 updated=0
 
   while IFS= read -r file; do
-    ((expected += 1))
-    if grep -q -E "^[[:space:]]*version: ${current}$" "$file"; then
-      sed -i -E \
-        "s/^([[:space:]]*version: )${current}$/\\1${candidate}/" \
-        "$file"
-      ((updated += 1))
+    action_count="$(grep -c 'uses: jdx/mise-action@' "$file")"
+    pin_count="$(
+      grep -c -E "^[[:space:]]*version: ${current}$" "$file"
+    )"
+    if [[ "$pin_count" -ne "$action_count" ]]; then
+      printf '%s contains %s mise actions but %s matching pins.\n' \
+        "$file" "$action_count" "$pin_count" >&2
+      return 1
     fi
+    sed -i -E \
+      "s/^([[:space:]]*version: )${current}$/\\1${candidate}/" \
+      "$file"
+    ((expected += action_count))
+    ((updated += pin_count))
   done < <(
     grep -l 'uses: jdx/mise-action@' .github/workflows/*.yml
   )
@@ -334,6 +353,7 @@ prepare_tools() {
   local branch digest pr body tool current candidate head_sha
 
   checkout_base "$base"
+  assert_mise_version
   collect_tool_updates
   if [[ -z "$tool_updates" ]]; then
     set_output changed false
@@ -409,11 +429,28 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
 mark_ready() {
   local pr="${PR_NUMBER:?PR_NUMBER is required}"
   local head_sha="${HEAD_SHA:?HEAD_SHA is required}"
-  local data title is_draft
+  local data title is_draft pr_head_sha pr_head_branch
 
   if [[ "$dry_run" == "true" ]]; then
     printf 'Would mark PR #%s ready.\n' "$pr"
     return
+  fi
+
+  data="$(
+    gh pr view \
+      "$pr" \
+      --repo "$repository" \
+      --json title,isDraft,headRefName,headRefOid
+  )" || return
+  title="$(jq -r '.title' <<<"$data")"
+  is_draft="$(jq -r '.isDraft' <<<"$data")"
+  pr_head_sha="$(jq -r '.headRefOid' <<<"$data")"
+  pr_head_branch="$(jq -r '.headRefName' <<<"$data")"
+  if [[ "$head_sha" != "${GITHUB_SHA:?GITHUB_SHA is required}" ||
+        "$pr_head_sha" != "$head_sha" ||
+        "$pr_head_branch" != "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}" ]]; then
+    printf 'Validation no longer matches the current PR head.\n' >&2
+    return 1
   fi
 
   gh api \
@@ -423,27 +460,49 @@ mark_ready() {
     -f context="toolchain-maintenance / cross-platform" \
     -f description="Ubuntu, macOS, and Windows passed without warnings" \
     -f target_url="${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}" \
-    >/dev/null
-  data="$(
-    gh pr view \
-      "$pr" \
-      --repo "$repository" \
-      --json title,isDraft
-  )"
-  title="$(jq -r '.title' <<<"$data")"
-  is_draft="$(jq -r '.isDraft' <<<"$data")"
+    >/dev/null || return
   if [[ "$is_draft" == "true" ]]; then
-    gh pr ready "$pr" --repo "$repository"
+    gh pr ready "$pr" --repo "$repository" || return
   elif [[ "$title" == "[HOLD] "* ]]; then
     gh pr edit \
       "$pr" \
       --repo "$repository" \
-      --title "${title#"[HOLD] "}"
+      --title "${title#"[HOLD] "}" || return
+  fi
+}
+
+upsert_issue() {
+  local body="$1"
+  local existing
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would report maintenance problems:\n%s\n' "$body"
+    return
+  fi
+
+  existing="$(
+    gh issue list \
+      --repo "$repository" \
+      --state open \
+      --search "\"${issue_title}\" in:title" \
+      --json number,title \
+      --jq ".[] |
+        select(.title == \"${issue_title}\") |
+        .number" |
+      head -n 1
+  )"
+  if [[ -n "$existing" ]]; then
+    gh issue comment "$existing" --repo "$repository" --body "$body"
+  else
+    gh issue create \
+      --repo "$repository" \
+      --title "$issue_title" \
+      --body "$body"
   fi
 }
 
 report_run() {
-  local jobs failures="" warning_lines="" check_url annotations found existing body
+  local jobs failures="" warning_lines="" check_url annotations found body
 
   jobs="$(
     gh api \
@@ -488,32 +547,44 @@ report_run() {
   if [[ -n "$warning_lines" ]]; then
     body+=$'\n\nWarnings:\n'"${warning_lines}"
   fi
+  upsert_issue "$body"
+  return 1
+}
 
-  if [[ "$dry_run" == "true" ]]; then
-    printf 'Would report maintenance problems:\n%s\n' "$body"
+complete_validation() {
+  local phase="${MAINTENANCE_PHASE:?MAINTENANCE_PHASE is required}"
+  local age="${MINIMUM_RELEASE_AGE_DAYS:-7}"
+  local body
+
+  report_run
+  if ! mark_ready; then
+    body="Failed to finalize PR #${PR_NUMBER}.
+
+Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+    upsert_issue "$body"
     return 1
   fi
 
-  existing="$(
-    gh issue list \
+  if [[ "$phase" == "mise" ]]; then
+    if [[ "$dry_run" == "true" ]]; then
+      printf 'Would dispatch tool phase from %s.\n' "$GITHUB_REF_NAME"
+    elif ! gh workflow run toolchain-maintenance.yml \
       --repo "$repository" \
-      --state open \
-      --search "\"${issue_title}\" in:title" \
-      --json number,title \
-      --jq ".[] |
-        select(.title == \"${issue_title}\") |
-        .number" |
-      head -n 1
-  )"
-  if [[ -n "$existing" ]]; then
-    gh issue comment "$existing" --repo "$repository" --body "$body"
-  else
-    gh issue create \
-      --repo "$repository" \
-      --title "$issue_title" \
-      --body "$body"
+      --ref "$GITHUB_REF_NAME" \
+      -f phase=tools \
+      -f base_branch="$GITHUB_REF_NAME" \
+      -f bottom_pr="$PR_NUMBER" \
+      -f minimum_release_age_days="$age"; then
+      body="Failed to dispatch tool updates from \`${GITHUB_REF_NAME}\`.
+
+Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+      upsert_issue "$body"
+      return 1
+    fi
+  elif [[ "$phase" != "tools" ]]; then
+    printf 'Unknown maintenance phase: %s\n' "$phase" >&2
+    return 1
   fi
-  return 1
 }
 
 checked() {
@@ -564,6 +635,9 @@ case "${1:-}" in
     ;;
   report-run)
     report_run
+    ;;
+  complete-validation)
+    complete_validation
     ;;
   *)
     printf 'Unknown toolchain maintenance command: %s\n' "${1:-}" >&2

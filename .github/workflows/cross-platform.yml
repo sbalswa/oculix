@@ -1,23 +1,40 @@
 name: Cross-platform runners
-run-name: Cross-platform runners on ${{ inputs.ref || github.head_ref || github.ref_name }}
+run-name: Cross-platform runners on ${{ github.head_ref || github.ref_name }}
 
 on:
   pull_request:
     types:
       - synchronize
-  workflow_call:
-    inputs:
-      ref:
-        description: Git ref to validate
-        required: true
-        type: string
   workflow_dispatch:
+    inputs:
+      maintenance_phase:
+        description: Internal toolchain maintenance phase
+        required: false
+        default: none
+        type: choice
+        options:
+          - none
+          - mise
+          - tools
+      pr_number:
+        description: Internal toolchain maintenance PR number
+        required: false
+        type: string
+      head_sha:
+        description: Internal toolchain maintenance commit
+        required: false
+        type: string
+      minimum_release_age_days:
+        description: Internal toolchain release waiting period
+        required: false
+        default: "7"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: cross-platform-runners-${{ inputs.ref || github.ref }}
+  group: cross-platform-runners-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -47,7 +64,6 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Install pinned toolchain
@@ -60,6 +76,18 @@ jobs:
         run: |
           ci_log="${RUNNER_TEMP//\\//}/oculix-ci.log"
           trap 'rm -f "$ci_log"' EXIT
+          expected_mise="$(
+            awk '
+              /uses: jdx\/mise-action@/ { found = 1; next }
+              found && $1 == "version:" { print $2; exit }
+            ' .github/workflows/cross-platform.yml
+          )"
+          actual_mise="$(mise --version | awk '{ print $1 }')"
+          if [[ "$actual_mise" != "$expected_mise" ]]; then
+            printf 'Running mise %s does not match the checked-in pin %s.\n' \
+              "$actual_mise" "$expected_mise" >&2
+            exit 1
+          fi
           mise run ci 2>&1 | tee "$ci_log"
           warnings="$(
             grep -Ei \
@@ -74,3 +102,37 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+
+  finalize:
+    name: Finalize toolchain validation
+    needs: run
+    if: >-
+      ${{
+        always() &&
+        inputs.maintenance_phase != '' &&
+        inputs.maintenance_phase != 'none'
+      }}
+    permissions:
+      actions: write # Dispatch the tool phase after mise validation.
+      checks: read # Reject warning annotations from this run.
+      contents: read # Read the trusted maintenance script.
+      issues: write # Report failed or warning validation.
+      pull-requests: write # Mark the validated PR ready.
+      statuses: write # Record validation on the candidate commit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out candidate branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Finalize validation
+        run: .github/scripts/toolchain-maintenance checked complete-validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          MAINTENANCE_PHASE: ${{ inputs.maintenance_phase }}
+          MINIMUM_RELEASE_AGE_DAYS: ${{ inputs.minimum_release_age_days }}
+          PR_NUMBER: ${{ inputs.pr_number }}
