@@ -37,4 +37,8 @@ run = "hk check --all"
 
 [tasks.oculix]
 description = "Run the basic Oculix smoke script"
+# Force a POSIX shell: mise's default inline shell on Windows is cmd, which
+# would not expand "$(mise where ...)" or the *.jar glob (git-bash ships on
+# all three runners, so this stays OS-agnostic and matches local == CI).
+shell = "bash -c"
 run = 'java -jar "$(mise where http:oculixide)"/*.jar -c -r basic.sikuli'
