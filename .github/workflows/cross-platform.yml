@@ -80,10 +80,15 @@ jobs:
           fi
           mise run ci 2>&1 | tee "$ci_log"
           warnings="$(
-            grep -Ei \
-              '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' \
-              "$ci_log" |
-              grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
+            awk '
+              {
+                normalized = tolower($0)
+                gsub(/(^|[^[:digit:]])0 warnings?([^[:alnum:]_]|$)/, "", normalized)
+                if (normalized ~ /::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)/) {
+                  print
+                }
+              }
+            ' "$ci_log"
           )"
           if [[ -n "$warnings" ]]; then
             printf '%s\n' "$warnings" >&2
