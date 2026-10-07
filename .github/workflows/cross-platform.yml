@@ -1,13 +1,23 @@
 name: Cross-platform runners
+run-name: Cross-platform runners on ${{ inputs.ref || github.head_ref || github.ref_name }}
 
 on:
+  pull_request:
+    types:
+      - synchronize
+  workflow_call:
+    inputs:
+      ref:
+        description: Git commit to validate
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: cross-platform-runners
+  group: cross-platform-runners-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -16,6 +26,11 @@ defaults:
 
 jobs:
   run:
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        startsWith(github.head_ref, 'automation/toolchain/')
+      }}
     name: Run on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
@@ -32,15 +47,54 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
+
+      - name: Read repository mise pin
+        id: mise
+        run: |
+          version="$(
+            sed -n 's/^min_version = "\([^"]*\)"$/\1/p' mise.toml
+          )"
+          if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){2,3}$ ]]; then
+            echo "mise.toml must contain one numeric min_version." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
 
       - name: Install pinned toolchain
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
-          version: 2026.10.3
+          version: ${{ steps.mise.outputs.version }}
           install_args: --locked
 
-      - name: Run checks
-        run: mise run ci
+      - name: Run checks without warnings
+        run: |
+          ci_log="${RUNNER_TEMP//\\//}/oculix-ci.log"
+          trap 'rm -f "$ci_log"' EXIT
+          actual_mise="$(mise --version | awk '{ print $1 }')"
+          if [[ "$actual_mise" != "$EXPECTED_MISE" ]]; then
+            printf 'Running mise %s does not match the checked-in pin %s.\n' \
+              "$actual_mise" "$EXPECTED_MISE" >&2
+            exit 1
+          fi
+          mise run ci 2>&1 | tee "$ci_log"
+          warnings="$(
+            awk '
+              {
+                normalized = tolower($0)
+                gsub(/(^|[^[:digit:]])0 warnings?([^[:alnum:]_]|$)/, "", normalized)
+                if (normalized ~ /::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)/) {
+                  print
+                }
+              }
+            ' "$ci_log"
+          )"
+          if [[ -n "$warnings" ]]; then
+            printf '%s\n' "$warnings" >&2
+            echo "Warnings are treated as failures." >&2
+            exit 1
+          fi
         env:
+          EXPECTED_MISE: ${{ steps.mise.outputs.version }}
           GH_TOKEN: ${{ github.token }}
