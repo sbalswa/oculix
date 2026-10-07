@@ -1,0 +1,248 @@
+name: Toolchain maintenance
+run-name: Toolchain maintenance from ${{ github.event_name }}
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      minimum_release_age_days:
+        description: Minimum age of a release before it is eligible
+        required: false
+        default: "7"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: toolchain-maintenance
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan update
+    permissions:
+      contents: read # Read the checked-out toolchain pins.
+      pull-requests: read # Avoid overlapping open update cycles.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      blocked: ${{ steps.plan.outputs.blocked }}
+      mise_candidate: ${{ steps.plan.outputs.mise_candidate }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.10.3
+          install: false
+          cache: false
+
+      - name: Find eligible updates
+        id: plan
+        run: .github/scripts/toolchain-maintenance checked plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_MIN_AGE_DAYS: >-
+            ${{ inputs.minimum_release_age_days ||
+                vars.TOOLCHAIN_MIN_AGE_DAYS ||
+                '7' }}
+
+  prepare_mise:
+    name: Prepare mise update
+    needs: plan
+    if: ${{ needs.plan.outputs.blocked != 'true' && needs.plan.outputs.mise_candidate != '' }}
+    permissions:
+      contents: write # Create the mise update branch.
+      pull-requests: write # Create its held or draft PR.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      branch: ${{ steps.prepare.outputs.branch }}
+      changed: ${{ steps.prepare.outputs.changed }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.10.3
+          install: false
+          cache: false
+
+      - name: Create mise update
+        id: prepare
+        run: .github/scripts/toolchain-maintenance checked prepare-mise
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MISE_CANDIDATE: ${{ needs.plan.outputs.mise_candidate }}
+          TOOLCHAIN_MIN_AGE_DAYS: >-
+            ${{ inputs.minimum_release_age_days ||
+                vars.TOOLCHAIN_MIN_AGE_DAYS ||
+                '7' }}
+
+  validate_mise:
+    name: Validate mise update
+    needs: prepare_mise
+    if: ${{ needs.prepare_mise.outputs.changed == 'true' }}
+    permissions:
+      contents: read
+    uses: $/.github/workflows/cross-platform.yml
+    with:
+      ref: ${{ needs.prepare_mise.outputs.branch }}
+
+  ready_mise:
+    name: Mark mise update ready
+    needs:
+      - prepare_mise
+      - validate_mise
+    if: ${{ needs.validate_mise.result == 'success' }}
+    permissions:
+      contents: read # Read the maintenance script.
+      pull-requests: write # Mark the validated PR ready.
+      statuses: write # Record validation on the candidate commit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mark PR ready
+        run: .github/scripts/toolchain-maintenance checked ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.prepare_mise.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.prepare_mise.outputs.pr_number }}
+
+  prepare_tools:
+    name: Prepare tool updates
+    needs:
+      - plan
+      - prepare_mise
+      - validate_mise
+      - ready_mise
+    if: >-
+      ${{
+        always() &&
+        needs.plan.result == 'success' &&
+        needs.plan.outputs.blocked != 'true' &&
+        (
+          needs.prepare_mise.result == 'skipped' ||
+          needs.ready_mise.result == 'success'
+        )
+      }}
+    permissions:
+      contents: write # Create the tool update branch and lockfile.
+      pull-requests: write # Create and stack its held or draft PR.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      branch: ${{ steps.prepare.outputs.branch }}
+      changed: ${{ steps.prepare.outputs.changed }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.10.3
+          install: false
+          cache: false
+
+      - name: Create tool updates
+        id: prepare
+        run: .github/scripts/toolchain-maintenance checked prepare-tools
+        env:
+          BASE_BRANCH: >-
+            ${{ needs.prepare_mise.outputs.branch ||
+                github.event.repository.default_branch }}
+          BOTTOM_PR: ${{ needs.prepare_mise.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_MIN_AGE_DAYS: >-
+            ${{ inputs.minimum_release_age_days ||
+                vars.TOOLCHAIN_MIN_AGE_DAYS ||
+                '7' }}
+
+  validate_tools:
+    name: Validate tool updates
+    needs: prepare_tools
+    if: ${{ needs.prepare_tools.outputs.changed == 'true' }}
+    permissions:
+      contents: read
+    uses: $/.github/workflows/cross-platform.yml
+    with:
+      ref: ${{ needs.prepare_tools.outputs.branch }}
+
+  ready_tools:
+    name: Mark tool updates ready
+    needs:
+      - prepare_tools
+      - validate_tools
+    if: ${{ needs.validate_tools.result == 'success' }}
+    permissions:
+      contents: read # Read the maintenance script.
+      pull-requests: write # Mark the validated PR ready.
+      statuses: write # Record validation on the candidate commit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mark PR ready
+        run: .github/scripts/toolchain-maintenance checked ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.prepare_tools.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.prepare_tools.outputs.pr_number }}
+
+  report:
+    name: Report failures or warnings
+    needs:
+      - plan
+      - prepare_mise
+      - validate_mise
+      - ready_mise
+      - prepare_tools
+      - validate_tools
+      - ready_tools
+    if: ${{ always() }}
+    permissions:
+      actions: read # Inspect every job in this maintenance run.
+      checks: read # Inspect warning annotations.
+      contents: read # Read the maintenance script.
+      issues: write # Create or update the triage issue.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report problems
+        run: .github/scripts/toolchain-maintenance report-run
+        env:
+          GH_TOKEN: ${{ github.token }}

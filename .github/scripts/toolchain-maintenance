@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+readonly branch_prefix="automation/toolchain/"
+readonly issue_title="Toolchain maintenance needs triage"
+readonly minimum_age_days="${TOOLCHAIN_MIN_AGE_DAYS:-7}"
+readonly dry_run="${TOOLCHAIN_DRY_RUN:-false}"
+
+default_branch="$(gh api "repos/${repository}" --jq '.default_branch')"
+readonly default_branch
+
+created_pr=""
+tool_updates=""
+
+set_output() {
+  local name="$1"
+  local value="$2"
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    printf '%s=%s\n' "$name" "$value" >>"$GITHUB_OUTPUT"
+  else
+    printf '%s=%s\n' "$name" "$value"
+  fi
+}
+
+version_is_greater() {
+  local candidate="$1"
+  local current="$2"
+
+  [[ "$candidate" != "$current" ]] &&
+    [[ "$(printf '%s\n%s\n' "$candidate" "$current" | sort -V | tail -n 1)" == "$candidate" ]]
+}
+
+latest_eligible_release() {
+  local release_repository="$1"
+  local current="$2"
+  local cutoff best="" tag published version published_epoch
+
+  cutoff="$(date -u -d "${minimum_age_days} days ago" +%s)"
+  while IFS=$'\t' read -r tag published; do
+    version="${tag#v}"
+    if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){1,3}$ ]]; then
+      continue
+    fi
+
+    published_epoch="$(date -u -d "$published" +%s)"
+    if ((published_epoch > cutoff)) || ! version_is_greater "$version" "$current"; then
+      continue
+    fi
+    if [[ -z "$best" ]] || version_is_greater "$version" "$best"; then
+      best="$version"
+    fi
+  done < <(
+    gh api \
+      --method GET \
+      "repos/${release_repository}/releases" \
+      -f per_page=100 \
+      --jq '.[] |
+        select(
+          .draft == false and
+          .prerelease == false and
+          .published_at != null
+        ) |
+        [.tag_name, .published_at] |
+        @tsv'
+  )
+
+  printf '%s' "$best"
+}
+
+current_mise_version() {
+  awk '
+    /uses: jdx\/mise-action@/ { found = 1; next }
+    found && $1 == "version:" { print $2; exit }
+  ' .github/workflows/cross-platform.yml
+}
+
+backend_repository() {
+  local backend="$1"
+
+  case "$backend" in
+    aqua:* | github:*)
+      printf '%s' "${backend#*:}"
+      ;;
+    packslip:github.com/*)
+      printf '%s' "${backend#packslip:github.com/}"
+      ;;
+    *)
+      printf 'Unsupported mise backend: %s\n' "$backend" >&2
+      return 1
+      ;;
+  esac
+}
+
+project_tools() {
+  local config_path
+
+  config_path="$(realpath mise.toml)"
+  mise config ls --json |
+    jq -r --arg path "$config_path" \
+      '.[] | select(.path == $path) | .tools[]'
+}
+
+current_tool_version() {
+  local tool="$1"
+  local config_path
+
+  config_path="$(realpath mise.toml)"
+  mise ls --current --json |
+    jq -r \
+      --arg tool "$tool" \
+      --arg path "$config_path" \
+      '.[$tool][] |
+        select(.source.path == $path) |
+        .requested_version'
+}
+
+collect_tool_updates() {
+  local tool current backend release_repository candidate
+
+  tool_updates=""
+  while IFS= read -r tool; do
+    current="$(current_tool_version "$tool")"
+    backend="$(mise tool "$tool" --backend)"
+    release_repository="$(backend_repository "$backend")"
+    candidate="$(latest_eligible_release "$release_repository" "$current")"
+    if [[ -n "$candidate" ]]; then
+      tool_updates+="${tool}"$'\t'"${current}"$'\t'"${candidate}"$'\n'
+    fi
+  done < <(project_tools)
+  tool_updates="${tool_updates%$'\n'}"
+}
+
+configure_git() {
+  gh auth setup-git
+  git config user.name "github-actions[bot]"
+  git config user.email \
+    "41898282+github-actions[bot]@users.noreply.github.com"
+}
+
+checkout_base() {
+  local branch="$1"
+
+  configure_git
+  git fetch origin \
+    "refs/heads/${branch}:refs/remotes/origin/${branch}"
+  git switch --detach "refs/remotes/origin/${branch}"
+}
+
+remote_branch_exists() {
+  local branch="$1"
+
+  git ls-remote --exit-code \
+    --heads origin "refs/heads/${branch}" >/dev/null 2>&1
+}
+
+push_branch() {
+  local branch="$1"
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would push %s\n' "$branch"
+  else
+    git push origin "HEAD:refs/heads/${branch}"
+  fi
+}
+
+pull_request_number() {
+  local branch="$1"
+
+  gh pr list \
+    --repo "$repository" \
+    --state open \
+    --head "$branch" \
+    --json number \
+    --jq '.[0].number // empty'
+}
+
+create_pull_request() {
+  local branch="$1"
+  local base="$2"
+  local title="$3"
+  local body="$4"
+  local output
+
+  created_pr=""
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would create held PR %s -> %s: %s\n' "$branch" "$base" "$title"
+    created_pr="0"
+    return
+  fi
+
+  if ! output="$(
+    gh pr create \
+      --repo "$repository" \
+      --head "$branch" \
+      --base "$base" \
+      --title "$title" \
+      --body "$body" \
+      --draft 2>&1
+  )"; then
+    output="$(
+      gh pr create \
+        --repo "$repository" \
+        --head "$branch" \
+        --base "$base" \
+        --title "[HOLD] ${title}" \
+        --body "$body"
+    )"
+  fi
+  printf '%s\n' "$output"
+  created_pr="$(pull_request_number "$branch")"
+}
+
+update_mise_pins() {
+  local current="$1"
+  local candidate="$2"
+  local file expected=0 updated=0
+
+  while IFS= read -r file; do
+    ((expected += 1))
+    if grep -q -E "^[[:space:]]*version: ${current}$" "$file"; then
+      sed -i -E \
+        "s/^([[:space:]]*version: )${current}$/\\1${candidate}/" \
+        "$file"
+      ((updated += 1))
+    fi
+  done < <(
+    grep -l 'uses: jdx/mise-action@' .github/workflows/*.yml
+  )
+
+  if ((updated == 0 || updated != expected)); then
+    printf 'Updated %s of %s mise pins; refusing divergent pins.\n' \
+      "$updated" "$expected" >&2
+    return 1
+  fi
+}
+
+update_hk_packages() {
+  local current="$1"
+  local candidate="$2"
+  local matches
+
+  matches="$(
+    grep -c \
+      "/jdx/hk/releases/download/v${current}/hk@${current}" \
+      hk.pkl
+  )"
+  if [[ "$matches" -ne 2 ]]; then
+    printf 'Expected two hk package pins, found %s.\n' "$matches" >&2
+    return 1
+  fi
+  sed -i \
+    "s#/jdx/hk/releases/download/v${current}/hk@${current}#/jdx/hk/releases/download/v${candidate}/hk@${candidate}#g" \
+    hk.pkl
+}
+
+plan() {
+  local open_count current candidate
+
+  if [[ ! "$minimum_age_days" =~ ^[0-9]+$ ]]; then
+    printf 'Release age must be a non-negative whole number.\n' >&2
+    return 1
+  fi
+
+  open_count="$(
+    gh pr list \
+      --repo "$repository" \
+      --state open \
+      --limit 100 \
+      --json headRefName \
+      --jq "[.[] |
+        select(.headRefName | startswith(\"${branch_prefix}\"))] |
+        length"
+  )"
+  if ((open_count > 0)); then
+    set_output blocked true
+    set_output mise_candidate ""
+    return
+  fi
+
+  current="$(current_mise_version)"
+  candidate="$(latest_eligible_release "jdx/mise" "$current")"
+  set_output blocked false
+  set_output mise_candidate "$candidate"
+}
+
+prepare_mise() {
+  local candidate="${MISE_CANDIDATE:?MISE_CANDIDATE is required}"
+  local current branch pr body head_sha
+
+  branch="${branch_prefix}mise-${candidate}"
+  if ! remote_branch_exists "$branch"; then
+    checkout_base "$default_branch"
+    git switch -c "$branch"
+    current="$(current_mise_version)"
+    update_mise_pins "$current" "$candidate"
+    git diff --check
+    git add .github/workflows
+    git commit -m "chore: update mise to ${candidate}"
+    push_branch "$branch"
+  fi
+
+  pr="$(pull_request_number "$branch")"
+  if [[ -z "$pr" ]]; then
+    body="Updates the pinned mise release after the configured ${minimum_age_days}-day waiting period.
+
+The cross-platform \`mise run ci\` workflow must pass without warnings before this PR is made ready."
+    create_pull_request \
+      "$branch" \
+      "$default_branch" \
+      "chore: update mise to ${candidate}" \
+      "$body"
+    pr="$created_pr"
+  fi
+  head_sha="$(
+    git ls-remote origin "refs/heads/${branch}" |
+      awk '{ print $1 }'
+  )"
+  if [[ "$dry_run" == "true" ]]; then
+    head_sha="$(git rev-parse HEAD)"
+  fi
+
+  set_output changed true
+  set_output branch "$branch"
+  set_output head_sha "$head_sha"
+  set_output pr_number "$pr"
+}
+
+prepare_tools() {
+  local base="${BASE_BRANCH:?BASE_BRANCH is required}"
+  local bottom_pr="${BOTTOM_PR:-}"
+  local branch digest pr body tool current candidate head_sha
+
+  checkout_base "$base"
+  collect_tool_updates
+  if [[ -z "$tool_updates" ]]; then
+    set_output changed false
+    set_output branch ""
+    set_output head_sha ""
+    set_output pr_number ""
+    return
+  fi
+
+  digest="$(
+    printf '%s\n%s' "$base" "$tool_updates" |
+      sha256sum |
+      cut -c 1-12
+  )"
+  branch="${branch_prefix}tools-${digest}"
+  if ! remote_branch_exists "$branch"; then
+    git switch -c "$branch"
+    while IFS=$'\t' read -r tool current candidate; do
+      mise config set \
+        --file mise.toml \
+        --type string \
+        "tools.${tool}" \
+        "$candidate"
+      if [[ "$tool" == "hk" ]]; then
+        update_hk_packages "$current" "$candidate"
+      fi
+    done <<<"$tool_updates"
+    mise lock
+    git diff --check
+    git add mise.toml mise.lock hk.pkl
+    git commit -m "chore: update pinned tools"
+    push_branch "$branch"
+  fi
+
+  pr="$(pull_request_number "$branch")"
+  if [[ -z "$pr" ]]; then
+    body="Updates eligible tool pins after the configured ${minimum_age_days}-day waiting period.
+
+The cross-platform \`mise run ci\` workflow must pass without warnings before this PR is made ready."
+    create_pull_request \
+      "$branch" \
+      "$base" \
+      "chore: update pinned tools" \
+      "$body"
+    pr="$created_pr"
+  fi
+
+  if [[ -n "$bottom_pr" && "$dry_run" != "true" ]]; then
+    jq -n \
+      --argjson bottom "$bottom_pr" \
+      --argjson top "$pr" \
+      '{pull_requests: [$bottom, $top]}' |
+      gh api \
+        --method POST \
+        -H "X-GitHub-Api-Version: 2026-03-10" \
+        "repos/${repository}/stacks" \
+        --input - >/dev/null
+  fi
+  head_sha="$(
+    git ls-remote origin "refs/heads/${branch}" |
+      awk '{ print $1 }'
+  )"
+  if [[ "$dry_run" == "true" ]]; then
+    head_sha="$(git rev-parse HEAD)"
+  fi
+
+  set_output changed true
+  set_output branch "$branch"
+  set_output head_sha "$head_sha"
+  set_output pr_number "$pr"
+}
+
+mark_ready() {
+  local pr="${PR_NUMBER:?PR_NUMBER is required}"
+  local head_sha="${HEAD_SHA:?HEAD_SHA is required}"
+  local data title is_draft
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would mark PR #%s ready.\n' "$pr"
+    return
+  fi
+
+  gh api \
+    --method POST \
+    "repos/${repository}/statuses/${head_sha}" \
+    -f state=success \
+    -f context="toolchain-maintenance / cross-platform" \
+    -f description="Ubuntu, macOS, and Windows passed without warnings" \
+    -f target_url="${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}" \
+    >/dev/null
+  data="$(
+    gh pr view \
+      "$pr" \
+      --repo "$repository" \
+      --json title,isDraft
+  )"
+  title="$(jq -r '.title' <<<"$data")"
+  is_draft="$(jq -r '.isDraft' <<<"$data")"
+  if [[ "$is_draft" == "true" ]]; then
+    gh pr ready "$pr" --repo "$repository"
+  elif [[ "$title" == "[HOLD] "* ]]; then
+    gh pr edit \
+      "$pr" \
+      --repo "$repository" \
+      --title "${title#"[HOLD] "}"
+  fi
+}
+
+report_run() {
+  local jobs failures="" warning_lines="" check_url annotations found existing body
+
+  jobs="$(
+    gh api \
+      --method GET \
+      "repos/${repository}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+      -f per_page=100
+  )"
+  failures="$(
+    jq -r \
+      '.jobs[] |
+        select(
+          .conclusion != null and
+          .conclusion != "success" and
+          .conclusion != "skipped"
+        ) |
+        "- \(.name): \(.conclusion)"' \
+      <<<"$jobs"
+  )"
+
+  while IFS= read -r check_url; do
+    annotations="$(gh api "${check_url}/annotations")"
+    found="$(
+      jq -r \
+        '.[] |
+          select(.annotation_level == "warning") |
+          "- \(.path // "workflow"): \(.message)"' \
+        <<<"$annotations"
+    )"
+    if [[ -n "$found" ]]; then
+      warning_lines+="${warning_lines:+$'\n'}${found}"
+    fi
+  done < <(jq -r '.jobs[].check_run_url' <<<"$jobs")
+
+  if [[ -z "$failures" && -z "$warning_lines" ]]; then
+    return
+  fi
+
+  body="Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+  if [[ -n "$failures" ]]; then
+    body+=$'\n\nFailed jobs:\n'"${failures}"
+  fi
+  if [[ -n "$warning_lines" ]]; then
+    body+=$'\n\nWarnings:\n'"${warning_lines}"
+  fi
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would report maintenance problems:\n%s\n' "$body"
+    return 1
+  fi
+
+  existing="$(
+    gh issue list \
+      --repo "$repository" \
+      --state open \
+      --search "\"${issue_title}\" in:title" \
+      --json number,title \
+      --jq ".[] |
+        select(.title == \"${issue_title}\") |
+        .number" |
+      head -n 1
+  )"
+  if [[ -n "$existing" ]]; then
+    gh issue comment "$existing" --repo "$repository" --body "$body"
+  else
+    gh issue create \
+      --repo "$repository" \
+      --title "$issue_title" \
+      --body "$body"
+  fi
+  return 1
+}
+
+checked() {
+  local temp_root log status warning_lines
+
+  temp_root="${RUNNER_TEMP:-${HOME}/tmp}"
+  mkdir -p "$temp_root"
+  log="$(mktemp "${temp_root}/toolchain-maintenance.XXXXXX")"
+
+  set +e
+  "$0" "$@" 2>&1 | tee "$log"
+  status="${PIPESTATUS[0]}"
+  set -e
+  if ((status != 0)); then
+    rm -f "$log"
+    return "$status"
+  fi
+
+  warning_lines="$(
+    grep -Ei \
+      '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' \
+      "$log" |
+      grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
+  )"
+  rm -f "$log"
+  if [[ -n "$warning_lines" ]]; then
+    printf '%s\nWarnings are treated as failures.\n' "$warning_lines" >&2
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  checked)
+    shift
+    checked "$@"
+    ;;
+  plan)
+    plan
+    ;;
+  prepare-mise)
+    prepare_mise
+    ;;
+  prepare-tools)
+    prepare_tools
+    ;;
+  ready)
+    mark_ready
+    ;;
+  report-run)
+    report_run
+    ;;
+  *)
+    printf 'Unknown toolchain maintenance command: %s\n' "${1:-}" >&2
+    exit 2
+    ;;
+esac

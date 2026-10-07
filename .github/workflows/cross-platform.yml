@@ -1,13 +1,23 @@
 name: Cross-platform runners
+run-name: Cross-platform runners on ${{ inputs.ref || github.head_ref || github.ref_name }}
 
 on:
+  pull_request:
+    types:
+      - synchronize
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to validate
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: cross-platform-runners
+  group: cross-platform-runners-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -16,6 +26,11 @@ defaults:
 
 jobs:
   run:
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        startsWith(github.head_ref, 'automation/toolchain/')
+      }}
     name: Run on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
@@ -32,6 +47,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Install pinned toolchain
@@ -40,7 +56,21 @@ jobs:
           version: 2026.10.3
           install_args: --locked
 
-      - name: Run checks
-        run: mise run ci
+      - name: Run checks without warnings
+        run: |
+          ci_log="${RUNNER_TEMP//\\//}/oculix-ci.log"
+          trap 'rm -f "$ci_log"' EXIT
+          mise run ci 2>&1 | tee "$ci_log"
+          warnings="$(
+            grep -Ei \
+              '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' \
+              "$ci_log" |
+              grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
+          )"
+          if [[ -n "$warnings" ]]; then
+            printf '%s\n' "$warnings" >&2
+            echo "Warnings are treated as failures." >&2
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
