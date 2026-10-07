@@ -9,6 +9,8 @@ GitHub Actions policy is defined in `.github/jactionlint.yaml`.
 Repository hygiene checks enforce LF line endings, final newlines, executable
 shebang consistency, conflict-free filenames and contents, valid symlinks,
 secret detection, and a 500 KiB file-size ceiling.
+The versioned Git hooks also prevent direct commits to `main` or `master` and
+require conventional commit messages. Editor defaults live in `.editorconfig`.
 
 On macOS or Linux:
 

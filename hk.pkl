@@ -1,6 +1,19 @@
 amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pkl"
 import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
 
+hooks {
+  ["pre-commit"] {
+    steps {
+      ["no_commit_to_branch"] = Builtins.no_commit_to_branch
+    }
+  }
+  ["commit-msg"] {
+    steps {
+      ["check_conventional_commit"] = Builtins.check_conventional_commit
+    }
+  }
+}
+
 steps {
   ["jactionlint"] {
     glob = List(".github/workflows/*.yml", ".github/workflows/*.yaml")
