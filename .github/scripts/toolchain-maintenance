@@ -71,10 +71,16 @@ latest_eligible_release() {
 }
 
 current_mise_version() {
-  awk '
-    /uses: jdx\/mise-action@/ { found = 1; next }
-    found && $1 == "version:" { print $2; exit }
-  ' .github/workflows/cross-platform.yml
+  local version
+
+  version="$(
+    sed -n 's/^min_version = "\([^"]*\)"$/\1/p' mise.toml
+  )"
+  if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){2,3}$ ]]; then
+    printf 'mise.toml must contain one numeric min_version.\n' >&2
+    return 1
+  fi
+  printf '%s' "$version"
 }
 
 assert_mise_version() {
@@ -225,35 +231,22 @@ create_pull_request() {
   created_pr="$(pull_request_number "$branch")"
 }
 
-update_mise_pins() {
+update_mise_pin() {
   local current="$1"
   local candidate="$2"
-  local file action_count pin_count expected=0 updated=0
+  local matches
 
-  while IFS= read -r file; do
-    action_count="$(grep -c 'uses: jdx/mise-action@' "$file")"
-    pin_count="$(
-      grep -c -E "^[[:space:]]*version: ${current}$" "$file"
-    )"
-    if [[ "$pin_count" -ne "$action_count" ]]; then
-      printf '%s contains %s mise actions but %s matching pins.\n' \
-        "$file" "$action_count" "$pin_count" >&2
-      return 1
-    fi
-    sed -i -E \
-      "s/^([[:space:]]*version: )${current}$/\\1${candidate}/" \
-      "$file"
-    ((expected += action_count))
-    ((updated += pin_count))
-  done < <(
-    grep -l 'uses: jdx/mise-action@' .github/workflows/*.yml
-  )
-
-  if ((updated == 0 || updated != expected)); then
-    printf 'Updated %s of %s mise pins; refusing divergent pins.\n' \
-      "$updated" "$expected" >&2
+  matches="$(
+    grep -c -F "min_version = \"${current}\"" mise.toml
+  )"
+  if [[ "$matches" -ne 1 ]]; then
+    printf 'Expected one mise pin at %s, found %s.\n' \
+      "$current" "$matches" >&2
     return 1
   fi
+  sed -i \
+    "s/^min_version = \"${current}\"$/min_version = \"${candidate}\"/" \
+    mise.toml
 }
 
 update_hk_packages() {
@@ -314,9 +307,9 @@ prepare_mise() {
     checkout_base "$default_branch"
     git switch -c "$branch"
     current="$(current_mise_version)"
-    update_mise_pins "$current" "$candidate"
+    update_mise_pin "$current" "$candidate"
     git diff --check
-    git add .github/workflows
+    git add mise.toml
     git commit -m "chore: update mise to ${candidate}"
     push_branch "$branch"
   fi
@@ -349,10 +342,15 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
 
 prepare_tools() {
   local base="${BASE_BRANCH:?BASE_BRANCH is required}"
+  local base_sha="${BASE_SHA:?BASE_SHA is required}"
   local bottom_pr="${BOTTOM_PR:-}"
   local branch digest pr body tool current candidate head_sha
 
   checkout_base "$base"
+  if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
+    printf 'Base branch %s moved after validation.\n' "$base" >&2
+    return 1
+  fi
   assert_mise_version
   collect_tool_updates
   if [[ -z "$tool_updates" ]]; then
@@ -429,6 +427,7 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
 mark_ready() {
   local pr="${PR_NUMBER:?PR_NUMBER is required}"
   local head_sha="${HEAD_SHA:?HEAD_SHA is required}"
+  local head_branch="${HEAD_BRANCH:?HEAD_BRANCH is required}"
   local data title is_draft pr_head_sha pr_head_branch
 
   if [[ "$dry_run" == "true" ]]; then
@@ -446,9 +445,8 @@ mark_ready() {
   is_draft="$(jq -r '.isDraft' <<<"$data")"
   pr_head_sha="$(jq -r '.headRefOid' <<<"$data")"
   pr_head_branch="$(jq -r '.headRefName' <<<"$data")"
-  if [[ "$head_sha" != "${GITHUB_SHA:?GITHUB_SHA is required}" ||
-        "$pr_head_sha" != "$head_sha" ||
-        "$pr_head_branch" != "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}" ]]; then
+  if [[ "$pr_head_sha" != "$head_sha" ||
+        "$pr_head_branch" != "$head_branch" ]]; then
     printf 'Validation no longer matches the current PR head.\n' >&2
     return 1
   fi
@@ -551,42 +549,6 @@ report_run() {
   return 1
 }
 
-complete_validation() {
-  local phase="${MAINTENANCE_PHASE:?MAINTENANCE_PHASE is required}"
-  local age="${MINIMUM_RELEASE_AGE_DAYS:-7}"
-  local body
-
-  report_run
-  if ! mark_ready; then
-    body="Failed to finalize PR #${PR_NUMBER}.
-
-Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
-    upsert_issue "$body"
-    return 1
-  fi
-
-  if [[ "$phase" == "mise" ]]; then
-    if [[ "$dry_run" == "true" ]]; then
-      printf 'Would dispatch tool phase from %s.\n' "$GITHUB_REF_NAME"
-    elif ! gh workflow run toolchain-maintenance.yml \
-      --repo "$repository" \
-      --ref "$GITHUB_REF_NAME" \
-      -f phase=tools \
-      -f base_branch="$GITHUB_REF_NAME" \
-      -f bottom_pr="$PR_NUMBER" \
-      -f minimum_release_age_days="$age"; then
-      body="Failed to dispatch tool updates from \`${GITHUB_REF_NAME}\`.
-
-Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
-      upsert_issue "$body"
-      return 1
-    fi
-  elif [[ "$phase" != "tools" ]]; then
-    printf 'Unknown maintenance phase: %s\n' "$phase" >&2
-    return 1
-  fi
-}
-
 checked() {
   local temp_root log status warning_lines
 
@@ -635,9 +597,6 @@ case "${1:-}" in
     ;;
   report-run)
     report_run
-    ;;
-  complete-validation)
-    complete_validation
     ;;
   *)
     printf 'Unknown toolchain maintenance command: %s\n' "${1:-}" >&2
