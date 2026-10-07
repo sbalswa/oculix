@@ -1,0 +1,19 @@
+min_version = "2026.10.3"
+
+[settings]
+lockfile = true
+
+[tools]
+betterleaks = "1.9.0"
+hk = "2.5.0"
+jactionlint = "1.8.2"
+shellcheck = "0.11.0"
+zizmor = "1.30.1"
+
+[tasks.setup]
+description = "Install the repository's Git hooks"
+run = "hk install --mise"
+
+[tasks.ci]
+description = "Run the checks required by CI"
+run = "hk check --all"

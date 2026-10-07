@@ -1,0 +1,39 @@
+amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
+
+hooks {
+  ["pre-commit"] {
+    steps {
+      ["no_commit_to_branch"] = Builtins.no_commit_to_branch
+    }
+  }
+  ["commit-msg"] {
+    steps {
+      ["check_conventional_commit"] = Builtins.check_conventional_commit
+    }
+  }
+}
+
+steps {
+  ["jactionlint"] {
+    glob = List(".github/workflows/*.yml", ".github/workflows/*.yaml")
+    check = "jactionlint {{files}}"
+  }
+  ["shellcheck"] = Builtins.shellcheck
+  ["zizmor"] = (Builtins.zizmor) {
+    check = "zizmor --pedantic --no-progress {{files}}"
+  }
+
+  ["byte_order_marker"] = Builtins.byte_order_marker
+  ["betterleaks"] = Builtins.betterleaks
+  ["check_added_large_files"] = Builtins.check_added_large_files
+  ["check_case_conflict"] = Builtins.check_case_conflict
+  ["check_executables_have_shebangs"] = Builtins.check_executables_have_shebangs
+  ["check_merge_conflict"] = Builtins.check_merge_conflict
+  ["check_shebang_scripts_are_executable"] = Builtins.check_shebang_scripts_are_executable
+  ["check_symlinks"] = Builtins.check_symlinks
+  ["destroyed_symlinks"] = Builtins.destroyed_symlinks
+  ["mixed_line_ending"] = Builtins.mixed_line_ending
+  ["trailing_whitespace"] = Builtins.trailing_whitespace
+  ["newlines"] = Builtins.newlines
+}
