@@ -27,6 +27,7 @@ jobs:
     name: Plan update
     permissions:
       contents: read # Read the checked-out toolchain pins.
+      issues: write # Report an interrupted held update.
       pull-requests: read # Avoid overlapping open update cycles.
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -60,6 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      base_branch: ${{ steps.prepare.outputs.base_branch }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
       branch: ${{ steps.prepare.outputs.branch }}
       changed: ${{ steps.prepare.outputs.changed }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
@@ -119,6 +122,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.prepare_mise.outputs.head_sha }}
           HEAD_BRANCH: ${{ needs.prepare_mise.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare_mise.outputs.base_sha }}
+          EXPECTED_BASE_BRANCH: ${{ needs.prepare_mise.outputs.base_branch }}
           PR_NUMBER: ${{ needs.prepare_mise.outputs.pr_number }}
 
   prepare_tools:
@@ -144,6 +149,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
+      base_branch: ${{ steps.prepare.outputs.base_branch }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
       branch: ${{ steps.prepare.outputs.branch }}
       changed: ${{ steps.prepare.outputs.changed }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
@@ -228,6 +235,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.prepare_tools.outputs.head_sha }}
           HEAD_BRANCH: ${{ needs.prepare_tools.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare_tools.outputs.base_sha }}
+          EXPECTED_BASE_BRANCH: ${{ needs.prepare_tools.outputs.base_branch }}
           PR_NUMBER: ${{ needs.prepare_tools.outputs.pr_number }}
 
   report:

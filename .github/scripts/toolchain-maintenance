@@ -33,6 +33,12 @@ version_is_greater() {
     [[ "$(printf '%s\n%s\n' "$candidate" "$current" | sort -V | tail -n 1)" == "$candidate" ]]
 }
 
+find_warnings() {
+  grep -Ei \
+    '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' |
+    grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
+}
+
 latest_eligible_release() {
   local release_repository="$1"
   local current="$2"
@@ -40,6 +46,7 @@ latest_eligible_release() {
 
   cutoff="$(date -u -d "${minimum_age_days} days ago" +%s)"
   if ! releases="$(
+    # The newest 100 releases are an intentional bounded update window.
     gh api \
       --method GET \
       "repos/${release_repository}/releases" \
@@ -260,24 +267,14 @@ create_pull_request() {
     return
   fi
 
-  if ! output="$(
+  output="$(
     gh pr create \
       --repo "$repository" \
       --head "$branch" \
       --base "$base" \
-      --title "$title" \
-      --body "$body" \
-      --draft 2>&1
-  )"; then
-    output="$(
-      gh pr create \
-        --repo "$repository" \
-        --head "$branch" \
-        --base "$base" \
-        --title "[HOLD] ${title}" \
-        --body "$body"
-    )"
-  fi
+      --title "[HOLD] ${title}" \
+      --body "$body"
+  )"
   printf '%s\n' "$output"
   created_pr="$(pull_request_number "$branch")"
 }
@@ -320,7 +317,7 @@ update_hk_packages() {
 }
 
 plan() {
-  local base_sha open_count current candidate
+  local base_sha open_prs open_count held_prs current candidate
 
   if [[ ! "$minimum_age_days" =~ ^[0-9]+$ ]]; then
     printf 'Release age must be a non-negative whole number.\n' >&2
@@ -329,17 +326,38 @@ plan() {
 
   base_sha="$(git rev-parse HEAD)"
   set_output base_sha "$base_sha"
-  open_count="$(
+  open_prs="$(
     gh pr list \
       --repo "$repository" \
       --state open \
       --limit 100 \
-      --json headRefName \
-      --jq "[.[] |
-        select(.headRefName | startswith(\"${branch_prefix}\"))] |
-        length"
+      --json number,title,url,headRefName
+  )"
+  open_count="$(
+    jq \
+      --arg prefix "$branch_prefix" \
+      '[.[] |
+        select(.headRefName | startswith($prefix))] |
+        length' \
+      <<<"$open_prs"
   )"
   if ((open_count > 0)); then
+    held_prs="$(
+      jq -r \
+        --arg prefix "$branch_prefix" \
+        '.[] |
+          select(
+            (.headRefName | startswith($prefix)) and
+            (.title | startswith("[HOLD] "))
+          ) |
+          "- [#\(.number)](\(.url)): \(.title)"' \
+        <<<"$open_prs"
+    )"
+    if [[ -n "$held_prs" ]]; then
+      ensure_issue "Toolchain maintenance is paused by an update that was not made ready:
+
+${held_prs}"
+    fi
     set_output blocked true
     set_output mise_candidate ""
     return
@@ -401,6 +419,8 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
   fi
 
   set_output changed true
+  set_output base_branch "$default_branch"
+  set_output base_sha "$base_sha"
   set_output branch "$branch"
   set_output head_sha "$head_sha"
   set_output pr_number "$pr"
@@ -422,6 +442,8 @@ prepare_tools() {
   collect_tool_updates
   if [[ -z "$tool_updates" ]]; then
     set_output changed false
+    set_output base_branch "$base"
+    set_output base_sha "$base_sha"
     set_output branch ""
     set_output head_sha ""
     set_output pr_number ""
@@ -488,54 +510,202 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
         --input - >/dev/null
   fi
   set_output changed true
+  set_output base_branch "$base"
+  set_output base_sha "$base_sha"
   set_output branch "$branch"
   set_output head_sha "$head_sha"
   set_output pr_number "$pr"
+}
+
+post_commit_status() {
+  local head_sha="$1"
+  local state="$2"
+  local description="$3"
+
+  gh api \
+    --silent \
+    --method POST \
+    "repos/${repository}/statuses/${head_sha}" \
+    -f state="$state" \
+    -f context="toolchain-maintenance / cross-platform" \
+    -f description="$description" \
+    -f target_url="${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}" \
+    2>&1
+}
+
+fail_readiness() {
+  local pr="$1"
+  local head_sha="$2"
+  local original_title="$3"
+  local restore_title="$4"
+  local reason="$5"
+  local details="$6"
+  local rollback_output="" rollback_warnings="" status_output="" body
+
+  if [[ "$restore_title" == "true" ]]; then
+    if ! rollback_output="$(
+      gh pr edit \
+        "$pr" \
+        --repo "$repository" \
+        --title "$original_title" \
+        2>&1
+    )"; then
+      details+=$'\n\nFailed to restore the held PR title:\n'"${rollback_output}"
+    else
+      rollback_warnings="$(find_warnings <<<"$rollback_output")"
+      if [[ -n "$rollback_warnings" ]]; then
+        details+=$'\n\nWarnings while restoring the held PR title:\n'"${rollback_warnings}"
+      fi
+    fi
+  fi
+
+  if ! status_output="$(
+    post_commit_status \
+      "$head_sha" \
+      failure \
+      "Readiness failed; triage the maintenance run"
+  )"; then
+    details+=$'\n\nFailed to record the failure status:\n'"${status_output}"
+  fi
+
+  body="${reason}
+
+Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+  if [[ -n "$details" ]]; then
+    body+=$'\n\nDetails:\n'"${details}"
+  fi
+  upsert_issue "$body"
+  return 1
 }
 
 mark_ready() {
   local pr="${PR_NUMBER:?PR_NUMBER is required}"
   local head_sha="${HEAD_SHA:?HEAD_SHA is required}"
   local head_branch="${HEAD_BRANCH:?HEAD_BRANCH is required}"
-  local data title is_draft pr_head_sha pr_head_branch
+  local expected_base_sha="${EXPECTED_BASE_SHA:?EXPECTED_BASE_SHA is required}"
+  local expected_base_branch="${EXPECTED_BASE_BRANCH:?EXPECTED_BASE_BRANCH is required}"
+  local data title pr_head_sha pr_head_branch pr_base_sha pr_base_branch
+  local audit_output audit_warnings view_warnings
+  local status_output status_warnings ready_output ready_warnings
 
   if [[ "$dry_run" == "true" ]]; then
     printf 'Would mark PR #%s ready.\n' "$pr"
     return
   fi
 
-  report_run
-  data="$(
+  if ! audit_output="$(report_run 2>&1)"; then
+    printf '%s\n' "$audit_output" >&2
+    return 1
+  fi
+  audit_warnings="$(find_warnings <<<"$audit_output")"
+  if [[ -n "$audit_warnings" ]]; then
+    printf '%s\nWarnings are treated as failures.\n' \
+      "$audit_warnings" >&2
+    return 1
+  fi
+
+  if ! data="$(
     gh pr view \
       "$pr" \
       --repo "$repository" \
-      --json title,isDraft,headRefName,headRefOid
-  )" || return
+      --json title,headRefName,headRefOid,baseRefName,baseRefOid \
+      2>&1
+  )"; then
+    printf '%s\n' "$data" >&2
+    return 1
+  fi
+  view_warnings="$(find_warnings <<<"$data")"
+  if [[ -n "$view_warnings" ]]; then
+    printf '%s\nWarnings are treated as failures.\n' \
+      "$view_warnings" >&2
+    return 1
+  fi
+
   title="$(jq -r '.title' <<<"$data")"
-  is_draft="$(jq -r '.isDraft' <<<"$data")"
   pr_head_sha="$(jq -r '.headRefOid' <<<"$data")"
   pr_head_branch="$(jq -r '.headRefName' <<<"$data")"
+  pr_base_sha="$(jq -r '.baseRefOid' <<<"$data")"
+  pr_base_branch="$(jq -r '.baseRefName' <<<"$data")"
   if [[ "$pr_head_sha" != "$head_sha" ||
         "$pr_head_branch" != "$head_branch" ]]; then
     printf 'Validation no longer matches the current PR head.\n' >&2
     return 1
   fi
+  if [[ "$pr_base_sha" != "$expected_base_sha" ||
+        "$pr_base_branch" != "$expected_base_branch" ]]; then
+    printf 'Validation no longer matches the current PR base.\n' >&2
+    return 1
+  fi
 
-  gh api \
-    --method POST \
-    "repos/${repository}/statuses/${head_sha}" \
-    -f state=success \
-    -f context="toolchain-maintenance / cross-platform" \
-    -f description="Ubuntu, macOS, and Windows passed without warnings" \
-    -f target_url="${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}" \
-    >/dev/null || return
-  if [[ "$is_draft" == "true" ]]; then
-    gh pr ready "$pr" --repo "$repository" || return
-  elif [[ "$title" == "[HOLD] "* ]]; then
-    gh pr edit \
-      "$pr" \
+  if ! status_output="$(
+    post_commit_status \
+      "$head_sha" \
+      success \
+      "Ubuntu, macOS, and Windows passed without warnings"
+  )"; then
+    fail_readiness \
+      "$pr" "$head_sha" "$title" false \
+      "Failed to record successful validation." \
+      "$status_output" || return 1
+  fi
+  status_warnings="$(find_warnings <<<"$status_output")"
+  if [[ -n "$status_warnings" ]]; then
+    fail_readiness \
+      "$pr" "$head_sha" "$title" false \
+      "A command warned while recording successful validation." \
+      "$status_warnings" || return 1
+  fi
+
+  if [[ "$title" == "[HOLD] "* ]]; then
+    if ! ready_output="$(
+      gh pr edit \
+        "$pr" \
+        --repo "$repository" \
+        --title "${title#"[HOLD] "}" \
+        2>&1
+    )"; then
+      fail_readiness \
+        "$pr" "$head_sha" "$title" true \
+        "Failed to remove the toolchain maintenance hold." \
+        "$ready_output" || return 1
+    fi
+    ready_warnings="$(find_warnings <<<"$ready_output")"
+    if [[ -n "$ready_warnings" ]]; then
+      fail_readiness \
+        "$pr" "$head_sha" "$title" true \
+        "A command warned while removing the toolchain maintenance hold." \
+        "$ready_warnings" || return 1
+    fi
+  fi
+}
+
+triage_issue_number() {
+  gh issue list \
+    --repo "$repository" \
+    --state open \
+    --search "\"${issue_title}\" in:title" \
+    --json number,title \
+    --jq ".[] |
+      select(.title == \"${issue_title}\") |
+      .number" |
+    head -n 1
+}
+
+ensure_issue() {
+  local body="$1"
+  local existing
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would ensure maintenance problem is reported:\n%s\n' "$body"
+    return
+  fi
+
+  existing="$(triage_issue_number)"
+  if [[ -z "$existing" ]]; then
+    gh issue create \
       --repo "$repository" \
-      --title "${title#"[HOLD] "}" || return
+      --title "$issue_title" \
+      --body "$body"
   fi
 }
 
@@ -548,17 +718,7 @@ upsert_issue() {
     return
   fi
 
-  existing="$(
-    gh issue list \
-      --repo "$repository" \
-      --state open \
-      --search "\"${issue_title}\" in:title" \
-      --json number,title \
-      --jq ".[] |
-        select(.title == \"${issue_title}\") |
-        .number" |
-      head -n 1
-  )"
+  existing="$(triage_issue_number)"
   if [[ -n "$existing" ]]; then
     gh issue comment "$existing" --repo "$repository" --body "$body"
   else
@@ -654,7 +814,8 @@ Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
 }
 
 checked() {
-  local temp_root log status warning_lines
+  local temp_root log status tee_status warning_lines
+  local -a pipe_status
 
   temp_root="${RUNNER_TEMP:-${HOME}/tmp}"
   mkdir -p "$temp_root"
@@ -662,19 +823,21 @@ checked() {
 
   set +e
   "$0" "$@" 2>&1 | tee "$log"
-  status="${PIPESTATUS[0]}"
+  pipe_status=("${PIPESTATUS[@]}")
+  status="${pipe_status[0]}"
+  tee_status="${pipe_status[1]}"
   set -e
   if ((status != 0)); then
     rm -f "$log"
     return "$status"
   fi
+  if ((tee_status != 0)); then
+    rm -f "$log"
+    printf 'Failed to capture command output.\n' >&2
+    return "$tee_status"
+  fi
 
-  warning_lines="$(
-    grep -Ei \
-      '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' \
-      "$log" |
-      grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
-  )"
+  warning_lines="$(find_warnings <"$log")"
   rm -f "$log"
   if [[ -n "$warning_lines" ]]; then
     printf '%s\nWarnings are treated as failures.\n' "$warning_lines" >&2
