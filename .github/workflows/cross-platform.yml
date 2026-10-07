@@ -40,11 +40,6 @@ jobs:
           version: 2026.10.3
           install_args: --locked
 
-      - name: Show pinned toolchain
-        run: |
-          mise --version
-          hk --version
-
       - name: Run checks
         run: mise run ci
         env:
