@@ -34,9 +34,15 @@ version_is_greater() {
 }
 
 find_warnings() {
-  grep -Ei \
-    '::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)' |
-    grep -Eiv '(^|[^[:digit:]])0 warnings?' || true
+  awk '
+    {
+      normalized = tolower($0)
+      gsub(/(^|[^[:digit:]])0 warnings?([^[:alnum:]_]|$)/, "", normalized)
+      if (normalized ~ /::warning::|(^|[^[:alnum:]_])warnings?([^[:alnum:]_]|$)/) {
+        print
+      }
+    }
+  '
 }
 
 latest_eligible_release() {
