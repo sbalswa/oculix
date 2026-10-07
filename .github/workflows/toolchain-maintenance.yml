@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      base_sha: ${{ steps.plan.outputs.base_sha }}
       blocked: ${{ steps.plan.outputs.blocked }}
       mise_candidate: ${{ steps.plan.outputs.mise_candidate }}
     steps:
@@ -73,6 +74,7 @@ jobs:
         id: prepare
         run: .github/scripts/toolchain-maintenance checked prepare-mise
         env:
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
           GH_TOKEN: ${{ github.token }}
           MISE_CANDIDATE: ${{ needs.plan.outputs.mise_candidate }}
           TOOLCHAIN_MIN_AGE_DAYS: >-
@@ -97,7 +99,10 @@ jobs:
       - validate_mise
     if: ${{ needs.validate_mise.result == 'success' }}
     permissions:
+      actions: read # Confirm every completed job succeeded.
+      checks: read # Reject warning annotations before readiness.
       contents: read # Read the maintenance script.
+      issues: write # Report failures or warnings before readiness.
       pull-requests: write # Mark the validated PR ready.
       statuses: write # Record validation on the candidate commit.
     runs-on: ubuntu-latest
@@ -203,7 +208,10 @@ jobs:
       - validate_tools
     if: ${{ needs.validate_tools.result == 'success' }}
     permissions:
+      actions: read # Confirm every completed job succeeded.
+      checks: read # Reject warning annotations before readiness.
       contents: read # Read the maintenance script.
+      issues: write # Report failures or warnings before readiness.
       pull-requests: write # Mark the validated PR ready.
       statuses: write # Record validation on the candidate commit.
     runs-on: ubuntu-latest

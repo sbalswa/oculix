@@ -36,9 +36,30 @@ version_is_greater() {
 latest_eligible_release() {
   local release_repository="$1"
   local current="$2"
-  local cutoff best="" tag published version published_epoch
+  local cutoff releases best="" tag published version published_epoch
 
   cutoff="$(date -u -d "${minimum_age_days} days ago" +%s)"
+  if ! releases="$(
+    gh api \
+      --method GET \
+      "repos/${release_repository}/releases" \
+      -f per_page=100 \
+      --jq '.[] |
+        select(
+          .draft == false and
+          .prerelease == false and
+          .published_at != null
+        ) |
+        [.tag_name, .published_at] |
+        @tsv'
+  )"; then
+    printf 'Failed to read releases for %s.\n' "$release_repository" >&2
+    return 1
+  fi
+  if [[ -z "$releases" ]]; then
+    return
+  fi
+
   while IFS=$'\t' read -r tag published; do
     version="${tag#v}"
     if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){1,3}$ ]]; then
@@ -52,20 +73,7 @@ latest_eligible_release() {
     if [[ -z "$best" ]] || version_is_greater "$version" "$best"; then
       best="$version"
     fi
-  done < <(
-    gh api \
-      --method GET \
-      "repos/${release_repository}/releases" \
-      -f per_page=100 \
-      --jq '.[] |
-        select(
-          .draft == false and
-          .prerelease == false and
-          .published_at != null
-        ) |
-        [.tag_name, .published_at] |
-        @tsv'
-  )
+  done <<<"$releases"
 
   printf '%s' "$best"
 }
@@ -136,9 +144,18 @@ current_tool_version() {
 }
 
 collect_tool_updates() {
-  local tool current backend release_repository candidate
+  local tools tool current backend release_repository candidate
 
   tool_updates=""
+  if ! tools="$(project_tools)"; then
+    printf 'Failed to read repository tools from mise.toml.\n' >&2
+    return 1
+  fi
+  if [[ -z "$tools" ]]; then
+    printf 'No repository tools were found in mise.toml.\n' >&2
+    return 1
+  fi
+
   while IFS= read -r tool; do
     current="$(current_tool_version "$tool")"
     backend="$(mise tool "$tool" --backend)"
@@ -147,7 +164,7 @@ collect_tool_updates() {
     if [[ -n "$candidate" ]]; then
       tool_updates+="${tool}"$'\t'"${current}"$'\t'"${candidate}"$'\n'
     fi
-  done < <(project_tools)
+  done <<<"$tools"
   tool_updates="${tool_updates%$'\n'}"
 }
 
@@ -167,11 +184,45 @@ checkout_base() {
   git switch --detach "refs/remotes/origin/${branch}"
 }
 
-remote_branch_exists() {
+remote_branch_sha() {
   local branch="$1"
+  local output
 
-  git ls-remote --exit-code \
-    --heads origin "refs/heads/${branch}" >/dev/null 2>&1
+  if ! output="$(
+    git ls-remote --heads origin "refs/heads/${branch}"
+  )"; then
+    printf 'Failed to inspect remote branch %s.\n' "$branch" >&2
+    return 1
+  fi
+  awk '{ print $1 }' <<<"$output"
+}
+
+verify_expected_branch() {
+  local branch="$1"
+  local base_sha="$2"
+  local expected_diff="$3"
+  local remote_ref remote_sha parents commit parent extra remote_diff
+
+  remote_ref="refs/remotes/origin/${branch}"
+  git fetch origin "refs/heads/${branch}:${remote_ref}"
+  remote_sha="$(git rev-parse "${remote_ref}^{commit}")"
+  parents="$(git rev-list --parents -n 1 "$remote_sha")"
+  read -r commit parent extra <<<"$parents"
+  if [[ "$commit" != "$remote_sha" ||
+        "$parent" != "$base_sha" ||
+        -n "$extra" ]]; then
+    printf 'Remote branch %s does not have the expected parent %s.\n' \
+      "$branch" "$base_sha" >&2
+    return 1
+  fi
+
+  remote_diff="$(git diff --binary "$base_sha" "$remote_sha")"
+  if [[ "$remote_diff" != "$expected_diff" ]]; then
+    printf 'Remote branch %s does not contain the expected update.\n' \
+      "$branch" >&2
+    return 1
+  fi
+  printf '%s' "$remote_sha"
 }
 
 push_branch() {
@@ -269,13 +320,15 @@ update_hk_packages() {
 }
 
 plan() {
-  local open_count current candidate
+  local base_sha open_count current candidate
 
   if [[ ! "$minimum_age_days" =~ ^[0-9]+$ ]]; then
     printf 'Release age must be a non-negative whole number.\n' >&2
     return 1
   fi
 
+  base_sha="$(git rev-parse HEAD)"
+  set_output base_sha "$base_sha"
   open_count="$(
     gh pr list \
       --repo "$repository" \
@@ -300,17 +353,37 @@ plan() {
 
 prepare_mise() {
   local candidate="${MISE_CANDIDATE:?MISE_CANDIDATE is required}"
-  local current branch pr body head_sha
+  local base_sha="${BASE_SHA:?BASE_SHA is required}"
+  local current branch existing_sha expected_diff pr body head_sha
 
-  branch="${branch_prefix}mise-${candidate}"
-  if ! remote_branch_exists "$branch"; then
-    checkout_base "$default_branch"
+  checkout_base "$default_branch"
+  if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
+    printf 'Default branch moved after update planning.\n' >&2
+    return 1
+  fi
+  current="$(current_mise_version)"
+  if ! version_is_greater "$candidate" "$current"; then
+    printf 'Refusing mise update from %s to %s.\n' \
+      "$current" "$candidate" >&2
+    return 1
+  fi
+  update_mise_pin "$current" "$candidate"
+  git diff --check
+  expected_diff="$(git diff --binary)"
+  if [[ -z "$expected_diff" ]]; then
+    printf 'The planned mise update produced no changes.\n' >&2
+    return 1
+  fi
+
+  branch="${branch_prefix}mise-${candidate}-${base_sha:0:12}"
+  existing_sha="$(remote_branch_sha "$branch")"
+  if [[ -n "$existing_sha" ]]; then
+    head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
+  else
     git switch -c "$branch"
-    current="$(current_mise_version)"
-    update_mise_pin "$current" "$candidate"
-    git diff --check
     git add mise.toml
     git commit -m "chore: update mise to ${candidate}"
+    head_sha="$(git rev-parse HEAD)"
     push_branch "$branch"
   fi
 
@@ -326,13 +399,6 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
       "$body"
     pr="$created_pr"
   fi
-  head_sha="$(
-    git ls-remote origin "refs/heads/${branch}" |
-      awk '{ print $1 }'
-  )"
-  if [[ "$dry_run" == "true" ]]; then
-    head_sha="$(git rev-parse HEAD)"
-  fi
 
   set_output changed true
   set_output branch "$branch"
@@ -344,7 +410,8 @@ prepare_tools() {
   local base="${BASE_BRANCH:?BASE_BRANCH is required}"
   local base_sha="${BASE_SHA:?BASE_SHA is required}"
   local bottom_pr="${BOTTOM_PR:-}"
-  local branch digest pr body tool current candidate head_sha
+  local branch digest existing_sha expected_diff
+  local pr body tool current candidate head_sha
 
   checkout_base "$base"
   if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
@@ -362,27 +429,37 @@ prepare_tools() {
   fi
 
   digest="$(
-    printf '%s\n%s' "$base" "$tool_updates" |
+    printf '%s\n%s\n%s' "$base" "$base_sha" "$tool_updates" |
       sha256sum |
       cut -c 1-12
   )"
   branch="${branch_prefix}tools-${digest}"
-  if ! remote_branch_exists "$branch"; then
+  while IFS=$'\t' read -r tool current candidate; do
+    mise config set \
+      --file mise.toml \
+      --type string \
+      "tools.${tool}" \
+      "$candidate"
+    if [[ "$tool" == "hk" ]]; then
+      update_hk_packages "$current" "$candidate"
+    fi
+  done <<<"$tool_updates"
+  mise lock
+  git diff --check
+  expected_diff="$(git diff --binary)"
+  if [[ -z "$expected_diff" ]]; then
+    printf 'The planned tool updates produced no changes.\n' >&2
+    return 1
+  fi
+
+  existing_sha="$(remote_branch_sha "$branch")"
+  if [[ -n "$existing_sha" ]]; then
+    head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
+  else
     git switch -c "$branch"
-    while IFS=$'\t' read -r tool current candidate; do
-      mise config set \
-        --file mise.toml \
-        --type string \
-        "tools.${tool}" \
-        "$candidate"
-      if [[ "$tool" == "hk" ]]; then
-        update_hk_packages "$current" "$candidate"
-      fi
-    done <<<"$tool_updates"
-    mise lock
-    git diff --check
     git add mise.toml mise.lock hk.pkl
     git commit -m "chore: update pinned tools"
+    head_sha="$(git rev-parse HEAD)"
     push_branch "$branch"
   fi
 
@@ -410,14 +487,6 @@ The cross-platform \`mise run ci\` workflow must pass without warnings before th
         "repos/${repository}/stacks" \
         --input - >/dev/null
   fi
-  head_sha="$(
-    git ls-remote origin "refs/heads/${branch}" |
-      awk '{ print $1 }'
-  )"
-  if [[ "$dry_run" == "true" ]]; then
-    head_sha="$(git rev-parse HEAD)"
-  fi
-
   set_output changed true
   set_output branch "$branch"
   set_output head_sha "$head_sha"
@@ -435,6 +504,7 @@ mark_ready() {
     return
   fi
 
+  report_run
   data="$(
     gh pr view \
       "$pr" \
@@ -500,15 +570,22 @@ upsert_issue() {
 }
 
 report_run() {
-  local jobs failures="" warning_lines="" check_url annotations found body
+  local jobs failures="" warning_lines="" check_urls check_url
+  local annotations found body
 
-  jobs="$(
+  if ! jobs="$(
     gh api \
       --method GET \
       "repos/${repository}/actions/runs/${GITHUB_RUN_ID}/jobs" \
       -f per_page=100
-  )"
-  failures="$(
+  )"; then
+    body="Failed to inspect jobs for run ${GITHUB_RUN_ID}.
+
+Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+    upsert_issue "$body"
+    return 1
+  fi
+  if ! failures="$(
     jq -r \
       '.jobs[] |
         select(
@@ -518,21 +595,48 @@ report_run() {
         ) |
         "- \(.name): \(.conclusion)"' \
       <<<"$jobs"
-  )"
+  )"; then
+    printf 'Failed to parse jobs for run %s.\n' "$GITHUB_RUN_ID" >&2
+    return 1
+  fi
+  if ! check_urls="$(
+    jq -r '.jobs[].check_run_url' <<<"$jobs"
+  )"; then
+    printf 'Failed to parse check runs for run %s.\n' \
+      "$GITHUB_RUN_ID" >&2
+    return 1
+  fi
 
-  while IFS= read -r check_url; do
-    annotations="$(gh api "${check_url}/annotations")"
-    found="$(
+  while [[ -n "$check_urls" ]] && IFS= read -r check_url; do
+    if ! annotations="$(
+      gh api \
+        --method GET \
+        --paginate \
+        --slurp \
+        "${check_url}/annotations" \
+        -f per_page=100
+    )"; then
+      body="Failed to inspect annotations for run ${GITHUB_RUN_ID}.
+
+Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
+      upsert_issue "$body"
+      return 1
+    fi
+    if ! found="$(
       jq -r \
-        '.[] |
+        '.[][] |
           select(.annotation_level == "warning") |
           "- \(.path // "workflow"): \(.message)"' \
         <<<"$annotations"
-    )"
+    )"; then
+      printf 'Failed to parse annotations for run %s.\n' \
+        "$GITHUB_RUN_ID" >&2
+      return 1
+    fi
     if [[ -n "$found" ]]; then
       warning_lines+="${warning_lines:+$'\n'}${found}"
     fi
-  done < <(jq -r '.jobs[].check_run_url' <<<"$jobs")
+  done <<<"$check_urls"
 
   if [[ -z "$failures" && -z "$warning_lines" ]]; then
     return
