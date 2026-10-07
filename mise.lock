@@ -125,6 +125,27 @@ url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1
 url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338616"
 provenance = "github-attestations"
 
+[[tools.java]]
+version = "temurin-17.0.20+101"
+backend = "core:java"
+specifiers = ["temurin-17"]
+
+[tools.java."platforms.linux-arm64"]
+checksum = "sha256:457b57af8f9c93ec39080bb8c764f559dc8c89a6da1a39d718a400b7890d3e41"
+url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_aarch64_linux_hotspot_17.0.20.1_1.tar.gz"
+
+[tools.java."platforms.linux-x64"]
+checksum = "sha256:3808d1d15e3ec6bd5b84057fb5d84c33d8a1536a258146bcea2e603fc726e08e"
+url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_x64_linux_hotspot_17.0.20.1_1.tar.gz"
+
+[tools.java."platforms.macos-arm64"]
+checksum = "sha256:196d13ba5f10414bef7f6a05a9b3f00edacb18ebacef2b99485db9e2ee18f0e8"
+url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_aarch64_mac_hotspot_17.0.20.1_1.tar.gz"
+
+[tools.java."platforms.windows-x64"]
+checksum = "sha256:e53a79c3c3d86865bd7e787903884331068e71321714ffd44f145785affc7cb0"
+url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip"
+
 [[tools.shellcheck]]
 version = "0.11.0"
 backend = "aqua:koalaman/shellcheck"
