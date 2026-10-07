@@ -72,6 +72,24 @@ url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-pc-windows-m
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
 repository_ids = { repository = "922514152" }
 
+[[tools."http:oculixide"]]
+version = "4.0.0"
+backend = "http:oculixide"
+specifiers = ["4.0.0"]
+
+[tools."http:oculixide"."platforms.linux-arm64"]
+checksum = "blake3:0236665ea65d665331654cc91ac01a4738c14d617db71d95ac32621024de4816"
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
+
+[tools."http:oculixide"."platforms.linux-x64"]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
+
+[tools."http:oculixide"."platforms.macos-arm64"]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-macos.jar"
+
+[tools."http:oculixide"."platforms.windows-x64"]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-windows.jar"
+
 [[tools.jactionlint]]
 version = "1.8.2"
 backend = "github:jdx/jactionlint"

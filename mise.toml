@@ -10,6 +10,22 @@ jactionlint = "1.8.2"
 shellcheck = "0.11.0"
 zizmor = "1.30.1"
 
+[tools."http:oculixide"]
+version = "4.0.0"
+
+[tools."http:oculixide".platforms.linux-x64]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
+
+# linux jar is arch-independent bytecode; arm64 reuses the x64 linux artifact (no separate upstream build)
+[tools."http:oculixide".platforms.linux-arm64]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
+
+[tools."http:oculixide".platforms.macos-arm64]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-macos.jar"
+
+[tools."http:oculixide".platforms.windows-x64]
+url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-windows.jar"
+
 [tasks.setup]
 description = "Install the repository's Git hooks"
 run = "hk install --mise"
