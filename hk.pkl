@@ -19,9 +19,7 @@ steps {
     glob = List(".github/workflows/*.yml", ".github/workflows/*.yaml")
     check = "jactionlint {{files}}"
   }
-  ["shellcheck"] = (Builtins.shellcheck) {
-    exclude = List("bin/mise")
-  }
+  ["shellcheck"] = Builtins.shellcheck
   ["zizmor"] = (Builtins.zizmor) {
     check = "zizmor --pedantic --no-progress {{files}}"
   }

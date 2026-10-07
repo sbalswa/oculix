@@ -45,14 +45,6 @@ jobs:
           mise --version
           hk --version
 
-      - name: Install repository Git hooks
-        run: mise run setup
-
-      - name: Verify commit-message hook
-        run: |
-          git log -1 --format=%B > "$RUNNER_TEMP/commit-message"
-          git hook run commit-msg -- "$RUNNER_TEMP/commit-message"
-
       - name: Run checks
         run: mise run ci
         env:

@@ -12,23 +12,8 @@ zizmor = "1.30.1"
 
 [tasks.setup]
 description = "Install the repository's Git hooks"
-run = "git config --local core.hooksPath .githooks"
-
-[tasks.check]
-description = "Check all repository files"
-run = "hk check --all"
-
-[tasks.fix]
-description = "Fix modified repository files"
-run = "hk fix"
-
-[tasks.pre-commit]
-description = "Run the pre-commit hook"
-run = "hk run pre-commit"
+run = "hk install --mise"
 
 [tasks.ci]
 description = "Run the checks required by CI"
-run = [
-  "hk validate",
-  "hk check --all",
-]
+run = "hk check --all"
