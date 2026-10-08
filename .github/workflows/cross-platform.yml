@@ -101,6 +101,7 @@ jobs:
     timeout-minutes: 15
     env:
       MISE_ENV: oculix
+      MISE_LOCKED: "1"
 
     strategy:
       fail-fast: false
@@ -147,6 +148,7 @@ jobs:
     timeout-minutes: 15
     env:
       MISE_ENV: oculix
+      MISE_LOCKED: "1"
 
     strategy:
       fail-fast: false
