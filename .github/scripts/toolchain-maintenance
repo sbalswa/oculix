@@ -170,8 +170,17 @@ collect_tool_updates() {
   fi
 
   while IFS= read -r tool; do
-    current="$(current_tool_version "$tool")"
     backend="$(mise tool "$tool" --backend)"
+    case "$backend" in
+      core:* | http:*)
+        # Version-pinned runtimes/artifacts (Java, the Oculix jar) have no
+        # upstream release feed to track, so skip rather than fail.
+        printf 'Skipping %s: backend %s is version-pinned, not release-tracked.\n' \
+          "$tool" "$backend" >&2
+        continue
+        ;;
+    esac
+    current="$(current_tool_version "$tool")"
     release_repository="$(backend_repository "$backend")"
     candidate="$(latest_eligible_release "$release_repository" "$current")"
     if [[ -n "$candidate" ]]; then
