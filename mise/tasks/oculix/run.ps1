@@ -1,5 +1,7 @@
 # PowerShell sibling of mise/tasks/oculix/run (no shebang / not executable on
 # Unix so mise pairs it as one oculix:run task; Windows selects this file).
+#MISE description="Run an Oculix script"
+#MISE alias="oculix"
 $ErrorActionPreference = "Stop"
 
 if (-not $env:MISE_PROJECT_ROOT) {
