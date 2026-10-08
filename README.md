@@ -28,8 +28,10 @@ In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
 
 ## Development
 
-Prerequisite: install [mise](https://mise.jdx.dev/installing-mise.html) once per
-development environment.
+Prerequisites: install [mise](https://mise.jdx.dev/installing-mise.html) once per
+development environment. On Windows the `oculix` task runs under `bash -c`, so a
+bash (for example [Git for Windows](https://gitforwindows.org/)) must be on
+`PATH`; macOS and Linux already provide one.
 
 After cloning:
 
