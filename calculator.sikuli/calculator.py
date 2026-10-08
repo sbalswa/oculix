@@ -1,6 +1,8 @@
 from java.lang import System
+from io.github.julienmerconsulting.legerix import Legerix
 from org.sikuli.basics import Settings
 from org.sikuli.script import App, Key, Screen
+from org.sikuli.support import Commons
 
 import os
 import time
@@ -32,9 +34,16 @@ def capture_failure(screen):
     print("calculator: failure screenshot = %s" % path)
 
 
+def configure_ocr_natives():
+    native_path = Legerix.loadNatives().toString()
+    Commons.jnaPathAdd(native_path)
+    print("calculator: OCR native path = %s" % native_path)
+
+
 screen = Screen()
 
 try:
+    configure_ocr_natives()
     Settings.OcrTextRead = True
     Settings.OcrTextSearch = True
 
@@ -68,9 +77,9 @@ try:
         )
 
     print("calculator: verified 7 * 34 = %s" % EXPECTED_RESULT)
-except Exception:
+except:
     try:
         capture_failure(screen)
-    except Exception as capture_error:
-        print("calculator: could not capture failure screenshot: %s" % capture_error)
+    except:
+        print("calculator: could not capture failure screenshot")
     raise
