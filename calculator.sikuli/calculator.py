@@ -63,6 +63,16 @@ def calculator_result_region(window, platform):
     )
 
 
+def wait_for_result(region):
+    text = ""
+    for _ in range(20):
+        text = region.text()
+        if EXPECTED_RESULT in text:
+            return text
+        time.sleep(0.5)
+    return text
+
+
 screen = Screen()
 
 try:
@@ -94,9 +104,8 @@ try:
     window.type(Key.ENTER)
 
     result_region = calculator_result_region(window, platform)
-    result = result_region.existsText(EXPECTED_RESULT, 10)
-    if result is None:
-        text = result_region.text()
+    text = wait_for_result(result_region)
+    if EXPECTED_RESULT not in text:
         raise AssertionError(
             "Expected calculator result %s; OCR read: %r"
             % (EXPECTED_RESULT, text)
