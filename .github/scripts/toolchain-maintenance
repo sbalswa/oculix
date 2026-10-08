@@ -190,18 +190,9 @@ collect_tool_updates() {
   tool_updates="${tool_updates%$'\n'}"
 }
 
-configure_git() {
-  gh auth setup-git
-  export GIT_AUTHOR_NAME="github-actions[bot]"
-  export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
-  export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
-  export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-}
-
 checkout_base() {
   local branch="$1"
 
-  configure_git
   git fetch origin \
     "refs/heads/${branch}:refs/remotes/origin/${branch}"
   git switch --detach "refs/remotes/origin/${branch}"
