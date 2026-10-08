@@ -124,6 +124,12 @@ jobs:
           version: 2026.10.3
           install_args: --locked
 
+      - name: Install Linux window backend (xdotool)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xdotool
+
       - name: Run Oculix smoke script
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
