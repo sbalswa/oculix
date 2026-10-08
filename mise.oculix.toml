@@ -43,6 +43,21 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       darwin-aarch64/libleptonica.6.dylib \
       darwin-aarch64/libtesseract.5.dylib
     cd "$native_directory"
+    leptonica_dependency="$(
+      otool -L libtesseract.5.dylib |
+        awk '/libleptonica[.]6[.]dylib/ { print $1; exit }'
+    )"
+    if [[ -z "$leptonica_dependency" ]]; then
+      printf 'Bundled libtesseract has no libleptonica dependency.\n' >&2
+      exit 1
+    fi
+    if [[ "$leptonica_dependency" != "@loader_path/libleptonica.6.dylib" ]]; then
+      install_name_tool \
+        -change "$leptonica_dependency" \
+        "@loader_path/libleptonica.6.dylib" \
+        libtesseract.5.dylib
+      codesign --force --sign - libtesseract.5.dylib
+    fi
     ln -sfn libleptonica.6.dylib libleptonica.dylib
     ln -sfn libtesseract.5.dylib libtesseract.dylib
   )

@@ -14,9 +14,9 @@ BUTTON_IMAGES = {
     "windows": "calculator-7-windows.png",
 }
 RESULT_REGION = {
-    "linux": (0.10, 0.38),
-    "macos": (0.13, 0.27),
-    "windows": (0.14, 0.28),
+    "linux": (0.00, 0.10, 1.00, 0.38),
+    "macos": (0.04, 0.15, 0.92, 0.17),
+    "windows": (0.08, 0.18, 0.84, 0.18),
 }
 
 
@@ -54,11 +54,11 @@ def capture_failure(screen):
 
 
 def calculator_result_region(window, platform):
-    top_ratio, height_ratio = RESULT_REGION[platform]
+    left_ratio, top_ratio, width_ratio, height_ratio = RESULT_REGION[platform]
     return Region(
-        window.getX(),
+        window.getX() + int(window.getW() * left_ratio),
         window.getY() + int(window.getH() * top_ratio),
-        window.getW(),
+        int(window.getW() * width_ratio),
         int(window.getH() * height_ratio),
     )
 
