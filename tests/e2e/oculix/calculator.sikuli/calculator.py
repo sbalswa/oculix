@@ -33,14 +33,14 @@ def platform_name():
 
 def wait_for_calculator():
     for _ in range(20):
-        app = App.focus(WINDOW_TITLE)
-        if app.isValid():
-            try:
+        try:
+            app = App.focus(WINDOW_TITLE)
+            if app.isValid():
                 window = app.window()
                 if window is not None and window.getW() > 0 and window.getH() > 0:
                     return window
-            except (Exception, NumberFormatException):
-                pass
+        except (Exception, NumberFormatException):
+            pass
         time.sleep(0.5)
     raise AssertionError("Calculator window did not become available.")
 
