@@ -1,8 +1,6 @@
 from java.lang import System
-from io.github.julienmerconsulting.legerix import Legerix
 from org.sikuli.basics import Settings
-from org.sikuli.script import App, Key, Screen
-from org.sikuli.support import Commons
+from org.sikuli.script import App, Key, Pattern, Region, Screen
 
 import os
 import time
@@ -10,6 +8,27 @@ import time
 
 EXPECTED_RESULT = "238"
 WINDOW_TITLE = "Calculator"
+BUTTON_IMAGES = {
+    "linux": "calculator-7-linux.png",
+    "macos": "calculator-7-macos.png",
+    "windows": "calculator-7-windows.png",
+}
+RESULT_REGION = {
+    "linux": (0.10, 0.38),
+    "macos": (0.13, 0.27),
+    "windows": (0.14, 0.28),
+}
+
+
+def platform_name():
+    os_name = System.getProperty("os.name").lower()
+    if os_name.startswith("mac"):
+        return "macos"
+    if os_name.startswith("windows"):
+        return "windows"
+    if os_name.startswith("linux"):
+        return "linux"
+    raise AssertionError("Unsupported calculator platform: %s" % os_name)
 
 
 def wait_for_calculator():
@@ -34,19 +53,23 @@ def capture_failure(screen):
     print("calculator: failure screenshot = %s" % path)
 
 
-def configure_ocr_natives():
-    native_path = Legerix.loadNatives().toString()
-    Commons.jnaPathAdd(native_path)
-    print("calculator: OCR native path = %s" % native_path)
+def calculator_result_region(window, platform):
+    top_ratio, height_ratio = RESULT_REGION[platform]
+    return Region(
+        window.getX(),
+        window.getY() + int(window.getH() * top_ratio),
+        window.getW(),
+        int(window.getH() * height_ratio),
+    )
 
 
 screen = Screen()
 
 try:
-    configure_ocr_natives()
     Settings.OcrTextRead = True
     Settings.OcrTextSearch = True
 
+    platform = platform_name()
     window = wait_for_calculator()
     print(
         "calculator: %s window = %dx%d at (%d,%d)"
@@ -60,17 +83,20 @@ try:
     )
 
     window.type(Key.ESC)
-    seven = window.existsText("7", 10)
+    seven = window.exists(Pattern(BUTTON_IMAGES[platform]).similar(0.80), 10)
     if seven is None:
-        raise AssertionError("OCR could not locate the calculator's 7 button.")
+        raise AssertionError(
+            "Image matching could not locate the calculator's 7 button."
+        )
 
     seven.click()
     window.type("*34")
     window.type(Key.ENTER)
 
-    result = window.existsText(EXPECTED_RESULT, 10)
+    result_region = calculator_result_region(window, platform)
+    result = result_region.existsText(EXPECTED_RESULT, 10)
     if result is None:
-        text = window.text()
+        text = result_region.text()
         raise AssertionError(
             "Expected calculator result %s; OCR read: %r"
             % (EXPECTED_RESULT, text)

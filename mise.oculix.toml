@@ -32,6 +32,24 @@ if [[ "$#" -ne 1 || ! -f "$1" ]]; then
   exit 1
 fi
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # Oculix v4.0.0 bundles versioned dylibs; Tess4J expects unversioned names.
+  native_root="$HOME/tmp/oculix-natives"
+  native_directory="$native_root/darwin-aarch64"
+  mkdir -p "$native_root"
+  (
+    cd "$native_root"
+    jar xf "$1" \
+      darwin-aarch64/libleptonica.6.dylib \
+      darwin-aarch64/libtesseract.5.dylib
+    cd "$native_directory"
+    ln -sfn libleptonica.6.dylib libleptonica.dylib
+    ln -sfn libtesseract.5.dylib libtesseract.dylib
+  )
+  exec java "-Djna.library.path=$native_directory" \
+    -jar "$1" -c -r "$script"
+fi
+
 exec java -jar "$1" -c -r "$script"
 '''
 run_windows = '''
