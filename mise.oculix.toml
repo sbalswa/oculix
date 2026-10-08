@@ -18,11 +18,12 @@ url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4
 url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-windows.jar"
 
 [tasks.oculix]
-description = "Run the basic Oculix smoke script"
+description = "Run an Oculix script"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
+script="${1:-basic.sikuli}"
 oculix_directory="$(mise where http:oculixide)"
 set -- "${oculix_directory}"/*.jar
 
@@ -31,12 +32,13 @@ if [[ "$#" -ne 1 || ! -f "$1" ]]; then
   exit 1
 fi
 
-exec java -jar "$1" -c -r basic.sikuli
+exec java -jar "$1" -c -r "$script"
 '''
 run_windows = '''
 #!/usr/bin/env pwsh
 $ErrorActionPreference = "Stop"
 
+$script = if ($args.Count -gt 0) { $args[0] } else { "basic.sikuli" }
 $oculixDirectory = & mise where http:oculixide
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -47,6 +49,6 @@ if ($jars.Count -ne 1) {
     throw "Expected exactly one Oculix jar in ${oculixDirectory}; found $($jars.Count)."
 }
 
-& java -jar $jars[0].FullName -c -r basic.sikuli
+& java -jar $jars[0].FullName -c -r $script
 exit $LASTEXITCODE
 '''
