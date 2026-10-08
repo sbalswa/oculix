@@ -2,15 +2,15 @@
 
 ## Oculix cross-platform smoke test
 
-Oculix (the `oculixide` jar) and Java (Temurin 17) are pinned in the mise
-toolchain. Run the minimal `.sikuli` smoke script locally:
+Oculix (the `oculixide` jar) and Java (Temurin 17) are pinned in the
+`oculix` mise environment. Run the minimal `.sikuli` smoke script locally:
 
 ```sh
-mise install --locked
+mise -E oculix install --locked
 # Linux is headless, so wrap in Xvfb:
-xvfb-run -a mise run oculix
+xvfb-run -a mise -E oculix run oculix
 # macOS / Windows have a desktop session:
-mise run oculix
+mise -E oculix run oculix
 ```
 
 In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
@@ -28,10 +28,8 @@ In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
 
 ## Development
 
-Prerequisites: install [mise](https://mise.jdx.dev/installing-mise.html) once per
-development environment. On Windows the `oculix` task runs under `bash -c`, so a
-bash (for example [Git for Windows](https://gitforwindows.org/)) must be on
-`PATH`; macOS and Linux already provide one.
+Prerequisite: install [mise](https://mise.jdx.dev/installing-mise.html) once per
+development environment.
 
 After cloning:
 
