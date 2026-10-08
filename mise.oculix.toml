@@ -24,16 +24,14 @@ run = '''
 set -euo pipefail
 
 oculix_directory="$(mise where http:oculixide)"
-shopt -s nullglob
-jars=("${oculix_directory}"/*.jar)
+set -- "${oculix_directory}"/*.jar
 
-if (( ${#jars[@]} != 1 )); then
-  printf 'Expected exactly one Oculix jar in %s; found %d.\n' \
-    "$oculix_directory" "${#jars[@]}" >&2
+if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+  printf 'Expected exactly one Oculix jar in %s.\n' "$oculix_directory" >&2
   exit 1
 fi
 
-exec java -jar "${jars[0]}" -c -r basic.sikuli
+exec java -jar "$1" -c -r basic.sikuli
 '''
 run_windows = '''
 #!/usr/bin/env pwsh
