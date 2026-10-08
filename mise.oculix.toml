@@ -23,7 +23,7 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-script="${1:-basic.sikuli}"
+script="${1:-tests/e2e/oculix/basic.sikuli}"
 oculix_directory="$(mise where http:oculixide)"
 set -- "${oculix_directory}"/*.jar
 
@@ -32,12 +32,14 @@ if [[ "$#" -ne 1 || ! -f "$1" ]]; then
   exit 1
 fi
 
-mkdir -p "$HOME/tmp"
-java_arguments=("-Djava.io.tmpdir=$HOME/tmp")
+temporary_directory="${RUNNER_TEMP:-$HOME/tmp}/oculix"
+mkdir -p "$temporary_directory"
+export TMPDIR="$temporary_directory"
+java_arguments=("-Djava.io.tmpdir=$temporary_directory")
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   # Oculix v4.0.0 bundles versioned dylibs; Tess4J expects unversioned names.
-  native_root="$HOME/tmp/oculix-natives"
+  native_root="$temporary_directory/natives"
   native_directory="$native_root/darwin-aarch64"
   mkdir -p "$native_root"
   (
@@ -73,17 +75,30 @@ run_windows = '''
 #!/usr/bin/env pwsh
 $ErrorActionPreference = "Stop"
 
-$script = if ($args.Count -gt 0) { $args[0] } else { "basic.sikuli" }
+$script = if ($args.Count -gt 0) {
+    $args[0]
+} else {
+    "tests/e2e/oculix/basic.sikuli"
+}
 $oculixDirectory = & mise where http:oculixide
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
+
+$temporaryBase = if ($env:RUNNER_TEMP) {
+    $env:RUNNER_TEMP
+} else {
+    Join-Path $HOME "tmp"
+}
+$temporaryDirectory = Join-Path $temporaryBase "oculix"
+[System.IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
 
 $jars = @(Get-ChildItem -LiteralPath $oculixDirectory -Filter "*.jar" -File)
 if ($jars.Count -ne 1) {
     throw "Expected exactly one Oculix jar in ${oculixDirectory}; found $($jars.Count)."
 }
 
-& java -jar $jars[0].FullName -c -r $script
+& java "-Djava.io.tmpdir=$temporaryDirectory" `
+    -jar $jars[0].FullName -c -r $script
 exit $LASTEXITCODE
 '''

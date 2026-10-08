@@ -183,14 +183,12 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
-          mkdir -p "$HOME/tmp"
-          export TMPDIR="$HOME/tmp"
           xvfb-run -a -s '-screen 0 1280x1024x24' \
             dbus-run-session -- \
             bash -euo pipefail -c '
               fluxbox >/dev/null 2>&1 &
               gnome-calculator >/dev/null 2>&1 &
-              mise run oculix calculator.sikuli
+              mise run oculix tests/e2e/oculix/calculator.sikuli
             '
 
       - name: Exercise Calculator on macOS
@@ -198,14 +196,14 @@ jobs:
         shell: bash
         run: |
           open -a Calculator
-          mise run oculix calculator.sikuli
+          mise run oculix tests/e2e/oculix/calculator.sikuli
 
       - name: Exercise Calculator on Windows
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
           Start-Process calc.exe
-          mise run oculix calculator.sikuli
+          mise run oculix tests/e2e/oculix/calculator.sikuli
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
