@@ -1,4 +1,4 @@
-from java.lang import System
+from java.lang import NumberFormatException, RuntimeException, System
 from org.sikuli.basics import Settings
 from org.sikuli.script import App, Key, Pattern, Region, Screen
 
@@ -39,7 +39,7 @@ def wait_for_calculator():
                 window = app.window()
                 if window is not None and window.getW() > 0 and window.getH() > 0:
                     return window
-            except Exception:
+            except (Exception, NumberFormatException):
                 pass
         time.sleep(0.5)
     raise AssertionError("Calculator window did not become available.")
@@ -112,9 +112,9 @@ try:
         )
 
     print("calculator: verified 7 * 34 = %s" % EXPECTED_RESULT)
-except:
+except (Exception, RuntimeException):
     try:
         capture_failure(screen)
-    except:
+    except (Exception, RuntimeException):
         print("calculator: could not capture failure screenshot")
     raise
