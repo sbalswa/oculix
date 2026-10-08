@@ -7,6 +7,8 @@ readonly branch_prefix="automation/toolchain/"
 readonly issue_title="Toolchain maintenance needs triage"
 readonly minimum_age_days="${TOOLCHAIN_MIN_AGE_DAYS:-7}"
 readonly dry_run="${TOOLCHAIN_DRY_RUN:-false}"
+readonly mise_config_path="mise/config.toml"
+readonly mise_lock_path="mise/mise.lock"
 
 default_branch="$(gh api "repos/${repository}" --jq '.default_branch')"
 readonly default_branch
@@ -95,10 +97,10 @@ current_mise_version() {
   local version
 
   version="$(
-    sed -n 's/^min_version = "\([^"]*\)"$/\1/p' mise.toml
+    sed -n 's/^min_version = "\([^"]*\)"$/\1/p' "${mise_config_path}"
   )"
   if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){2,3}$ ]]; then
-    printf 'mise.toml must contain one numeric min_version.\n' >&2
+    printf '%s must contain one numeric min_version.\n' "${mise_config_path}" >&2
     return 1
   fi
   printf '%s' "$version"
@@ -136,7 +138,7 @@ backend_repository() {
 project_tools() {
   local config_path
 
-  config_path="$(realpath mise.toml)"
+  config_path="$(realpath "${mise_config_path}")"
   mise config ls --json |
     jq -r --arg path "$config_path" \
       '.[] | select(.path == $path) | .tools[]'
@@ -146,7 +148,7 @@ current_tool_version() {
   local tool="$1"
   local config_path
 
-  config_path="$(realpath mise.toml)"
+  config_path="$(realpath "${mise_config_path}")"
   mise ls --current --json |
     jq -r \
       --arg tool "$tool" \
@@ -161,11 +163,11 @@ collect_tool_updates() {
 
   tool_updates=""
   if ! tools="$(project_tools)"; then
-    printf 'Failed to read repository tools from mise.toml.\n' >&2
+    printf 'Failed to read repository tools from %s.\n' "${mise_config_path}" >&2
     return 1
   fi
   if [[ -z "$tools" ]]; then
-    printf 'No repository tools were found in mise.toml.\n' >&2
+    printf 'No repository tools were found in %s.\n' "${mise_config_path}" >&2
     return 1
   fi
 
@@ -292,7 +294,7 @@ update_mise_pin() {
   local matches
 
   matches="$(
-    grep -c -F "min_version = \"${current}\"" mise.toml
+    grep -c -F "min_version = \"${current}\"" "${mise_config_path}"
   )"
   if [[ "$matches" -ne 1 ]]; then
     printf 'Expected one mise pin at %s, found %s.\n' \
@@ -301,7 +303,7 @@ update_mise_pin() {
   fi
   sed -i \
     "s/^min_version = \"${current}\"$/min_version = \"${candidate}\"/" \
-    mise.toml
+    "${mise_config_path}"
 }
 
 update_hk_packages() {
@@ -406,7 +408,7 @@ prepare_mise() {
     head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
   else
     git switch -c "$branch"
-    git add mise.toml
+    git add "${mise_config_path}"
     git commit -m "chore: update mise to ${candidate}"
     head_sha="$(git rev-parse HEAD)"
     push_branch "$branch"
@@ -465,7 +467,7 @@ prepare_tools() {
   branch="${branch_prefix}tools-${digest}"
   while IFS=$'\t' read -r tool current candidate; do
     mise config set \
-      --file mise.toml \
+      --file "${mise_config_path}" \
       --type string \
       "tools.${tool}" \
       "$candidate"
@@ -486,7 +488,7 @@ prepare_tools() {
     head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
   else
     git switch -c "$branch"
-    git add mise.toml mise.lock hk.pkl
+    git add "${mise_config_path}" "${mise_lock_path}" hk.pkl
     git commit -m "chore: update pinned tools"
     head_sha="$(git rev-parse HEAD)"
     push_branch "$branch"

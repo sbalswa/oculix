@@ -1,21 +1,49 @@
 # oculix
 
+## Mise layout
+
+Repository tooling lives under the grouped `mise/` configuration directory:
+
+```text
+mise/
+├── config.toml            # base policy tools + setup/ci tasks
+├── mise.lock              # lock for config.toml (mise naming)
+├── config.oculix.toml     # Java + Oculix jar (MISE_ENV=oculix)
+├── mise.oculix.lock       # lock for config.oculix.toml
+└── tasks/
+    └── oculix/
+        ├── run            # Unix/macOS runner
+        └── run.ps1        # Windows runner
+```
+
+- **Base config** (`mise install --locked`): lightweight policy tools only.
+- **`oculix` environment** (`mise -E oculix install --locked`): additionally installs Java and the Oculix artifact.
+- Future environment pairs (for example `web-e2e`) add `mise/config.<env>.toml` + `mise/mise.<env>.lock` without cluttering the repository root.
+
+After pulling a config-path move, you may need to trust the new paths once (`mise trust`).
+
 ## Oculix cross-platform smoke test
 
 Oculix (the `oculixide` jar) and Java (Temurin 17) are pinned in the
-`oculix` mise environment. Run the minimal `.sikuli` smoke script locally:
+`oculix` mise environment. The canonical runner task is `oculix:run`
+(compatibility alias: `oculix`):
 
 ```sh
 mise -E oculix install --locked
 # Linux is headless, so wrap in Xvfb:
-xvfb-run -a mise -E oculix run oculix
+xvfb-run -a mise -E oculix run oculix:run
 # macOS / Windows have a desktop session:
-mise -E oculix run oculix
+mise -E oculix run oculix:run
+# Optional script argument (default: tests/e2e/oculix/basic.sikuli):
+mise -E oculix run oculix:run tests/e2e/oculix/calculator.sikuli
 ```
 
 In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
 `ubuntu-latest`, `macos-latest`, and `windows-latest` (trigger via
 **Actions → Cross-platform runners → Run workflow**).
+
+Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
+`oculix:run` rather than duplicating platform logic.
 
 ### Not yet built (backlog)
 

@@ -1,27 +1,9 @@
-[tools]
-java = "temurin-17"
-
-[tools."http:oculixide"]
-version = "4.0.0"
-
-[tools."http:oculixide".platforms.linux-x64]
-url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
-
-# The upstream Linux jar is shared across architectures.
-[tools."http:oculixide".platforms.linux-arm64]
-url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-linux.jar"
-
-[tools."http:oculixide".platforms.macos-arm64]
-url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-macos.jar"
-
-[tools."http:oculixide".platforms.windows-x64]
-url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-windows.jar"
-
-[tasks.oculix]
-description = "Run an Oculix script"
-run = '''
 #!/usr/bin/env bash
+#MISE description="Run an Oculix script"
+#MISE alias="oculix"
 set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
 
 script="${1:-tests/e2e/oculix/basic.sikuli}"
 oculix_directory="$(mise where http:oculixide)"
@@ -70,35 +52,3 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 exec java "${java_arguments[@]}" -jar "$1" -c -r "$script"
-'''
-run_windows = '''
-#!/usr/bin/env pwsh
-$ErrorActionPreference = "Stop"
-
-$script = if ($args.Count -gt 0) {
-    $args[0]
-} else {
-    "tests/e2e/oculix/basic.sikuli"
-}
-$oculixDirectory = & mise where http:oculixide
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-$temporaryBase = if ($env:RUNNER_TEMP) {
-    $env:RUNNER_TEMP
-} else {
-    Join-Path $HOME "tmp"
-}
-$temporaryDirectory = Join-Path $temporaryBase "oculix"
-[System.IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
-
-$jars = @(Get-ChildItem -LiteralPath $oculixDirectory -Filter "*.jar" -File)
-if ($jars.Count -ne 1) {
-    throw "Expected exactly one Oculix jar in ${oculixDirectory}; found $($jars.Count)."
-}
-
-& java "-Djava.io.tmpdir=$temporaryDirectory" `
-    -jar $jars[0].FullName -c -r $script
-exit $LASTEXITCODE
-'''
