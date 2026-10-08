@@ -18,11 +18,12 @@ url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4
 url = "https://github.com/oculix-org/Oculix/releases/download/v4.0.0/oculixide-4.0.0-windows.jar"
 
 [tasks.oculix]
-description = "Run the basic Oculix smoke script"
+description = "Run an Oculix script"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
+script="${1:-tests/e2e/oculix/basic.sikuli}"
 oculix_directory="$(mise where http:oculixide)"
 set -- "${oculix_directory}"/*.jar
 
@@ -31,22 +32,73 @@ if [[ "$#" -ne 1 || ! -f "$1" ]]; then
   exit 1
 fi
 
-exec java -jar "$1" -c -r basic.sikuli
+temporary_directory="${RUNNER_TEMP:-$HOME/tmp}/oculix"
+mkdir -p "$temporary_directory"
+export TMPDIR="$temporary_directory"
+java_arguments=("-Djava.io.tmpdir=$temporary_directory")
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # Oculix v4.0.0 bundles versioned dylibs; Tess4J expects unversioned names.
+  native_root="$temporary_directory/natives"
+  native_directory="$native_root/darwin-aarch64"
+  mkdir -p "$native_root"
+  (
+    cd "$native_root"
+    jar xf "$1" \
+      darwin-aarch64/libleptonica.6.dylib \
+      darwin-aarch64/libtesseract.5.dylib
+    cd "$native_directory"
+    leptonica_dependency="$(
+      otool -L libtesseract.5.dylib |
+        awk '/libleptonica[.]6[.]dylib/ { print $1; exit }'
+    )"
+    if [[ -z "$leptonica_dependency" ]]; then
+      printf 'Bundled libtesseract has no libleptonica dependency.\n' >&2
+      exit 1
+    fi
+    if [[ "$leptonica_dependency" != "@loader_path/libleptonica.6.dylib" ]]; then
+      install_name_tool \
+        -change "$leptonica_dependency" \
+        "@loader_path/libleptonica.6.dylib" \
+        libtesseract.5.dylib
+      codesign --force --sign - libtesseract.5.dylib
+    fi
+    ln -sfn libleptonica.6.dylib libleptonica.dylib
+    ln -sfn libtesseract.5.dylib libtesseract.dylib
+  )
+  java_arguments+=("-Djna.library.path=$native_directory")
+fi
+
+exec java "${java_arguments[@]}" -jar "$1" -c -r "$script"
 '''
 run_windows = '''
 #!/usr/bin/env pwsh
 $ErrorActionPreference = "Stop"
 
+$script = if ($args.Count -gt 0) {
+    $args[0]
+} else {
+    "tests/e2e/oculix/basic.sikuli"
+}
 $oculixDirectory = & mise where http:oculixide
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
+
+$temporaryBase = if ($env:RUNNER_TEMP) {
+    $env:RUNNER_TEMP
+} else {
+    Join-Path $HOME "tmp"
+}
+$temporaryDirectory = Join-Path $temporaryBase "oculix"
+[System.IO.Directory]::CreateDirectory($temporaryDirectory) | Out-Null
 
 $jars = @(Get-ChildItem -LiteralPath $oculixDirectory -Filter "*.jar" -File)
 if ($jars.Count -ne 1) {
     throw "Expected exactly one Oculix jar in ${oculixDirectory}; found $($jars.Count)."
 }
 
-& java -jar $jars[0].FullName -c -r basic.sikuli
+& java "-Djava.io.tmpdir=$temporaryDirectory" `
+    -jar $jars[0].FullName -c -r $script
 exit $LASTEXITCODE
 '''

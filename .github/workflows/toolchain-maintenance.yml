@@ -14,6 +14,16 @@ on:
 
 permissions: {}
 
+env:
+  GIT_AUTHOR_EMAIL: >-
+    ${{ format('{0}+{1}@users.noreply.github.com',
+        github.actor_id, github.actor) }}
+  GIT_AUTHOR_NAME: ${{ github.actor }}
+  GIT_COMMITTER_EMAIL: >-
+    ${{ format('{0}+{1}@users.noreply.github.com',
+        github.actor_id, github.actor) }}
+  GIT_COMMITTER_NAME: ${{ github.actor }}
+
 concurrency:
   group: toolchain-maintenance
   cancel-in-progress: false
@@ -72,6 +82,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Create mise update
         id: prepare
@@ -181,6 +196,11 @@ jobs:
           version: ${{ steps.mise.outputs.version }}
           install: false
           cache: false
+
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Create tool updates
         id: prepare
