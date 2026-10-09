@@ -54,6 +54,15 @@ Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
   is ours to set; macOS/Windows use the runner image defaults. The smoke script
   logs the detected geometry so this can be normalized later with real data.
 
+## Toolchain maintenance
+
+Scheduled updates stack as `mise` → `tools` → parallel `extras/*` leaves off
+tools. The first extras leaf is `extras/oculix`: age-gated **stable** Oculix
+GitHub releases plus Temurin **17 point** lock refreshes under the existing
+`java = "temurin-17"` pin. Java major-line changes stay manual
+([#19](https://github.com/sbalswa/oculix/issues/19)); RC early-warning is
+backlog ([#18](https://github.com/sbalswa/oculix/issues/18)).
+
 ## Development
 
 Prerequisite: install [mise](https://mise.jdx.dev/installing-mise.html) once per
