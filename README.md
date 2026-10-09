@@ -56,9 +56,7 @@ Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
 
 ## Toolchain maintenance
 
-Scheduled updates stack as `mise` → `tools` → parallel `extras/*` leaves off
-tools. The `extras/oculix` leaf refreshes age-gated stable Oculix releases and
-Java point releases within the configured major pin.
+Scheduled updates stack as `mise` → `tools` → parallel `extras/*`
 
 ## Development
 
