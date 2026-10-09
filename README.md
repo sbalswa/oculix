@@ -57,11 +57,8 @@ Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
 ## Toolchain maintenance
 
 Scheduled updates stack as `mise` → `tools` → parallel `extras/*` leaves off
-tools. The first extras leaf is `extras/oculix`: age-gated **stable** Oculix
-GitHub releases plus Temurin **17 point** lock refreshes under the existing
-`java = "temurin-17"` pin. Java major-line changes stay manual
-([#19](https://github.com/sbalswa/oculix/issues/19)); RC early-warning is
-backlog ([#18](https://github.com/sbalswa/oculix/issues/18)).
+tools. The `extras/oculix` leaf refreshes age-gated stable Oculix releases and
+Java point releases within the configured major pin.
 
 ## Development
 

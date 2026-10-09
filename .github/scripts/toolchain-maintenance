@@ -521,8 +521,6 @@ collect_extras_oculix_updates() {
   fi
 
   current_java="$(current_java_lock_version)"
-  # Temurin point releases stay on the configured major pin (temurin-17).
-  # Age gating uses CI validation rather than Adoptium publish timestamps.
   bump_json="$(
     mise -E oculix lock \
       --bump \
@@ -605,13 +603,13 @@ prepare_extras_oculix() {
 
   pr="$(pull_request_number "$branch")"
   if [[ -z "$pr" ]]; then
-    body="Updates the oculix extras lane (Oculix stable release and/or Temurin 17 point lock) after the configured ${minimum_age_days}-day waiting period for Oculix.
+    body="Updates the oculix extras lane (Oculix stable release and/or Java point lock) after the configured ${minimum_age_days}-day waiting period for Oculix.
 
 \`\`\`
 ${extras_oculix_summary}
 \`\`\`
 
-Stacked after tools (parallel extras leaf). Cross-platform validation must pass before this PR is made ready. Java major-line changes remain manual (#19); RC scanning is backlog (#18)."
+Stacked after tools as a parallel extras leaf. Cross-platform validation must pass before this PR is made ready."
     create_pull_request \
       "$branch" \
       "$base" \
