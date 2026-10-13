@@ -106,7 +106,7 @@ jobs:
     if: ${{ needs.prepare_mise.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: $/.github/workflows/cross-platform.yml
+    uses: ./.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_mise.outputs.head_sha }}
 
@@ -224,7 +224,7 @@ jobs:
     if: ${{ needs.prepare_tools.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: $/.github/workflows/cross-platform.yml
+    uses: ./.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_tools.outputs.head_sha }}
 
@@ -259,6 +259,135 @@ jobs:
           EXPECTED_BASE_BRANCH: ${{ needs.prepare_tools.outputs.base_branch }}
           PR_NUMBER: ${{ needs.prepare_tools.outputs.pr_number }}
 
+  prepare_extras_oculix:
+    name: Prepare oculix extras updates
+    needs:
+      - plan
+      - prepare_mise
+      - prepare_tools
+      - validate_tools
+      - ready_tools
+    if: >-
+      ${{
+        always() &&
+        needs.plan.result == 'success' &&
+        needs.plan.outputs.blocked != 'true' &&
+        (
+          (
+            needs.prepare_tools.result == 'success' &&
+            needs.prepare_tools.outputs.changed != 'true'
+          ) ||
+          needs.ready_tools.result == 'success'
+        )
+      }}
+    permissions:
+      contents: write # Create the extras update branch and lockfile.
+      pull-requests: write # Create and stack its held or draft PR.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      base_branch: ${{ steps.prepare.outputs.base_branch }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      branch: ${{ steps.prepare.outputs.branch }}
+      changed: ${{ steps.prepare.outputs.changed }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: >-
+            ${{ needs.prepare_tools.outputs.head_sha ||
+                needs.prepare_mise.outputs.head_sha ||
+                github.sha }}
+          persist-credentials: false
+
+      - name: Read repository mise pin
+        id: mise
+        run: |
+          version="$(
+            sed -n 's/^min_version = "\([^"]*\)"$/\1/p' mise/config.toml
+          )"
+          if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){2,3}$ ]]; then
+            echo "mise/config.toml must contain one numeric min_version." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ steps.mise.outputs.version }}
+          install: false
+          cache: false
+
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create oculix extras updates
+        id: prepare
+        run: .github/scripts/toolchain-maintenance checked prepare-extras-oculix
+        env:
+          BASE_BRANCH: >-
+            ${{ needs.prepare_tools.outputs.branch ||
+                needs.prepare_mise.outputs.branch ||
+                github.event.repository.default_branch }}
+          BASE_SHA: >-
+            ${{ needs.prepare_tools.outputs.head_sha ||
+                needs.prepare_mise.outputs.head_sha ||
+                github.sha }}
+          BOTTOM_PR: >-
+            ${{ needs.prepare_tools.outputs.pr_number ||
+                needs.prepare_mise.outputs.pr_number }}
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_MIN_AGE_DAYS: >-
+            ${{ inputs.minimum_release_age_days ||
+                vars.TOOLCHAIN_MIN_AGE_DAYS ||
+                '7' }}
+
+  validate_extras_oculix:
+    name: Validate oculix extras updates
+    needs: prepare_extras_oculix
+    if: ${{ needs.prepare_extras_oculix.outputs.changed == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/cross-platform.yml
+    with:
+      ref: ${{ needs.prepare_extras_oculix.outputs.head_sha }}
+
+  ready_extras_oculix:
+    name: Mark oculix extras updates ready
+    needs:
+      - prepare_extras_oculix
+      - validate_extras_oculix
+    if: ${{ needs.validate_extras_oculix.result == 'success' }}
+    permissions:
+      actions: read # Confirm every completed job succeeded.
+      checks: read # Reject warning annotations before readiness.
+      contents: read # Read the maintenance script.
+      issues: write # Report failures or warnings before readiness.
+      pull-requests: write # Mark the validated PR ready.
+      statuses: write # Record validation on the candidate commit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Mark PR ready
+        run: .github/scripts/toolchain-maintenance checked ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.prepare_extras_oculix.outputs.head_sha }}
+          HEAD_BRANCH: ${{ needs.prepare_extras_oculix.outputs.branch }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare_extras_oculix.outputs.base_sha }}
+          EXPECTED_BASE_BRANCH: ${{ needs.prepare_extras_oculix.outputs.base_branch }}
+          PR_NUMBER: ${{ needs.prepare_extras_oculix.outputs.pr_number }}
+
   report:
     name: Report failures or warnings
     needs:
@@ -269,6 +398,9 @@ jobs:
       - prepare_tools
       - validate_tools
       - ready_tools
+      - prepare_extras_oculix
+      - validate_extras_oculix
+      - ready_extras_oculix
     if: ${{ always() }}
     permissions:
       actions: read # Inspect every job in this maintenance run.

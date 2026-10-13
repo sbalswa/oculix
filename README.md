@@ -54,6 +54,10 @@ Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
   is ours to set; macOS/Windows use the runner image defaults. The smoke script
   logs the detected geometry so this can be normalized later with real data.
 
+## Toolchain maintenance
+
+Scheduled updates stack as `mise` → `tools` → parallel `extras/*`
+
 ## Development
 
 Prerequisite: install [mise](https://mise.jdx.dev/installing-mise.html) once per
