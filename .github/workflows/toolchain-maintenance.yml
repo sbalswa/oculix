@@ -106,7 +106,7 @@ jobs:
     if: ${{ needs.prepare_mise.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: $/.github/workflows/cross-platform.yml
+    uses: ./.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_mise.outputs.head_sha }}
 
@@ -224,7 +224,7 @@ jobs:
     if: ${{ needs.prepare_tools.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: $/.github/workflows/cross-platform.yml
+    uses: ./.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_tools.outputs.head_sha }}
 
