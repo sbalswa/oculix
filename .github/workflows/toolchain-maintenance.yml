@@ -273,7 +273,10 @@ jobs:
         needs.plan.result == 'success' &&
         needs.plan.outputs.blocked != 'true' &&
         (
-          needs.prepare_tools.result == 'skipped' ||
+          (
+            needs.prepare_tools.result == 'success' &&
+            needs.prepare_tools.outputs.changed != 'true'
+          ) ||
           needs.ready_tools.result == 'success'
         )
       }}
