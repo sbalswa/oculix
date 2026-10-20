@@ -1,6 +1,6 @@
 from org.sikuli.script import Screen
 
-print("hello from oculix")
+print("oculix: smoke ready")
 
 scr = Screen()
 bounds = scr.getBounds()

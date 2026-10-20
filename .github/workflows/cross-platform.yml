@@ -190,7 +190,7 @@ jobs:
             bash -euo pipefail -c '
               fluxbox >/dev/null 2>&1 &
               gnome-calculator >/dev/null 2>&1 &
-              mise run oculix:run tests/e2e/oculix/calculator.sikuli
+              mise run oculix:run tests/e2e/oculix/native-calculator.sikuli
             '
 
       - name: Exercise Calculator on macOS
@@ -198,14 +198,14 @@ jobs:
         shell: bash
         run: |
           open -a Calculator
-          mise run oculix:run tests/e2e/oculix/calculator.sikuli
+          mise run oculix:run tests/e2e/oculix/native-calculator.sikuli
 
       - name: Exercise Calculator on Windows
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
           Start-Process calc.exe
-          mise run oculix:run tests/e2e/oculix/calculator.sikuli
+          mise run oculix:run tests/e2e/oculix/native-calculator.sikuli
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
