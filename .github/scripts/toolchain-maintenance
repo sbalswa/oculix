@@ -245,17 +245,160 @@ verify_expected_branch() {
       "$branch" >&2
     return 1
   fi
+  verify_github_commit "$remote_sha"
   printf '%s' "$remote_sha"
 }
 
-push_branch() {
+verify_github_commit() {
+  local sha="$1"
+  local attempt data verified reason author
+
+  for attempt in {1..5}; do
+    if data="$(
+      gh api \
+        --method GET \
+        "repos/${repository}/commits/${sha}"
+    )"; then
+      verified="$(
+        jq -r '.commit.verification.verified' <<<"$data"
+      )"
+      reason="$(
+        jq -r '.commit.verification.reason' <<<"$data"
+      )"
+      author="$(
+        jq -r '.author.login // empty' <<<"$data"
+      )"
+      if [[ "$verified" == "true" &&
+            "$author" == "github-actions[bot]" ]]; then
+        return
+      fi
+    fi
+    if ((attempt < 5)); then
+      sleep 1
+    fi
+  done
+
+  printf 'Commit %s must be authored by github-actions[bot] and verified; author=%s verification=%s (%s).\n' \
+    "$sha" "${author:-unknown}" "${verified:-unknown}" "${reason:-unknown}" >&2
+  return 1
+}
+
+create_github_commit() {
   local branch="$1"
+  local base_sha="$2"
+  local expected_diff="$3"
+  local headline="$4"
+  shift 4
+
+  local additions="[]" deletions="[]" path contents existing_sha
+  local query payload response commit_sha errors
+
+  for path in "$@"; do
+    if [[ -f "$path" ]]; then
+      contents="$(base64 <"$path" | tr -d '\n')"
+      additions="$(
+        jq -c \
+          --arg path "$path" \
+          --arg contents "$contents" \
+          '. + [{path: $path, contents: $contents}]' \
+          <<<"$additions"
+      )"
+    elif git cat-file -e "${base_sha}:${path}" 2>/dev/null; then
+      deletions="$(
+        jq -c \
+          --arg path "$path" \
+          '. + [{path: $path}]' \
+          <<<"$deletions"
+      )"
+    else
+      printf 'Cannot commit missing path %s.\n' "$path" >&2
+      return 1
+    fi
+  done
 
   if [[ "$dry_run" == "true" ]]; then
-    printf 'Would push %s\n' "$branch"
-  else
-    git push origin "HEAD:refs/heads/${branch}"
+    printf 'Would create a GitHub-signed commit on %s: %s\n' \
+      "$branch" "$headline" >&2
+    printf '%s' "$base_sha"
+    return
   fi
+
+  existing_sha="$(remote_branch_sha "$branch")"
+  if [[ -z "$existing_sha" ]]; then
+    gh api \
+      --silent \
+      --method POST \
+      "repos/${repository}/git/refs" \
+      -f ref="refs/heads/${branch}" \
+      -f sha="$base_sha"
+  elif [[ "$existing_sha" != "$base_sha" ]]; then
+    printf 'Remote branch %s moved before its commit was created.\n' \
+      "$branch" >&2
+    return 1
+  fi
+
+  # GraphQL variables intentionally retain their literal $ prefix.
+  # shellcheck disable=SC2016
+  query='
+    mutation CreateAutomationCommit($input: CreateCommitOnBranchInput!) {
+      createCommitOnBranch(input: $input) {
+        commit {
+          oid
+        }
+      }
+    }
+  '
+  payload="$(
+    jq -n \
+      --arg query "$query" \
+      --arg repository "$repository" \
+      --arg branch "$branch" \
+      --arg expected_head_oid "$base_sha" \
+      --arg headline "$headline" \
+      --argjson additions "$additions" \
+      --argjson deletions "$deletions" \
+      '{
+        query: $query,
+        variables: {
+          input: {
+            branch: {
+              repositoryNameWithOwner: $repository,
+              branchName: $branch
+            },
+            expectedHeadOid: $expected_head_oid,
+            message: {
+              headline: $headline
+            },
+            fileChanges: {
+              additions: $additions,
+              deletions: $deletions
+            }
+          }
+        }
+      }'
+  )"
+  response="$(
+    gh api graphql --input - <<<"$payload"
+  )"
+  errors="$(jq -r '.errors // empty' <<<"$response")"
+  commit_sha="$(
+    jq -r '.data.createCommitOnBranch.commit.oid // empty' <<<"$response"
+  )"
+  if [[ -n "$errors" || -z "$commit_sha" ]]; then
+    printf 'Failed to create GitHub-signed commit on %s:\n%s\n' \
+      "$branch" "$response" >&2
+    return 1
+  fi
+
+  existing_sha="$(
+    verify_expected_branch "$branch" "$base_sha" "$expected_diff"
+  )"
+  if [[ "$existing_sha" != "$commit_sha" ]]; then
+    printf 'GitHub created commit %s, but branch %s resolves to %s.\n' \
+      "$commit_sha" "$branch" "$existing_sha" >&2
+    return 1
+  fi
+  printf '%s' "$commit_sha"
 }
 
 pull_request_number() {
@@ -411,14 +554,17 @@ prepare_mise() {
 
   branch="${branch_prefix}mise-${candidate}-${base_sha:0:12}"
   existing_sha="$(remote_branch_sha "$branch")"
-  if [[ -n "$existing_sha" ]]; then
+  if [[ -n "$existing_sha" && "$existing_sha" != "$base_sha" ]]; then
     head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
   else
-    git switch -c "$branch"
-    git add "${mise_config_path}"
-    git commit -m "chore: update mise to ${candidate}"
-    head_sha="$(git rev-parse HEAD)"
-    push_branch "$branch"
+    head_sha="$(
+      create_github_commit \
+        "$branch" \
+        "$base_sha" \
+        "$expected_diff" \
+        "chore: update mise to ${candidate}" \
+        "${mise_config_path}"
+    )"
   fi
 
   pr="$(pull_request_number "$branch")"
@@ -591,14 +737,18 @@ prepare_extras_oculix() {
   )"
   branch="${branch_prefix}extras-oculix-${digest}"
   existing_sha="$(remote_branch_sha "$branch")"
-  if [[ -n "$existing_sha" ]]; then
+  if [[ -n "$existing_sha" && "$existing_sha" != "$base_sha" ]]; then
     head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
   else
-    git switch -c "$branch"
-    git add "${oculix_config_path}" "${oculix_lock_path}"
-    git commit -m "chore: update oculix extras pins"
-    head_sha="$(git rev-parse HEAD)"
-    push_branch "$branch"
+    head_sha="$(
+      create_github_commit \
+        "$branch" \
+        "$base_sha" \
+        "$expected_diff" \
+        "chore: update oculix extras pins" \
+        "${oculix_config_path}" \
+        "${oculix_lock_path}"
+    )"
   fi
 
   pr="$(pull_request_number "$branch")"
@@ -686,14 +836,19 @@ prepare_tools() {
   fi
 
   existing_sha="$(remote_branch_sha "$branch")"
-  if [[ -n "$existing_sha" ]]; then
+  if [[ -n "$existing_sha" && "$existing_sha" != "$base_sha" ]]; then
     head_sha="$(verify_expected_branch "$branch" "$base_sha" "$expected_diff")"
   else
-    git switch -c "$branch"
-    git add "${mise_config_path}" "${mise_lock_path}" hk.pkl
-    git commit -m "chore: update pinned tools"
-    head_sha="$(git rev-parse HEAD)"
-    push_branch "$branch"
+    head_sha="$(
+      create_github_commit \
+        "$branch" \
+        "$base_sha" \
+        "$expected_diff" \
+        "chore: update pinned tools" \
+        "${mise_config_path}" \
+        "${mise_lock_path}" \
+        hk.pkl
+    )"
   fi
 
   pr="$(pull_request_number "$branch")"
