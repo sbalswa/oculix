@@ -337,7 +337,7 @@ create_github_commit() {
     return 1
   fi
 
-  # GraphQL variables intentionally retain their literal $ prefix.
+  # $input is GraphQL syntax and must reach GitHub literally; it is not a shell variable.
   # shellcheck disable=SC2016
   query='
     mutation CreateAutomationCommit($input: CreateCommitOnBranchInput!) {
