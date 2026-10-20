@@ -5,7 +5,7 @@ lockfile_version = 3
 [[tools.node]]
 version = "24.22.0"
 backend = "core:node"
-specifiers = ["24.22.0"]
+specifiers = ["24"]
 
 [tools.node."platforms.linux-arm64"]
 checksum = "sha256:b7e7991d5407815adfa74a2a9cd4db683552c8ce32ff4a295c22e972849c3f5d"
