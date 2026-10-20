@@ -63,9 +63,15 @@ jobs:
         os: >-
           ${{
             fromJSON(
-              github.event_name == 'pull_request' &&
-              '["ubuntu-latest"]' ||
-              '["ubuntu-latest","macos-latest","windows-latest"]'
+              (
+                github.event_name != 'pull_request' ||
+                (
+                  startsWith(github.head_ref, 'automation/toolchain/') &&
+                  github.event.action == 'synchronize'
+                )
+              ) &&
+              '["ubuntu-latest","macos-latest","windows-latest"]' ||
+              '["ubuntu-latest"]'
             )
           }}
 
