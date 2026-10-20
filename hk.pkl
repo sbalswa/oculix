@@ -21,7 +21,7 @@ steps {
   }
   ["shellcheck"] = Builtins.shellcheck
   ["zizmor"] = (Builtins.zizmor) {
-    check = "zizmor --pedantic --no-progress {{files}}"
+    check = "zizmor --persona=auditor --strict-collection --no-progress {{files}}"
   }
 
   ["byte_order_marker"] = Builtins.byte_order_marker
