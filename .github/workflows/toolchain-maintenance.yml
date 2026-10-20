@@ -39,7 +39,7 @@ jobs:
       contents: read # Read the checked-out toolchain pins.
       issues: write # Report an interrupted held update.
       pull-requests: read # Avoid overlapping open update cycles.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       base_sha: ${{ steps.plan.outputs.base_sha }}
@@ -68,7 +68,7 @@ jobs:
     permissions:
       contents: write # Create the mise update branch.
       pull-requests: write # Create its held or draft PR.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       base_branch: ${{ steps.prepare.outputs.base_branch }}
@@ -123,7 +123,7 @@ jobs:
       issues: write # Report failures or warnings before readiness.
       pull-requests: write # Mark the validated PR ready.
       statuses: write # Record validation on the candidate commit.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -161,7 +161,7 @@ jobs:
     permissions:
       contents: write # Create the tool update branch and lockfile.
       pull-requests: write # Create and stack its held or draft PR.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       base_branch: ${{ steps.prepare.outputs.base_branch }}
@@ -241,7 +241,7 @@ jobs:
       issues: write # Report failures or warnings before readiness.
       pull-requests: write # Mark the validated PR ready.
       statuses: write # Record validation on the candidate commit.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -283,7 +283,7 @@ jobs:
     permissions:
       contents: write # Create the extras update branch and lockfile.
       pull-requests: write # Create and stack its held or draft PR.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
       base_branch: ${{ steps.prepare.outputs.base_branch }}
@@ -370,7 +370,7 @@ jobs:
       issues: write # Report failures or warnings before readiness.
       pull-requests: write # Mark the validated PR ready.
       statuses: write # Record validation on the candidate commit.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repository
@@ -407,7 +407,7 @@ jobs:
       checks: read # Inspect warning annotations.
       contents: read # Read the maintenance script.
       issues: write # Create or update the triage issue.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out repository

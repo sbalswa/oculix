@@ -39,7 +39,7 @@ mise -E oculix run oculix:run tests/e2e/oculix/calculator.sikuli
 ```
 
 In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
-`ubuntu-latest`, `macos-latest`, and `windows-latest` (trigger via
+`ubuntu-24.04`, `macos-latest`, and `windows-latest` (trigger via
 **Actions → Cross-platform runners → Run workflow**).
 
 Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
