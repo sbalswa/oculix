@@ -53,9 +53,21 @@ jobs:
 
   checks:
     needs: configuration
-    name: Repository checks
-    runs-on: ubuntu-latest
+    name: Repository checks on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: >-
+          ${{
+            fromJSON(
+              github.event_name == 'pull_request' &&
+              '["ubuntu-latest"]' ||
+              '["ubuntu-latest","macos-latest","windows-latest"]'
+            )
+          }}
 
     steps:
       - name: Check out repository
@@ -70,8 +82,16 @@ jobs:
           version: ${{ needs.configuration.outputs.mise-version }}
           install_args: --locked
 
-      - name: Run repository checks
+      - name: Run repository checks on Unix
+        if: ${{ runner.os != 'Windows' }}
         shell: bash
+        run: mise run ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Run repository checks on Windows
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
         run: mise run ci
         env:
           GH_TOKEN: ${{ github.token }}
