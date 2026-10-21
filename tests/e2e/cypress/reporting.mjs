@@ -212,6 +212,7 @@ export async function prepareScenarioDiagnostics(
 
 export function createCypressReportingTasks({
   axeCoreVersion,
+  axeSource,
   diagnosticsDirectory,
   scenario,
 }) {
@@ -228,6 +229,10 @@ export function createCypressReportingTasks({
   const assertionPath = resolve(scenarioDirectory, ASSERTION_FILE);
 
   return {
+    axeSource() {
+      return axeSource;
+    },
+
     async enforceAccessibility() {
       const accessibility = await readJsonIfPresent(accessibilityPath);
       return evaluateAccessibilityPolicy(accessibility);
@@ -322,6 +327,14 @@ function operatingSystemDetails(selection, result) {
     selectionSource: selection.operatingSystemSource,
     version: result?.osVersion ?? null,
   };
+}
+
+function matrixCapabilityId(selection) {
+  return [
+    "cypress",
+    selection.operatingSystem,
+    selection.browser,
+  ].join("-");
 }
 
 async function artifactPaths({
@@ -420,10 +433,7 @@ export async function writeScenarioResult({
     }),
     assertion,
     browser: browserDetails(selection, result),
-    capabilityId:
-      selection.scenario === "smoke"
-        ? "browser-smoke"
-        : "web-calculator",
+    capabilityId: matrixCapabilityId(selection),
     error: resultMessage(result, error),
     operatingSystem: operatingSystemDetails(selection, result),
     scenario: selection.scenario,
@@ -456,7 +466,8 @@ function summaryMarkdown(summary) {
   const rows = summary.scenarios
     .map(
       (scenario) =>
-        `| ${markdownCell(scenario.scenario)} | ` +
+        `| \`${markdownCell(scenario.capabilityId)}\` | ` +
+        `${markdownCell(scenario.scenario)} | ` +
         `${scenario.status} | ${scenario.assertionStatus} | ` +
         `${scenario.accessibilityStatus} | ` +
         `${scenario.violationRules} | ${scenario.incompleteRules} | ` +
@@ -465,8 +476,10 @@ function summaryMarkdown(summary) {
     .join("\n");
   return `# Cypress E2E summary
 
-| Scenario | Status | Assertion | Accessibility | Violations | Incomplete | Report |
-| --- | --- | --- | --- | ---: | ---: | --- |
+- Capability: \`${summary.capabilityId ?? "mixed"}\`
+
+| Capability | Scenario | Status | Assertion | Accessibility | Violations | Incomplete | Report |
+| --- | --- | --- | --- | --- | ---: | ---: | --- |
 ${rows}
 `;
 }
@@ -485,6 +498,7 @@ export async function writeAggregateSummary({
     scenarios.push({
       accessibilityStatus: run.accessibility.status,
       assertionStatus: run.assertion.status,
+      capabilityId: run.capabilityId,
       incompleteRules: run.accessibility.counts.incomplete.rules,
       runJson: toRepositoryRelativePath(runPath, repositoryRoot),
       scenario: run.scenario,
@@ -492,7 +506,11 @@ export async function writeAggregateSummary({
       violationRules: run.accessibility.counts.violations.rules,
     });
   }
+  const capabilityIds = [
+    ...new Set(scenarios.map((scenario) => scenario.capabilityId)),
+  ];
   const summary = {
+    capabilityId: capabilityIds.length === 1 ? capabilityIds[0] : null,
     generatedAt: new Date().toISOString(),
     scenarios,
     schemaVersion: SCHEMA_VERSION,

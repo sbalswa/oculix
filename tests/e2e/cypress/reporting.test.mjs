@@ -201,11 +201,13 @@ test("writes accessibility reports before returning a blocking result", async ()
   const diagnostics = resolve(root, "diagnostics");
   const tasks = createCypressReportingTasks({
     axeCoreVersion: "4.14.0",
+    axeSource: "window.axe = {};",
     diagnosticsDirectory: diagnostics,
     scenario: "web-calculator",
   });
 
   try {
+    assert.equal(await tasks.axeSource(), "window.axe = {};");
     await tasks.recordAccessibility({
       durationMs: 10,
       finishedAt: "2026-10-21T12:00:00.010Z",
@@ -244,6 +246,42 @@ test("writes accessibility reports before returning a blocking result", async ()
         "utf8",
       ),
       /Incomplete\/manual-review findings: retained, nonblocking/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("launch failures retain the stable matrix capability identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cypress-launch-failure-"));
+  const diagnostics = resolve(
+    root,
+    "tests/e2e/cypress/diagnostics",
+  );
+
+  try {
+    await prepareScenarioDiagnostics(diagnostics, "web-calculator");
+    const report = await writeScenarioResult({
+      axeCoreVersion: "4.14.0",
+      cypressVersion: "16.2.0",
+      diagnosticsDirectory: diagnostics,
+      error: new Error("Chrome did not launch"),
+      finishedAt: "2026-10-21T12:00:01.000Z",
+      repositoryRoot: root,
+      selection: selection("web-calculator"),
+      startedAt: "2026-10-21T12:00:00.000Z",
+    });
+
+    assert.equal(report.capabilityId, "cypress-ubuntu-chrome");
+    assert.equal(report.scenario, "web-calculator");
+    assert.equal(report.status, "failed");
+    const summary = JSON.parse(
+      await readFile(resolve(diagnostics, "summary.json"), "utf8"),
+    );
+    assert.equal(summary.capabilityId, "cypress-ubuntu-chrome");
+    assert.equal(
+      summary.scenarios[0].capabilityId,
+      "cypress-ubuntu-chrome",
     );
   } finally {
     await rm(root, { force: true, recursive: true });
@@ -309,11 +347,23 @@ test("scenario cleanup and summaries retain sequential results", async () => {
         "utf8",
       ),
     );
-    assert.equal(calculatorRun.capabilityId, "web-calculator");
+    assert.equal(
+      calculatorRun.capabilityId,
+      "cypress-ubuntu-chrome",
+    );
     assert.equal(calculatorRun.tool.version, "16.2.0");
     assert.equal(
       calculatorRun.artifacts.runJson,
       "tests/e2e/cypress/diagnostics/web-calculator/run.json",
+    );
+    assert.equal(summary.capabilityId, "cypress-ubuntu-chrome");
+    assert.deepEqual(
+      summary.scenarios.map((scenario) => scenario.capabilityId),
+      ["cypress-ubuntu-chrome", "cypress-ubuntu-chrome"],
+    );
+    assert.match(
+      await readFile(resolve(diagnostics, "summary.md"), "utf8"),
+      /Capability: `cypress-ubuntu-chrome`/,
     );
   } finally {
     await rm(root, { force: true, recursive: true });

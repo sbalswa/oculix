@@ -1,5 +1,3 @@
-import axe from "axe-core";
-
 import { ACCESSIBILITY_POLICY } from "./accessibility-policy.mjs";
 
 export function auditAccessibility(state) {
@@ -7,24 +5,26 @@ export function auditAccessibility(state) {
   let startedMilliseconds;
 
   return cy
-    .window({ log: false })
-    .then(async (window) => {
-      startedAt = new Date().toISOString();
-      startedMilliseconds = performance.now();
-      window.eval(axe.source);
-      return window.axe.run(window.document, {
-        resultTypes: [
-          "violations",
-          "incomplete",
-          "passes",
-          "inapplicable",
-        ],
-        runOnly: {
-          type: "tag",
-          values: ACCESSIBILITY_POLICY.tags,
-        },
-      });
-    })
+    .task("report:axe-source", null, { log: false })
+    .then((source) =>
+      cy.window({ log: false }).then(async (window) => {
+        startedAt = new Date().toISOString();
+        startedMilliseconds = performance.now();
+        window.eval(source);
+        return window.axe.run(window.document, {
+          resultTypes: [
+            "violations",
+            "incomplete",
+            "passes",
+            "inapplicable",
+          ],
+          runOnly: {
+            type: "tag",
+            values: ACCESSIBILITY_POLICY.tags,
+          },
+        });
+      }),
+    )
     .then((result) => {
       const finishedAt = new Date().toISOString();
       return cy.task(
