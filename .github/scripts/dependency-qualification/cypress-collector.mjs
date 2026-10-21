@@ -2839,13 +2839,26 @@ function structuredWarnings(
   if (typeof value !== "object") {
     return warningContext ? [warningDescription(value)] : [];
   }
-  if (warningContext) {
+  const warnings = [];
+  const levelKeys = ["level", "severity", "type"];
+  const hasExplicitLevel = levelKeys.some((key) =>
+    Object.hasOwn(value, key));
+  const level = value.level ?? value.severity ?? value.type;
+  const hasWarningLevel =
+    typeof level === "string" &&
+    /^(?:deprecated|deprecation|warn(?:ing)?s?|(?:deprecation|experimental)warnings?)$/iu
+      .test(level.trim());
+  if (hasWarningLevel) {
+    warnings.push(warningDescription(value));
+  }
+  if (warningContext && !hasExplicitLevel) {
     return Object.keys(value).length === 0
       ? []
       : [warningDescription(value)].filter(Boolean);
   }
   if (
     rootContext &&
+    !hasExplicitLevel &&
     Object.keys(value).some((key) =>
       [
         "code",
@@ -2857,15 +2870,6 @@ function structuredWarnings(
     )
   ) {
     return [warningDescription(value)].filter(Boolean);
-  }
-  const warnings = [];
-  const level = value.level ?? value.severity ?? value.type;
-  if (
-    typeof level === "string" &&
-    /^(?:deprecated|warn(?:ing)?s?|(?:deprecation|experimental)warnings?)$/iu
-      .test(level.trim())
-  ) {
-    warnings.push(warningDescription(value));
   }
   for (const [key, entry] of Object.entries(value)) {
     if (/^warnings?count$/iu.test(key)) {

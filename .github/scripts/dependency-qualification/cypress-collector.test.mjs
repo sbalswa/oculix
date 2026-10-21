@@ -668,6 +668,38 @@ test("detects compound, plural, case-insensitive, and structured warnings", () =
   assert.deepEqual(detectCypressWarnings("[]"), []);
 });
 
+test("explicit non-warning structured levels do not become warnings", () => {
+  assert.deepEqual(
+    detectCypressWarnings('{"level":"info","message":"normal"}'),
+    [],
+  );
+  const nearby = detectCypressWarnings(
+    [
+      '{"level":"info","message":"normal"}',
+      '{"severity":"warn","msg":"real warning","code":"W_WARN"}',
+      '{"type":"deprecation","message":"legacy","code":"W_OLD"}',
+    ].join("\n"),
+  );
+  assert.equal(
+    nearby.some((warning) => warning.includes("normal")),
+    false,
+  );
+  assert.ok(
+    nearby.some(
+      (warning) =>
+        warning.includes("real warning") &&
+        warning.includes("code=W_WARN"),
+    ),
+  );
+  assert.ok(
+    nearby.some(
+      (warning) =>
+        warning.includes("legacy") &&
+        warning.includes("code=W_OLD"),
+    ),
+  );
+});
+
 async function copyCollectorInputs(source, destination) {
   const paths = [
     PACKAGE_PATH,
