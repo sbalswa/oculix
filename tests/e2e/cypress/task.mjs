@@ -12,6 +12,7 @@ const FIXTURE_LIFECYCLE = resolve(
 );
 const HARNESS = resolve(HARNESS_DIRECTORY, "harness.mjs");
 const DEFAULT_STOP_GRACE_MS = 5_000;
+const DEFAULT_TASKKILL_TIMEOUT_MS = 5_000;
 const FORCE_STOP_GRACE_MS = 1_000;
 const POLL_INTERVAL_MS = 25;
 const SAFE_CMD_TOKEN = /^[A-Za-z0-9_./:=\\-]+$/;
@@ -117,14 +118,17 @@ function signalProcessGroup(processGroupId, signal) {
   }
 }
 
-function waitForExitWithin(child, timeoutMilliseconds) {
+function waitForExitResultWithin(child, timeoutMilliseconds) {
   if (exited(child)) {
-    return Promise.resolve(true);
+    return Promise.resolve({
+      code: child.exitCode,
+      signal: child.signalCode,
+    });
   }
 
-  return new Promise((resolveStopped, rejectStopped) => {
+  return new Promise((resolveResult, rejectResult) => {
     const timeout = setTimeout(
-      () => finish(resolveStopped, false),
+      () => finish(resolveResult, null),
       timeoutMilliseconds,
     );
     const finish = (callback, value) => {
@@ -133,32 +137,68 @@ function waitForExitWithin(child, timeoutMilliseconds) {
       child.off("exit", onExit);
       callback(value);
     };
-    const onError = (error) => finish(rejectStopped, error);
-    const onExit = () => finish(resolveStopped, true);
+    const onError = (error) => finish(rejectResult, error);
+    const onExit = (code, signal) =>
+      finish(resolveResult, {
+        code,
+        signal,
+      });
 
     child.once("error", onError);
     child.once("exit", onExit);
   });
 }
 
+async function waitForExitWithin(child, timeoutMilliseconds) {
+  return (
+    (await waitForExitResultWithin(child, timeoutMilliseconds)) !== null
+  );
+}
+
 export function taskkillExitAccepted(exitCode) {
   return exitCode === 0 || exitCode === 128;
 }
 
-async function runTaskkill(
+export async function runTaskkill(
   processId,
-  { environment = process.env, force = false } = {},
+  {
+    environment = process.env,
+    force = false,
+    forceStopGraceMilliseconds = FORCE_STOP_GRACE_MS,
+    spawnImplementation = spawn,
+    timeoutMilliseconds = DEFAULT_TASKKILL_TIMEOUT_MS,
+    waitForExitResultWithinImplementation = waitForExitResultWithin,
+  } = {},
 ) {
   const arguments_ = ["/pid", String(processId), "/t"];
   if (force) {
     arguments_.push("/f");
   }
-  const taskkill = spawn("taskkill.exe", arguments_, {
+  const taskkill = spawnImplementation("taskkill.exe", arguments_, {
     env: environment,
     stdio: "ignore",
     windowsHide: true,
   });
-  const result = await waitForExit(taskkill);
+  const result = await waitForExitResultWithinImplementation(
+    taskkill,
+    timeoutMilliseconds,
+  );
+  if (result === null) {
+    // This kill targets only the taskkill helper whose own execution window
+    // expired; Cypress and browser descendants remain the outer operation's
+    // responsibility.
+    taskkill.kill("SIGKILL");
+    const reaped = await waitForExitResultWithinImplementation(
+      taskkill,
+      forceStopGraceMilliseconds,
+    );
+    if (reaped === null) {
+      throw new Error(
+        `taskkill.exe for process tree ${processId} did not exit after SIGKILL`,
+      );
+    }
+    return false;
+  }
   return taskkillExitAccepted(result.code);
 }
 
@@ -168,25 +208,19 @@ async function stopWindowsProcessTree(
   graceMilliseconds,
   environment,
   runTaskkillImplementation,
+  taskkillTimeoutMilliseconds,
   waitForExitWithinImplementation,
 ) {
-  if (child.pid === undefined || exited(child)) {
+  if (child.pid === undefined) {
     return true;
   }
 
-  let accepted;
-  try {
-    accepted = await runTaskkillImplementation(child.pid, {
-      environment,
-      force,
-    });
-  } catch (error) {
-    if (error?.code === "ENOENT" && exited(child)) {
-      return true;
-    }
-    throw error;
-  }
-  if (!accepted && !exited(child)) {
+  const accepted = await runTaskkillImplementation(child.pid, {
+    environment,
+    force,
+    timeoutMilliseconds: taskkillTimeoutMilliseconds,
+  });
+  if (!accepted) {
     return false;
   }
   return waitForExitWithinImplementation(child, graceMilliseconds);
@@ -231,6 +265,7 @@ export async function terminateProcessTree(
     platform = process.platform,
     runTaskkillImplementation = runTaskkill,
     signal = "SIGTERM",
+    taskkillTimeoutMilliseconds = DEFAULT_TASKKILL_TIMEOUT_MS,
     timeoutMilliseconds = DEFAULT_STOP_GRACE_MS,
     waitForExitWithinImplementation = waitForExitWithin,
   } = {},
@@ -246,6 +281,7 @@ export async function terminateProcessTree(
       timeoutMilliseconds,
       environment,
       runTaskkillImplementation,
+      taskkillTimeoutMilliseconds,
       waitForExitWithinImplementation,
     );
     if (!stopped) {
@@ -255,6 +291,7 @@ export async function terminateProcessTree(
         Math.min(timeoutMilliseconds, FORCE_STOP_GRACE_MS),
         environment,
         runTaskkillImplementation,
+        taskkillTimeoutMilliseconds,
         waitForExitWithinImplementation,
       );
       if (!forced) {
@@ -308,6 +345,7 @@ export async function runCommand(
     cwd = PROJECT_ROOT,
     environment = process.env,
     platform = process.platform,
+    terminateProcessTreeImplementation = terminateProcessTree,
     timeoutMilliseconds = DEFAULT_STOP_GRACE_MS,
   } = {},
 ) {
@@ -323,7 +361,7 @@ export async function runCommand(
 
   const requestTermination = (signal) => {
     if (termination === undefined) {
-      termination = terminateProcessTree(child, {
+      termination = terminateProcessTreeImplementation(child, {
         environment,
         platform,
         signal,
@@ -349,11 +387,10 @@ export async function runCommand(
     if (termination !== undefined) {
       await termination;
     } else if (
-      platform !== "win32" &&
       child.pid !== undefined &&
-      processGroupHasLiveMembers(child.pid)
+      (platform === "win32" || processGroupHasLiveMembers(child.pid))
     ) {
-      await terminateProcessTree(child, {
+      await terminateProcessTreeImplementation(child, {
         environment,
         platform,
         timeoutMilliseconds,
