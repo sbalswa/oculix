@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { validatePreparationRecord } from "./harness.mjs";
+import {
+  validateOperatingSystem,
+  validatePreparationRecord,
+} from "./harness.mjs";
 
 const expected = {
   arch: "x64",
@@ -37,5 +40,28 @@ test("rejects a preparation stamp from a different OS alias", () => {
       expected,
     ),
     false,
+  );
+});
+
+test("accepts an Ubuntu matrix alias on an Ubuntu host", () => {
+  assert.equal(
+    validateOperatingSystem("ubuntu-latest", {
+      arch: "x64",
+      linuxDistribution: "ubuntu",
+      platform: "linux",
+    }),
+    "ubuntu-latest",
+  );
+});
+
+test("rejects an Ubuntu matrix alias on another Linux distribution", () => {
+  assert.throws(
+    () =>
+      validateOperatingSystem("ubuntu-24.04", {
+        arch: "arm64",
+        linuxDistribution: "amzn",
+        platform: "linux",
+      }),
+    /requires an Ubuntu host/,
   );
 });

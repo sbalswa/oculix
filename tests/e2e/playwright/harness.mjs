@@ -90,48 +90,71 @@ function selectProject(argument) {
   return selected;
 }
 
-function selectedOperatingSystem() {
-  const family = OPERATING_SYSTEMS.get(process.platform);
+export function validateOperatingSystem(
+  selected,
+  {
+    arch = process.arch,
+    linuxDistribution = null,
+    platform = process.platform,
+  } = {},
+) {
+  const family = OPERATING_SYSTEMS.get(platform);
   if (family === undefined) {
-    fail(`Unsupported host platform "${process.platform}".`);
+    fail(`Unsupported host platform "${platform}".`);
   }
 
-  const selected = normalize(process.env.E2E_OS) ?? process.platform;
   if (
     !family.aliases.includes(selected) &&
     !family.pattern.test(selected)
   ) {
     fail(
       `E2E_OS "${selected}" does not describe the current ` +
-        `${process.platform}/${process.arch} host. Expected one of: ` +
+        `${platform}/${arch} host. Expected one of: ` +
         `${family.aliases.join(", ")} or ${family.pattern}.`,
+    );
+  }
+  if (
+    platform === "linux" &&
+    selected.startsWith("ubuntu") &&
+    linuxDistribution !== "ubuntu"
+  ) {
+    fail(
+      `E2E_OS "${selected}" requires an Ubuntu host, but ` +
+        `/etc/os-release reports ${linuxDistribution ?? "no distribution ID"}.`,
     );
   }
   return selected;
 }
 
-async function currentLockHash() {
-  const lockContents = await readFile(LOCKFILE);
-  return createHash("sha256").update(lockContents).digest("hex");
-}
-
-async function isUbuntuHost(operatingSystem) {
-  if (operatingSystem.startsWith("ubuntu")) {
-    return true;
-  }
+async function linuxDistribution() {
   if (process.platform !== "linux") {
-    return false;
+    return null;
   }
 
   try {
     const release = await readFile("/etc/os-release", "utf8");
-    return /^ID=ubuntu$/m.test(release);
+    const match = /^ID="?([^"\n]+)"?$/m.exec(release);
+    return match?.[1]?.toLowerCase() ?? null;
   } catch (error) {
     if (error.code === "ENOENT") {
-      return false;
+      return null;
     }
     throw error;
   }
+}
+
+async function selectedOperatingSystem() {
+  return validateOperatingSystem(
+    normalize(process.env.E2E_OS) ?? process.platform,
+    {
+      linuxDistribution: await linuxDistribution(),
+    },
+  );
+}
+
+async function currentLockHash() {
+  const lockContents = await readFile(LOCKFILE);
+  return createHash("sha256").update(lockContents).digest("hex");
 }
 
 function preparationStamp(project) {
@@ -173,7 +196,7 @@ async function prepare(project, operatingSystem) {
   }
 
   const installArguments = ["exec", "--", "playwright", "install"];
-  if (await isUbuntuHost(operatingSystem)) {
+  if ((await linuxDistribution()) === "ubuntu") {
     installArguments.push("--with-deps");
   }
   installArguments.push(project);
@@ -333,7 +356,7 @@ async function runScenario(scenario, project, operatingSystem) {
 async function main() {
   const [command, ...arguments_] = process.argv.slice(2);
 
-  const operatingSystem = selectedOperatingSystem();
+  const operatingSystem = await selectedOperatingSystem();
   if (command === "prepare") {
     if (arguments_.length > 1) {
       fail("Usage: harness.mjs prepare BROWSER");
