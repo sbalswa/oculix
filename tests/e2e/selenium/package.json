@@ -1,0 +1,17 @@
+{
+  "name": "oculix-selenium-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test browser-selection.test.mjs",
+    "smoke": "npm test --silent && node smoke.mjs",
+    "web-calculator": "node web-calculator.mjs"
+  },
+  "dependencies": {
+    "selenium-webdriver": "4.51.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
