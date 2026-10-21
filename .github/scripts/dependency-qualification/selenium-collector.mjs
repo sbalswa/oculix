@@ -1,9 +1,15 @@
-import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import {
+  createHash,
+  createPublicKey,
+  sign as createSignature,
+  verify as verifySignature,
+} from "node:crypto";
 import {
   cp,
   glob,
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readlink,
@@ -13,6 +19,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
+  delimiter,
   dirname,
   isAbsolute,
   join,
@@ -68,6 +75,18 @@ const SEMVER_PATTERN =
 const BROWSER_VERSION_PATTERN =
   /^(0|[1-9]\d*)(?:\.(0|[1-9]\d*)){2,3}$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
+const CHALLENGE_PATTERN = /^[0-9a-f]{64}$/u;
+const EXECUTOR_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+const SELENIUM_MUTABLE_PATHS = Object.freeze([
+  ...SELENIUM_MANAGED_PATHS,
+  `${SELENIUM_PACKAGE_DIRECTORY}/.npm-cache`,
+  `${SELENIUM_PACKAGE_DIRECTORY}/.runtime`,
+  `${SELENIUM_PACKAGE_DIRECTORY}/diagnostics`,
+  `${SELENIUM_PACKAGE_DIRECTORY}/node_modules`,
+]);
+const SAFE_ENVIRONMENT_OVERRIDES = new Set([
+  "NPM_CONFIG_STRICT_SSL",
+]);
 
 class MetadataError extends Error {
   constructor(reasonCode, message, state = "unavailable") {
@@ -1386,6 +1405,7 @@ function relativeStep({
   arguments: arguments_,
   capabilityId = null,
   command,
+  cwd = ".",
   environment = {},
   id,
   kind,
@@ -1400,7 +1420,7 @@ function relativeStep({
     scenario,
     command,
     arguments: arguments_,
-    cwd: ".",
+    cwd,
     environment: Object.fromEntries(
       Object.entries(environment).sort(([left], [right]) =>
         compareText(left, right),
@@ -1503,7 +1523,7 @@ function capabilitySteps(capability, candidate) {
           kind: "command",
           phase: "capability",
           capabilityId: capability.id,
-          command: process.execPath,
+          command: "node",
           arguments: [
             "tests/e2e/fixtures/web-calculator/lifecycle.mjs",
             "npm",
@@ -1548,7 +1568,7 @@ function capabilitySteps(capability, candidate) {
       kind: "command",
       phase: "evidence",
       capabilityId: capability.id,
-      command: process.execPath,
+      command: "node",
       arguments: [".github/scripts/validate-e2e-reports.mjs"],
       environment: {
         ...environment,
@@ -1670,6 +1690,7 @@ export function createSeleniumQualificationPlan({
         kind: "command",
         phase: "prepare",
         command: "npm",
+        cwd: SELENIUM_PACKAGE_DIRECTORY,
         arguments: [
           "cache",
           "add",
@@ -1683,6 +1704,7 @@ export function createSeleniumQualificationPlan({
       kind: "command",
       phase: "prepare",
       command: "npm",
+      cwd: SELENIUM_PACKAGE_DIRECTORY,
       arguments: [
         "install",
         "--package-lock-only",
@@ -1705,6 +1727,7 @@ export function createSeleniumQualificationPlan({
       kind: "command",
       phase: "prepare",
       command: "npm",
+      cwd: SELENIUM_PACKAGE_DIRECTORY,
       arguments: [
         "ci",
         "--ignore-scripts",
@@ -1764,8 +1787,12 @@ export function createSeleniumQualificationPlan({
     candidate_digest: subjectDigest(observation),
     repository: structuredClone(observation.repository),
     workspace: {
-      kind: "ephemeral-copy",
-      mutation_boundary: SELENIUM_PACKAGE_DIRECTORY,
+      kind: "isolated-executor",
+      immutable_inputs: {
+        kind: "repository-source-manifest",
+        access: "read-only",
+      },
+      mutable_paths: [...SELENIUM_MUTABLE_PATHS],
       managed_paths: [...SELENIUM_MANAGED_PATHS],
     },
     packages: PACKAGE_NAMES.map((name) =>
@@ -1867,52 +1894,6 @@ async function checkoutState(repositoryRoot) {
   };
 }
 
-async function runRawCommand(step, { environment, workspaceRoot }) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(step.command, step.arguments, {
-      cwd:
-        step.id.startsWith("cache-selenium-") ||
-        step.id === "apply-selenium-tarballs" ||
-        step.id === "install-selenium-candidate"
-          ? resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY)
-          : resolve(workspaceRoot, step.cwd),
-      env: {
-        ...environment,
-        ...step.environment,
-        GITHUB_WORKSPACE: workspaceRoot,
-      },
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", (error) => {
-      resolvePromise({
-        exitCode: 1,
-        stdout,
-        stderr: `${stderr}${error.message}`,
-        signal: null,
-      });
-    });
-    child.on("close", (exitCode, signal) => {
-      resolvePromise({
-        exitCode: exitCode ?? 1,
-        stdout,
-        stderr,
-        signal,
-      });
-    });
-  });
-}
-
 function warningLines(output) {
   const warningPattern =
     /(?:\bwarn(?:ing)?s?\b|\b[A-Za-z][A-Za-z0-9_-]*warnings?\b)/iu;
@@ -1970,6 +1951,479 @@ function assertRawCommandResult(raw, stepId) {
   };
 }
 
+function assertExactObjectKeys(value, allowed, name) {
+  assertObject(value, name);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  const missing = [...allowed].filter((key) => !(key in value));
+  if (unknown.length > 0 || missing.length > 0) {
+    throw new Error(
+      `${name} must contain exactly ${[...allowed].sort(compareText).join(", ")}`,
+    );
+  }
+}
+
+function validateEnvironmentOverrides(overrides) {
+  assertObject(overrides, "Selenium executor environment overrides");
+  const environment = {};
+  for (const [name, value] of Object.entries(overrides)) {
+    if (!SAFE_ENVIRONMENT_OVERRIDES.has(name)) {
+      throw new Error(
+        `Selenium executor environment variable ${name} is not allowlisted`,
+      );
+    }
+    assertString(value, `Selenium executor environment ${name}`);
+    if (name === "NPM_CONFIG_STRICT_SSL" && !["true", "false"].includes(value)) {
+      throw new Error(
+        "Selenium executor environment NPM_CONFIG_STRICT_SSL must be true or false",
+      );
+    }
+    environment[name] = value;
+  }
+  return Object.fromEntries(
+    Object.entries(environment).sort(([left], [right]) =>
+      compareText(left, right)),
+  );
+}
+
+function validateExecutor(executor) {
+  assertExactObjectKeys(
+    executor,
+    new Set(["authority", "execute", "id", "path", "tools"]),
+    "Selenium executor",
+  );
+  if (
+    typeof executor.id !== "string" ||
+    !EXECUTOR_ID_PATTERN.test(executor.id)
+  ) {
+    throw new Error("Selenium executor id must be a kebab-case identifier");
+  }
+  if (typeof executor.execute !== "function") {
+    throw new Error("Selenium executor execute must be a function");
+  }
+  assertExactObjectKeys(
+    executor.authority,
+    new Set(["identity_digest", "kind", "public_key"]),
+    "Selenium executor authority",
+  );
+  if (executor.authority.kind !== "ed25519") {
+    throw new Error("Selenium executor authority kind must equal ed25519");
+  }
+  assertDigest(
+    executor.authority.identity_digest,
+    "Selenium executor authority identity_digest",
+  );
+  assertString(
+    executor.authority.public_key,
+    "Selenium executor authority public_key",
+  );
+  let publicKey;
+  try {
+    publicKey = createPublicKey(executor.authority.public_key);
+  } catch (error) {
+    throw new Error("Selenium executor authority public_key is invalid", {
+      cause: error,
+    });
+  }
+  if (publicKey.asymmetricKeyType !== "ed25519") {
+    throw new Error("Selenium executor authority public_key must be Ed25519");
+  }
+  if (
+    !Array.isArray(executor.path) ||
+    executor.path.length === 0 ||
+    new Set(executor.path).size !== executor.path.length ||
+    executor.path.some(
+      (directory) =>
+        typeof directory !== "string" || !isAbsolute(directory),
+    )
+  ) {
+    throw new Error(
+      "Selenium executor path must contain unique absolute directories",
+    );
+  }
+  assertExactObjectKeys(
+    executor.tools,
+    new Set(["node", "npm"]),
+    "Selenium executor tools",
+  );
+  for (const name of ["node", "npm"]) {
+    const tool = executor.tools[name];
+    assertExactObjectKeys(
+      tool,
+      new Set(["command", "digest", "realpath", "version"]),
+      `Selenium executor tool ${name}`,
+    );
+    if (tool.command !== name) {
+      throw new Error(`Selenium executor tool ${name} command must equal ${name}`);
+    }
+    assertDigest(tool.digest, `Selenium executor tool ${name} digest`);
+    assertString(tool.version, `Selenium executor tool ${name} version`);
+    if (!isAbsolute(tool.realpath)) {
+      throw new Error(
+        `Selenium executor tool ${name} realpath must be absolute`,
+      );
+    }
+  }
+  return executor;
+}
+
+function sanitizedEnvironment(
+  workspaceRoot,
+  temporaryRoot,
+  executorPath,
+  overrides,
+) {
+  return {
+    CI: "true",
+    E2E_SELENIUM_CACHE: resolve(
+      workspaceRoot,
+      SELENIUM_PACKAGE_DIRECTORY,
+      ".runtime",
+      "selenium-cache",
+    ),
+    GITHUB_WORKSPACE: workspaceRoot,
+    HOME: resolve(temporaryRoot, "executor-home"),
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    NO_COLOR: "1",
+    NPM_CONFIG_AUDIT: "false",
+    NPM_CONFIG_CACHE: resolve(
+      workspaceRoot,
+      SELENIUM_PACKAGE_DIRECTORY,
+      ".npm-cache",
+    ),
+    NPM_CONFIG_FUND: "false",
+    PATH: executorPath.join(delimiter),
+    TMPDIR: resolve(temporaryRoot, "executor-tmp"),
+    ...validateEnvironmentOverrides(overrides),
+  };
+}
+
+function executorPolicy({
+  executorAuthority,
+  executorId,
+  executorTools,
+  immutableInputsDigest,
+  mutablePaths,
+  plan,
+  baseEnvironment,
+  temporaryRoot,
+  workspaceRoot,
+}) {
+  const policyEnvironment = Object.fromEntries(
+    Object.entries(baseEnvironment).map(([name, value]) => [
+      name,
+      typeof value === "string" &&
+      (value === workspaceRoot || value.startsWith(`${workspaceRoot}${sep}`))
+        ? value === workspaceRoot
+          ? "${WORKSPACE_ROOT}"
+          : `\${WORKSPACE_ROOT}/${relative(workspaceRoot, value)
+              .split(sep)
+              .join("/")}`
+        : typeof value === "string" &&
+            (value === temporaryRoot ||
+              value.startsWith(`${temporaryRoot}${sep}`))
+          ? value === temporaryRoot
+            ? "${EXECUTOR_STATE_ROOT}"
+            : `\${EXECUTOR_STATE_ROOT}/${relative(temporaryRoot, value)
+                .split(sep)
+                .join("/")}`
+          : value,
+    ]),
+  );
+  const executorStatePaths = [
+    "${EXECUTOR_STATE_ROOT}/executor-home",
+    "${EXECUTOR_STATE_ROOT}/executor-tmp",
+  ];
+  return {
+    schema_version: 1,
+    kind: "selenium-isolated-executor-policy",
+    executor_id: executorId,
+    candidate_digest: plan.candidate_digest,
+    repository_revision: plan.repository.revision,
+    plan_digest: hash(plan),
+    authority: {
+      identity_digest: executorAuthority.identity_digest,
+      kind: executorAuthority.kind,
+      public_key_digest: hash(executorAuthority.public_key),
+    },
+    tools: structuredClone(executorTools),
+    tools_digest: hash(executorTools),
+    runner: structuredClone(plan.runner),
+    isolation: {
+      disposable: true,
+      network: "candidate-registry-only",
+      privileges: "unprivileged",
+      repository_write_access: false,
+      secrets: "none",
+    },
+    environment: {
+      inherit_host: false,
+      variables: policyEnvironment,
+    },
+    filesystem: {
+      immutable_inputs: {
+        access: "read-only",
+        digest: immutableInputsDigest,
+      },
+      mutable_paths: {
+        executor_state: executorStatePaths,
+        repository: [...mutablePaths],
+      },
+      mutable_paths_digest: hash({
+        executor_state: executorStatePaths,
+        repository: mutablePaths,
+      }),
+    },
+  };
+}
+
+function executionRequest(policy, challenge) {
+  if (typeof challenge !== "string" || !CHALLENGE_PATTERN.test(challenge)) {
+    throw new Error(
+      "Selenium executor challenge must be 64 lowercase hexadecimal characters",
+    );
+  }
+  const request = {
+    schema_version: 1,
+    kind: "selenium-executor-request",
+    authority_digest: hash(policy.authority),
+    challenge,
+    executor_id: policy.executor_id,
+    candidate_digest: policy.candidate_digest,
+    repository_revision: policy.repository_revision,
+    plan_digest: policy.plan_digest,
+    policy_digest: hash(policy),
+    immutable_inputs_digest:
+      policy.filesystem.immutable_inputs.digest,
+    mutable_paths_digest: policy.filesystem.mutable_paths_digest,
+    tools_digest: policy.tools_digest,
+  };
+  return {
+    ...request,
+    request_digest: hash(request),
+  };
+}
+
+function stepExecutableIdentity(step, policy) {
+  if (step.command === "node" || step.command === "npm") {
+    return policy.tools[step.command];
+  }
+  if (step.kind === "browser-identity") {
+    return policy.runner.browser;
+  }
+  if (step.kind === "driver-identity") {
+    return policy.runner.driver;
+  }
+  throw new Error(`${step.id} has no bound executor identity`);
+}
+
+export function createSeleniumExecutorAttestation({
+  environment,
+  execution,
+  result,
+  step,
+} = {}) {
+  const request = assertObject(
+    execution?.request,
+    "Selenium executor attestation request",
+  );
+  const policy = assertObject(
+    execution?.policy,
+    "Selenium executor attestation policy",
+  );
+  if (
+    hash(policy) !== request.policy_digest ||
+    policy.executor_id !== request.executor_id
+  ) {
+    throw new Error(
+      "Selenium executor attestation policy does not bind its request",
+    );
+  }
+  const raw = assertRawCommandResult(result, step?.id ?? "unknown step");
+  return {
+    schema_version: 1,
+    kind: "selenium-executor-attestation",
+    authority_digest: request.authority_digest,
+    challenge: request.challenge,
+    executor_id: request.executor_id,
+    candidate_digest: request.candidate_digest,
+    repository_revision: request.repository_revision,
+    plan_digest: request.plan_digest,
+    policy_digest: request.policy_digest,
+    request_digest: request.request_digest,
+    immutable_inputs_digest: request.immutable_inputs_digest,
+    mutable_paths_digest: request.mutable_paths_digest,
+    tools_digest: request.tools_digest,
+    step_id: step.id,
+    step_digest: hash(step),
+    working_directory: step.cwd,
+    environment_digest: hash(environment),
+    executable_identity_digest: hash(
+      stepExecutableIdentity(step, policy),
+    ),
+    result_digest: hash(raw),
+    isolation: structuredClone(policy.isolation),
+  };
+}
+
+export function signSeleniumExecutorAttestation(
+  attestation,
+  privateKey,
+) {
+  assertObject(attestation, "Selenium executor attestation");
+  if ("signature" in attestation) {
+    throw new Error("Selenium executor attestation is already signed");
+  }
+  return {
+    ...structuredClone(attestation),
+    signature: createSignature(
+      null,
+      Buffer.from(stableJson(attestation)),
+      privateKey,
+    ).toString("base64"),
+  };
+}
+
+function validateExecutorAttestation(
+  attestation,
+  {
+    authority,
+    environment,
+    policy,
+    raw,
+    request,
+    step,
+  },
+) {
+  const keys = new Set([
+    "authority_digest",
+    "candidate_digest",
+    "challenge",
+    "environment_digest",
+    "executable_identity_digest",
+    "executor_id",
+    "immutable_inputs_digest",
+    "isolation",
+    "kind",
+    "mutable_paths_digest",
+    "plan_digest",
+    "policy_digest",
+    "repository_revision",
+    "request_digest",
+    "result_digest",
+    "schema_version",
+    "signature",
+    "step_digest",
+    "step_id",
+    "tools_digest",
+    "working_directory",
+  ]);
+  assertExactObjectKeys(
+    attestation,
+    keys,
+    `${step.id} executor attestation`,
+  );
+  assertExactObjectKeys(
+    attestation.isolation,
+    new Set([
+      "disposable",
+      "network",
+      "privileges",
+      "repository_write_access",
+      "secrets",
+    ]),
+    `${step.id} executor attestation isolation`,
+  );
+  const expected = {
+    schema_version: 1,
+    kind: "selenium-executor-attestation",
+    authority_digest: request.authority_digest,
+    challenge: request.challenge,
+    executor_id: request.executor_id,
+    candidate_digest: request.candidate_digest,
+    repository_revision: request.repository_revision,
+    plan_digest: request.plan_digest,
+    policy_digest: request.policy_digest,
+    request_digest: request.request_digest,
+    immutable_inputs_digest: request.immutable_inputs_digest,
+    mutable_paths_digest: request.mutable_paths_digest,
+    tools_digest: request.tools_digest,
+    step_id: step.id,
+    step_digest: hash(step),
+    working_directory: step.cwd,
+    environment_digest: hash(environment),
+    executable_identity_digest: hash(
+      stepExecutableIdentity(step, policy),
+    ),
+    result_digest: hash(raw),
+    isolation: {
+      disposable: true,
+      network: "candidate-registry-only",
+      privileges: "unprivileged",
+      repository_write_access: false,
+      secrets: "none",
+    },
+  };
+  const { signature, ...unsigned } = attestation;
+  if (
+    stableJson(unsigned) !== stableJson(expected) ||
+    !/^[A-Za-z0-9+/]+={0,2}$/u.test(signature) ||
+    !verifySignature(
+      null,
+      Buffer.from(stableJson(expected)),
+      createPublicKey(authority.public_key),
+      Buffer.from(signature, "base64"),
+    )
+  ) {
+    throw new Error(`${step.id} executor attestation is not exactly bound`);
+  }
+  return structuredClone(attestation);
+}
+
+function executorAttestationEvidence(
+  attestation,
+  plan,
+  startedAt,
+  completedAt,
+) {
+  return {
+    type: "qualification-executor-attestation",
+    locator: `selenium-executor:${attestation.executor_id}/${attestation.step_id}`,
+    revision: plan.repository.revision,
+    digest: hash(attestation),
+    started_at: startedAt,
+    completed_at: completedAt,
+  };
+}
+
+function executorAttestationSetEvidence(
+  attestations,
+  plan,
+  request,
+  startedAt,
+  completedAt,
+) {
+  return {
+    type: "qualification-executor-attestation-set",
+    locator: `selenium-executor-set:${request.request_digest}`,
+    revision: plan.repository.revision,
+    digest: hash({
+      attestations: attestations
+        .map((attestation) => ({
+          digest: hash(attestation),
+          step_id: attestation.step_id,
+        }))
+        .sort(({ step_id: left }, { step_id: right }) =>
+          compareText(left, right)),
+      candidate_digest: plan.candidate_digest,
+      expected_step_ids: plan.steps.map(({ id }) => id).sort(compareText),
+      request_digest: request.request_digest,
+    }),
+    started_at: startedAt,
+    completed_at: completedAt,
+  };
+}
+
 async function verifyExecutableIdentity(identity) {
   const observedRealpath = await realpath(identity.path);
   const canonicalRealpath = await realpath(identity.realpath);
@@ -2018,15 +2472,19 @@ async function executeControlledStep(
   step,
   plan,
   {
-    environment,
+    attestations,
+    baseEnvironment,
+    executor,
     now,
-    runCommand,
+    policy,
+    request,
     workspaceRoot,
   },
 ) {
   const startedAt = timestamp(now());
-  let raw;
+  let attestation = null;
   let commandOutput = "";
+  let raw;
   const identity =
     step.kind === "browser-identity"
       ? plan.runner.browser
@@ -2043,19 +2501,42 @@ async function executeControlledStep(
       await verifyExecutableIdentity(identity);
     }
     const controlledEnvironment = {
-      ...environment,
+      ...baseEnvironment,
       ...step.environment,
       GITHUB_WORKSPACE: workspaceRoot,
     };
+    const response = await executor.execute(structuredClone(step), {
+      environment: controlledEnvironment,
+      execution: {
+        policy: structuredClone(policy),
+        request: structuredClone(request),
+      },
+      cwd: resolve(workspaceRoot, step.cwd),
+      packageRoot: resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY),
+      workspaceRoot,
+    });
+    assertExactObjectKeys(
+      response,
+      new Set(["attestation", "result"]),
+      `${step.id} executor response`,
+    );
     raw = assertRawCommandResult(
-      await runCommand(structuredClone(step), {
-        environment: controlledEnvironment,
-        packageRoot: resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY),
-        workspaceRoot,
-      }),
+      response.result,
       step.id,
     );
     commandOutput = `${raw.stdout}${raw.stderr}`;
+    attestation = validateExecutorAttestation(
+      response.attestation,
+      {
+        authority: executor.authority,
+        environment: controlledEnvironment,
+        policy,
+        raw,
+        request,
+        step,
+      },
+    );
+    attestations.push(attestation);
   } catch (error) {
     raw = {
       exitCode: 1,
@@ -2076,7 +2557,6 @@ async function executeControlledStep(
     }
   }
   const completedAt = timestamp(now());
-  const output = `${raw.stdout}${raw.stderr}`;
   let identityMatches = true;
   if (identity !== null && raw.exitCode === 0) {
     try {
@@ -2099,6 +2579,16 @@ async function executeControlledStep(
     warnings: sortedUnique(warningLines(commandOutput)),
     evidence: [
       commandEvidence(step, plan, raw, startedAt, completedAt),
+      ...(attestation === null
+        ? []
+        : [
+            executorAttestationEvidence(
+              attestation,
+              plan,
+              startedAt,
+              completedAt,
+            ),
+          ]),
     ],
   };
 }
@@ -2508,12 +2998,16 @@ async function treeEntries(
   return entries;
 }
 
-async function outsideBoundaryDigest(workspaceRoot, boundary) {
-  const prefix = `${boundary}/`;
+function pathIsMutable(path, mutablePaths) {
+  return mutablePaths.some(
+    (mutablePath) =>
+      path === mutablePath || path.startsWith(`${mutablePath}/`),
+  );
+}
+
+async function immutableWorkspaceDigest(workspaceRoot, mutablePaths) {
   const entries = (await treeEntries(workspaceRoot))
-    .filter(
-      ([path]) => path !== boundary && !path.startsWith(prefix),
-    )
+    .filter(([path]) => !pathIsMutable(path, mutablePaths))
     .sort(([left], [right]) => compareText(left, right));
   return hash(entries);
 }
@@ -2532,6 +3026,7 @@ function aggregateStatus(checks) {
 
 function disposition(results, failures) {
   if (
+    failures.length === 0 &&
     results.every(
       (result) => result.status === "pass" && result.warnings.length === 0,
     )
@@ -2573,13 +3068,15 @@ export async function qualifySeleniumCandidate(
   {
     catalog,
     createWorkspace = defaultCreateWorkspace,
-    environment = process.env,
+    environmentOverrides = {},
+    executionChallenge,
+    executor,
     generatedAt = new Date().toISOString(),
     materializeWorkspace = copyRepository,
     now = () => new Date(),
-    runCommand = runRawCommand,
   } = {},
 ) {
+  const isolatedExecutor = validateExecutor(executor);
   const root = resolve(repositoryRoot);
   const catalogDocument =
     catalog ??
@@ -2615,10 +3112,33 @@ export async function qualifySeleniumCandidate(
       observation,
       catalog: catalogDocument,
     });
-    const outsideBefore = await outsideBoundaryDigest(
+    const immutableBefore = await immutableWorkspaceDigest(
       workspaceRoot,
-      plan.workspace.mutation_boundary,
+      plan.workspace.mutable_paths,
     );
+    const baseEnvironment = sanitizedEnvironment(
+      workspaceRoot,
+      temporaryRoot,
+      isolatedExecutor.path,
+      environmentOverrides,
+    );
+    await Promise.all([
+      mkdir(baseEnvironment.HOME, { recursive: true }),
+      mkdir(baseEnvironment.TMPDIR, { recursive: true }),
+    ]);
+    const policy = executorPolicy({
+      executorAuthority: isolatedExecutor.authority,
+      executorId: isolatedExecutor.id,
+      executorTools: isolatedExecutor.tools,
+      immutableInputsDigest: immutableBefore,
+      mutablePaths: plan.workspace.mutable_paths,
+      plan,
+      baseEnvironment,
+      temporaryRoot,
+      workspaceRoot,
+    });
+    const request = executionRequest(policy, executionChallenge);
+    const attestations = [];
     const checks = [];
     const failures = [];
     for (const id of [
@@ -2632,9 +3152,12 @@ export async function qualifySeleniumCandidate(
       }
       const step = plan.steps.find((entry) => entry.id === id);
       const result = await executeControlledStep(step, plan, {
-        environment,
+        attestations,
+        baseEnvironment,
+        executor: isolatedExecutor,
         now,
-        runCommand,
+        policy,
+        request,
         workspaceRoot,
       });
       checks.push(result);
@@ -2661,9 +3184,12 @@ export async function qualifySeleniumCandidate(
         ({ id }) => id === "install-selenium-candidate",
       );
       const installResult = await executeControlledStep(installStep, plan, {
-        environment,
+        attestations,
+        baseEnvironment,
+        executor: isolatedExecutor,
         now,
-        runCommand,
+        policy,
+        request,
         workspaceRoot,
       });
       checks.push(installResult);
@@ -2692,9 +3218,12 @@ export async function qualifySeleniumCandidate(
       ]) {
         const step = plan.steps.find((entry) => entry.id === id);
         const result = await executeControlledStep(step, plan, {
-          environment,
+          attestations,
+          baseEnvironment,
+          executor: isolatedExecutor,
           now,
-          runCommand,
+          policy,
+          request,
           workspaceRoot,
         });
         checks.push(result);
@@ -2709,9 +3238,12 @@ export async function qualifySeleniumCandidate(
         ({ id }) => id === "test-selenium-package",
       );
       const packageResult = await executeControlledStep(packageStep, plan, {
-        environment,
+        attestations,
+        baseEnvironment,
+        executor: isolatedExecutor,
         now,
-        runCommand,
+        policy,
+        request,
         workspaceRoot,
       });
       checks.push(packageResult);
@@ -2727,9 +3259,12 @@ export async function qualifySeleniumCandidate(
       ]) {
         const step = plan.steps.find((entry) => entry.id === id);
         const result = await executeControlledStep(step, plan, {
-          environment,
+          attestations,
+          baseEnvironment,
+          executor: isolatedExecutor,
           now,
-          runCommand,
+          policy,
+          request,
           workspaceRoot,
         });
         checks.push(result);
@@ -2749,9 +3284,12 @@ export async function qualifySeleniumCandidate(
         );
         for (const step of selected) {
           const result = await executeControlledStep(step, plan, {
-            environment,
+            attestations,
+            baseEnvironment,
+            executor: isolatedExecutor,
             now,
-            runCommand,
+            policy,
+            request,
             workspaceRoot,
           });
           checks.push(result);
@@ -2821,13 +3359,13 @@ export async function qualifySeleniumCandidate(
       }
     }
 
-    const outsideAfter = await outsideBoundaryDigest(
+    const immutableAfter = await immutableWorkspaceDigest(
       workspaceRoot,
-      plan.workspace.mutation_boundary,
+      plan.workspace.mutable_paths,
     );
-    if (outsideAfter !== outsideBefore) {
+    if (immutableAfter !== immutableBefore) {
       throw new Error(
-        "Selenium qualification modified files outside its package boundary",
+        "Selenium qualification modified immutable trusted inputs",
       );
     }
     const globalChecks = checks.filter(
@@ -2851,7 +3389,44 @@ export async function qualifySeleniumCandidate(
     if (results.some(({ warnings }) => warnings.length > 0)) {
       failures.push("QUALIFICATION_WARNINGS");
     }
-    execution = { plan, checks, results, failures };
+    const expectedAttestationIds = plan.steps
+      .map(({ id }) => id)
+      .sort(compareText);
+    const observedAttestationIds = attestations
+      .map(({ step_id: id }) => id)
+      .sort(compareText);
+    if (
+      results.every(
+        ({ status, warnings }) =>
+          status === "pass" && warnings.length === 0,
+      ) &&
+      stableJson(observedAttestationIds) !==
+        stableJson(expectedAttestationIds)
+    ) {
+      failures.push("EXECUTOR_ATTESTATION_INCOMPLETE");
+    }
+    const attestationSetStartedAt = timestamp(now());
+    const attestationSetCompletedAt = timestamp(now());
+    const attestationSet = executorAttestationSetEvidence(
+      attestations,
+      plan,
+      request,
+      attestationSetStartedAt,
+      attestationSetCompletedAt,
+    );
+    for (const result of results) {
+      result.evidence.push(structuredClone(attestationSet));
+    }
+    execution = {
+      attestations,
+      checks,
+      failures,
+      immutableInputsDigest: immutableBefore,
+      plan,
+      policy,
+      request,
+      results,
+    };
   } catch (error) {
     workError = error;
   } finally {
@@ -2919,5 +3494,10 @@ export async function qualifySeleniumCandidate(
   return {
     validation,
     checks: execution.checks,
+    executor: {
+      attestations: execution.attestations,
+      policy: execution.policy,
+      request: execution.request,
+    },
   };
 }

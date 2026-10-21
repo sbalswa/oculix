@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { createServer } from "node:https";
 import {
   access,
@@ -8,6 +8,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -19,6 +20,7 @@ import { promisify } from "node:util";
 
 import {
   collectSeleniumObservation,
+  createSeleniumExecutorAttestation,
   createSeleniumQualificationPlan,
   normalizeSemverRange,
   parseExactSemver,
@@ -26,6 +28,7 @@ import {
   readNpmMetadata,
   SELENIUM_MANAGED_PATHS,
   semverRangeSatisfies,
+  signSeleniumExecutorAttestation,
 } from "./selenium-collector.mjs";
 import {
   canonicalDocument,
@@ -41,6 +44,11 @@ const FIXTURE_ROOT = new URL(
 );
 const GENERATED_AT = "2026-10-21T18:00:00Z";
 const execFileAsync = promisify(execFile);
+const TEST_EXECUTOR_KEYS = generateKeyPairSync("ed25519");
+const TEST_EXECUTOR_PUBLIC_KEY = TEST_EXECUTOR_KEYS.publicKey.export({
+  format: "pem",
+  type: "spki",
+}).toString();
 
 function digest(value) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -189,21 +197,60 @@ function rawResult({ stdout = "", stderr = "", exitCode = 0 } = {}) {
   };
 }
 
+let localExecutorIdentityPromise;
+
+async function localExecutorIdentity() {
+  localExecutorIdentityPromise ??= (async () => {
+    const nodeRealpath = await realpath(process.execPath);
+    const npmExecutable = join(
+      dirname(process.execPath),
+      process.platform === "win32" ? "npm.cmd" : "npm",
+    );
+    const npmRealpath = await realpath(npmExecutable);
+    const { stdout: npmVersion } = await execFileAsync(
+      npmExecutable,
+      ["--version"],
+      { encoding: "utf8" },
+    );
+    return {
+      authority: {
+        identity_digest: digest("test-disposable-executor-v1"),
+        kind: "ed25519",
+        public_key: TEST_EXECUTOR_PUBLIC_KEY,
+      },
+      path: [
+        ...new Set([
+          dirname(nodeRealpath),
+          dirname(npmRealpath),
+          ...(process.platform === "win32" ? [] : ["/usr/bin", "/bin"]),
+        ]),
+      ],
+      tools: {
+        node: {
+          command: "node",
+          digest: digest(await readFile(nodeRealpath)),
+          realpath: nodeRealpath,
+          version: process.version.slice(1),
+        },
+        npm: {
+          command: "npm",
+          digest: digest(await readFile(npmRealpath)),
+          realpath: npmRealpath,
+          version: npmVersion.trim(),
+        },
+      },
+    };
+  })();
+  return structuredClone(await localExecutorIdentityPromise);
+}
+
 async function executeRaw(step, context) {
-  const packageCommand =
-    step.id.startsWith("cache-selenium-") ||
-    new Set([
-      "apply-selenium-tarballs",
-      "install-selenium-candidate",
-    ]).has(step.id);
   try {
     const { stdout, stderr } = await execFileAsync(
       step.command,
       step.arguments,
       {
-        cwd: packageCommand
-          ? context.packageRoot
-          : context.workspaceRoot,
+        cwd: context.cwd,
         encoding: "utf8",
         env: context.environment,
         maxBuffer: 10 * 1024 * 1024,
@@ -602,6 +649,39 @@ async function qualify(
   overrides = {},
 ) {
   const catalog = await fixture("capabilities.json");
+  const {
+    attestation: mutateAttestation,
+    environment,
+    executor,
+    runCommand = async () => rawResult({ exitCode: 1 }),
+    ...qualificationOverrides
+  } = overrides;
+  const isolatedExecutor =
+    executor ??
+    {
+      ...(await localExecutorIdentity()),
+      id: "test-disposable-executor",
+      async execute(step, context) {
+        const result = await runCommand(step, context);
+        const attestation = createSeleniumExecutorAttestation({
+          environment: context.environment,
+          execution: context.execution,
+          result,
+          step,
+        });
+        const signedAttestation = signSeleniumExecutorAttestation(
+          attestation,
+          TEST_EXECUTOR_KEYS.privateKey,
+        );
+        return {
+          attestation:
+            mutateAttestation === undefined
+              ? signedAttestation
+              : mutateAttestation(signedAttestation, step, context),
+          result,
+        };
+      },
+    };
   return qualifySeleniumCandidate(
     {
       observation,
@@ -609,9 +689,12 @@ async function qualify(
     },
     {
       catalog,
+      environmentOverrides: environment ?? {},
+      executionChallenge: "c".repeat(64),
+      executor: isolatedExecutor,
       generatedAt: "2026-10-21T18:20:00Z",
       now: deterministicClock(),
-      ...overrides,
+      ...qualificationOverrides,
     },
   );
 }
@@ -1008,11 +1091,31 @@ test("qualification plan installs immutable tarballs and binds executables", asy
     );
 
     assert.deepEqual(plan.workspace, {
-      kind: "ephemeral-copy",
-      mutation_boundary: "tests/e2e/selenium",
+      kind: "isolated-executor",
+      immutable_inputs: {
+        kind: "repository-source-manifest",
+        access: "read-only",
+      },
+      mutable_paths: [
+        "tests/e2e/selenium/package.json",
+        "tests/e2e/selenium/package-lock.json",
+        "tests/e2e/selenium/.npm-cache",
+        "tests/e2e/selenium/.runtime",
+        "tests/e2e/selenium/diagnostics",
+        "tests/e2e/selenium/node_modules",
+      ],
       managed_paths: SELENIUM_MANAGED_PATHS,
     });
     assert.equal(cacheSteps.length, 3);
+    assert.ok(
+      [
+        ...cacheSteps,
+        apply,
+        plan.steps.find(
+          ({ id }) => id === "install-selenium-candidate",
+        ),
+      ].every(({ cwd }) => cwd === "tests/e2e/selenium"),
+    );
     assert.ok(
       cacheSteps.every(
         ({ arguments: arguments_ }) =>
@@ -1337,8 +1440,181 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
           context.environment.GITHUB_WORKSPACE === context.workspaceRoot,
       ),
     );
+    assert.equal(result.executor.policy.environment.inherit_host, false);
+    assert.deepEqual(result.executor.policy.isolation, {
+      disposable: true,
+      network: "candidate-registry-only",
+      privileges: "unprivileged",
+      repository_write_access: false,
+      secrets: "none",
+    });
+    assert.equal(
+      result.executor.policy.filesystem.immutable_inputs.access,
+      "read-only",
+    );
+    assert.deepEqual(
+      result.executor.policy.filesystem.mutable_paths.repository,
+      createSeleniumQualificationPlan({
+        observation,
+        catalog: await fixture("capabilities.json"),
+      }).workspace.mutable_paths,
+    );
+    assert.ok(result.executor.attestations.length > 0);
+    assert.ok(
+      result.validation.results.every(({ evidence }) =>
+        evidence.some(
+          ({ type }) =>
+            type === "qualification-executor-attestation-set",
+        )),
+    );
+    assert.equal(
+      result.executor.policy.environment.variables.GITHUB_WORKSPACE,
+      "${WORKSPACE_ROOT}",
+    );
+    assert.ok(
+      !JSON.stringify(result.executor.policy).includes(temporaryRoot),
+    );
+    assert.ok(
+      result.executor.attestations.every(
+        (attestation) =>
+          attestation.request_digest ===
+            result.executor.request.request_digest &&
+          attestation.plan_digest ===
+            result.executor.request.plan_digest &&
+          typeof attestation.working_directory === "string" &&
+          !("stdout" in attestation) &&
+          !("stderr" in attestation) &&
+          !("payload" in attestation),
+      ),
+    );
   } finally {
     await repository.cleanup();
+  }
+});
+
+test("qualification has no implicit executor and rejects host environment input", async () => {
+  const repository = await createRepository();
+  const previousSecret = process.env.SELENIUM_EXECUTOR_TEST_SECRET;
+  process.env.SELENIUM_EXECUTOR_TEST_SECRET = "must-not-cross";
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    await assert.rejects(
+      qualifySeleniumCandidate(
+        {
+          observation,
+          repositoryRoot: repository.root,
+        },
+        {
+          catalog: await fixture("capabilities.json"),
+          generatedAt: "2026-10-21T18:20:00Z",
+        },
+      ),
+      /Selenium executor must be an object/u,
+    );
+
+    const observed = [];
+    const result = await qualify(repository, observation, {
+      runCommand: passingRunner(observed),
+    });
+    assert.equal(
+      result.validation.disposition.state,
+      "independently-qualified",
+    );
+    assert.ok(
+      observed.every(
+        ({ context }) =>
+          context.environment.SELENIUM_EXECUTOR_TEST_SECRET === undefined &&
+          context.environment.GITHUB_TOKEN === undefined &&
+          context.environment.AWS_SECRET_ACCESS_KEY === undefined,
+      ),
+    );
+    await assert.rejects(
+      qualify(repository, observation, {
+        environment: {
+          GITHUB_TOKEN: "forbidden",
+        },
+        runCommand: passingRunner([]),
+      }),
+      /GITHUB_TOKEN is not allowlisted/u,
+    );
+  } finally {
+    if (previousSecret === undefined) {
+      delete process.env.SELENIUM_EXECUTOR_TEST_SECRET;
+    } else {
+      process.env.SELENIUM_EXECUTOR_TEST_SECRET = previousSecret;
+    }
+    await repository.cleanup();
+  }
+});
+
+test("missing or forged executor attestations fail closed", async () => {
+  for (const mutation of [
+    "missing",
+    "candidate",
+    "challenge",
+    "environment",
+    "executable",
+    "isolation",
+    "payload",
+    "signature",
+    "tools",
+  ]) {
+    const repository = await createRepository();
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      let calls = 0;
+      const result = await qualify(repository, observation, {
+        attestation(attestation) {
+          calls += 1;
+          const forged = structuredClone(attestation);
+          if (mutation === "missing") {
+            return undefined;
+          } else if (mutation === "candidate") {
+            forged.candidate_digest = "0".repeat(64);
+          } else if (mutation === "challenge") {
+            forged.challenge = "d".repeat(64);
+          } else if (mutation === "environment") {
+            forged.environment_digest = `sha256:${"0".repeat(64)}`;
+          } else if (mutation === "executable") {
+            forged.executable_identity_digest = `sha256:${"0".repeat(64)}`;
+          } else if (mutation === "payload") {
+            forged.payload = "forbidden";
+          } else if (mutation === "signature") {
+            forged.signature =
+              `${forged.signature.startsWith("A") ? "B" : "A"}` +
+              forged.signature.slice(1);
+          } else if (mutation === "tools") {
+            forged.tools_digest = `sha256:${"0".repeat(64)}`;
+          } else {
+            forged.isolation.repository_write_access = true;
+          }
+          return forged;
+        },
+        runCommand: passingRunner([]),
+      });
+
+      assert.equal(calls, 1, mutation);
+      assert.deepEqual(
+        result.validation.disposition,
+        {
+          state: "blocked",
+          reason_codes: ["APPLICATION_FAILED"],
+        },
+        mutation,
+      );
+      assert.ok(
+        result.validation.results.every(
+          ({ evidence }) =>
+            evidence.every(
+              ({ type }) =>
+                type !== "qualification-executor-attestation",
+            ),
+        ),
+        mutation,
+      );
+    } finally {
+      await repository.cleanup();
+    }
   }
 });
 
@@ -1355,9 +1631,7 @@ test("real npm creates and installs the candidate manifest and lock", async () =
     const observed = [];
     const result = await qualify(repository, observation, {
       environment: {
-        ...process.env,
-        GITHUB_WORKSPACE: "/untrusted/source/workspace",
-        npm_config_strict_ssl: "false",
+        NPM_CONFIG_STRICT_SSL: "false",
       },
       runCommand: async (step, context) => {
         observed.push({ step, context });
@@ -1977,7 +2251,7 @@ test("workspace boundary and source mutations fail closed", async () => {
           return raw;
         },
       }),
-      /outside its package boundary/u,
+      /modified immutable trusted inputs/u,
     );
 
     const ignoredRunner = passingRunner([]);
