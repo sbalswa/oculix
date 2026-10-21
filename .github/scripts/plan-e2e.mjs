@@ -1,4 +1,4 @@
-import { access, appendFile, readFile } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import {
   dirname,
   isAbsolute,
@@ -8,6 +8,10 @@ import {
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+const MAX_CUSTOM_CELLS = 12;
+const MAX_PARALLEL = 6;
+const GITHUB_HOSTED_RUNNER_PATTERN =
+  /^(?:ubuntu-(?:latest|\d{2}\.\d{2})|windows-(?:latest|\d{4})|macos-(?:latest|\d+(?:-intel)?))$/u;
 const DEFAULT_CATALOG_PATH = resolve(
   SCRIPT_DIRECTORY,
   "../../tests/e2e/capabilities.json",
@@ -73,9 +77,18 @@ function assertRepositoryPath(path, name) {
   const normalized = path.replaceAll("\\", "/");
   if (
     isAbsolute(normalized) ||
-    normalized.split("/").includes("..")
+    /^[a-zA-Z]:\//u.test(normalized) ||
+    normalized.startsWith("//") ||
+    normalized === "." ||
+    normalized.split("/").some((part) => part === "." || part === "..")
   ) {
     throw new Error(`${name} must be repository-relative`);
+  }
+}
+
+function assertUnderDiagnostics(path, diagnostics, name) {
+  if (!path.replaceAll("\\", "/").startsWith(diagnostics)) {
+    throw new Error(`${name} must remain beneath diagnostics`);
   }
 }
 
@@ -138,7 +151,10 @@ function validateCapability(capability, index) {
       `${prefix}.selector must match its tool, OS, and browser`,
     );
   }
-  if (!capability.task.startsWith(`e2e:${capability.tool}`)) {
+  if (
+    capability.task !== `e2e:${capability.tool}` &&
+    !capability.task.startsWith(`e2e:${capability.tool}:`)
+  ) {
     throw new Error(`${prefix}.task must invoke its tool's E2E task`);
   }
   if (!capability.diagnostics.endsWith("/")) {
@@ -146,9 +162,19 @@ function validateCapability(capability, index) {
   }
   assertRepositoryPath(capability.diagnostics, `${prefix}.diagnostics`);
   assertRepositoryPath(capability.evidence, `${prefix}.evidence`);
+  assertUnderDiagnostics(
+    capability.evidence,
+    capability.diagnostics,
+    `${prefix}.evidence`,
+  );
   for (const key of ["required_files", "result_reports"]) {
     for (const path of capability[key]) {
       assertRepositoryPath(path, `${prefix}.${key}`);
+      assertUnderDiagnostics(
+        path,
+        capability.diagnostics,
+        `${prefix}.${key}`,
+      );
     }
   }
   if (!requiredFilesCover(
@@ -186,6 +212,9 @@ function validateCapability(capability, index) {
   }
   if (!capability.environment.split(",").includes("web-e2e")) {
     throw new Error(`${prefix}.environment must include web-e2e`);
+  }
+  if (!GITHUB_HOSTED_RUNNER_PATTERN.test(capability.runner)) {
+    throw new Error(`${prefix}.runner must be a standard GitHub-hosted runner`);
   }
   const linuxRunner = capability.runner.startsWith("ubuntu-");
   if (
@@ -238,7 +267,8 @@ export function validateCatalog(catalog) {
     throw new Error("guardrails must be an object");
   }
   const unknownGuardrailKeys = Object.keys(catalog.guardrails).filter(
-    (key) => !["max_custom_cells", "max_parallel"].includes(key),
+    (key) =>
+      !["allowed_runners", "max_custom_cells", "max_parallel"].includes(key),
   );
   if (unknownGuardrailKeys.length > 0) {
     throw new Error(
@@ -254,6 +284,29 @@ export function validateCatalog(catalog) {
     catalog.guardrails.max_parallel,
     "guardrails.max_parallel",
   );
+  assertStringArray(
+    catalog.guardrails.allowed_runners,
+    "guardrails.allowed_runners",
+    { allowEmpty: false },
+  );
+  if (catalog.guardrails.max_custom_cells > MAX_CUSTOM_CELLS) {
+    throw new Error(
+      `guardrails.max_custom_cells cannot exceed ${MAX_CUSTOM_CELLS}`,
+    );
+  }
+  if (catalog.guardrails.max_parallel > MAX_PARALLEL) {
+    throw new Error(`guardrails.max_parallel cannot exceed ${MAX_PARALLEL}`);
+  }
+  if (
+    catalog.guardrails.allowed_runners.some(
+      (runner) => !GITHUB_HOSTED_RUNNER_PATTERN.test(runner),
+    )
+  ) {
+    throw new Error(
+      "guardrails.allowed_runners must contain only standard " +
+        "GitHub-hosted runners",
+    );
+  }
   if (
     !Array.isArray(catalog.capabilities) ||
     catalog.capabilities.length === 0
@@ -261,6 +314,13 @@ export function validateCatalog(catalog) {
     throw new Error("capabilities must be a nonempty array");
   }
   catalog.capabilities.forEach(validateCapability);
+  for (const capability of catalog.capabilities) {
+    if (!catalog.guardrails.allowed_runners.includes(capability.runner)) {
+      throw new Error(
+        `${capability.id} uses runner outside guardrails.allowed_runners`,
+      );
+    }
+  }
   for (const key of ["id", "selector"]) {
     const values = catalog.capabilities.map((capability) => capability[key]);
     if (new Set(values).size !== values.length) {
@@ -298,8 +358,9 @@ async function taskExists(task, repositoryRoot) {
   const path = taskPath(task, repositoryRoot);
   for (const candidate of [path, resolve(path, "_default")]) {
     try {
-      await access(candidate);
-      return true;
+      if ((await stat(candidate)).isFile()) {
+        return true;
+      }
     } catch (error) {
       if (error.code !== "ENOENT") {
         throw error;
@@ -355,6 +416,18 @@ export function selectorsFromDispatch({ preset, selectors = "" }) {
   if (preset === "custom") {
     if (custom.length === 0) {
       throw new Error("The custom E2E preset requires selectors");
+    }
+    if (
+      custom.some(
+        (selector) =>
+          selector === "ci:e2e:smoke" ||
+          selector === "ci:e2e:all" ||
+          /^ci:e2e:[a-z0-9-]+:all$/u.test(selector),
+      )
+    ) {
+      throw new Error(
+        "The custom E2E preset accepts only exact capability selectors",
+      );
     }
     return custom;
   }
@@ -438,9 +511,25 @@ function expandSelector(selector, catalog, indexes, includeExperimental) {
 
 function executionCapability(capability, position, total) {
   return {
-    ...capability,
+    id: capability.id,
     position,
     total,
+    tool: capability.tool,
+    runner: capability.runner,
+    os: capability.os,
+    browser: capability.browser,
+    environment: capability.environment,
+    task: capability.task,
+    diagnostics: capability.diagnostics,
+    evidence: capability.evidence,
+    required_files: JSON.stringify(capability.required_files),
+    result_reports: JSON.stringify(capability.result_reports),
+    require_accessibility: capability.require_accessibility,
+    linux_packages: capability.linux_packages.join(" "),
+    oculix_chromium_disable_sandbox:
+      capability.oculix_chromium_disable_sandbox ? "1" : "",
+    use_xvfb: capability.use_xvfb,
+    cost_class: capability.cost_class,
   };
 }
 
@@ -489,6 +578,9 @@ export function planCapabilities({
   return {
     count: total,
     ids: capabilities.map((capability) => capability.id),
+    skippedIds: catalog.capabilities
+      .filter((capability) => !selected.has(capability.id))
+      .map((capability) => capability.id),
     matrix: { include },
     maxParallel: catalog.guardrails.max_parallel,
   };
@@ -511,6 +603,15 @@ export function formatPlanSummary(plan) {
       );
     }
     lines.push("", `Maximum parallel jobs: **${plan.maxParallel}**.`, "");
+  }
+  lines.push("#### Skipped capabilities", "");
+  if (plan.skippedIds.length === 0) {
+    lines.push("- None.", "");
+  } else {
+    for (const id of plan.skippedIds) {
+      lines.push(`- \`${id}\``);
+    }
+    lines.push("");
   }
   return lines.join("\n");
 }

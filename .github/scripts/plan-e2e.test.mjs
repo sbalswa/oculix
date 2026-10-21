@@ -36,6 +36,11 @@ test("the committed catalog contains the proven Phase 1 cells", () => {
   );
   assert.equal(catalog.guardrails.max_custom_cells, 6);
   assert.equal(catalog.guardrails.max_parallel, 3);
+  assert.deepEqual(catalog.guardrails.allowed_runners, [
+    "ubuntu-latest",
+    "macos-latest",
+    "windows-latest",
+  ]);
   assert.deepEqual(
     catalog.capabilities
       .filter((capability) => capability.smoke)
@@ -56,6 +61,12 @@ test("an empty selection allocates zero capabilities", () => {
     {
       count: 0,
       ids: [],
+      skippedIds: [
+        "selenium-ubuntu-chromium",
+        "cypress-ubuntu-chrome",
+        "playwright-ubuntu-chromium",
+        "oculix-ubuntu-chromium",
+      ],
       matrix: { include: [] },
       maxParallel: 3,
     },
@@ -73,6 +84,14 @@ test("raw IDs and exact label selectors produce the same cell", () => {
   });
   assert.deepEqual(raw, label);
   assert.deepEqual(raw.ids, ["cypress-ubuntu-chrome"]);
+  assert.equal(
+    raw.matrix.include[0].required_files,
+    JSON.stringify(catalog.capabilities[1].required_files),
+  );
+  assert.equal(
+    raw.matrix.include[0].result_reports,
+    JSON.stringify(catalog.capabilities[1].result_reports),
+  );
 });
 
 test("selectors union and deduplicate deterministically", () => {
@@ -107,6 +126,10 @@ test("selectors union and deduplicate deterministically", () => {
       },
     ],
   );
+  assert.deepEqual(plan.skippedIds, [
+    "playwright-ubuntu-chromium",
+    "oculix-ubuntu-chromium",
+  ]);
 });
 
 test("smoke and full presets expand through stable catalog rows", () => {
@@ -215,6 +238,22 @@ test("custom unions enforce the configured cell limit", () => {
   );
 });
 
+test("execution rows serialize executor inputs without array coercion", () => {
+  const oculix = planCapabilities({
+    catalog,
+    selectors: ["oculix-ubuntu-chromium"],
+  }).matrix.include[0];
+  assert.equal(oculix.linux_packages, "xdotool");
+  assert.equal(oculix.required_files, JSON.stringify([
+    "oculix-web-calculator-diagnostics/result.png",
+  ]));
+  assert.equal(oculix.result_reports, "[]");
+  assert.equal(oculix.oculix_chromium_disable_sandbox, "1");
+  assert.equal(oculix.use_xvfb, true);
+  assert.equal(oculix.require_accessibility, false);
+  assert.equal("scenarios" in oculix, false);
+});
+
 test("label normalization ignores unrelated PR labels", () => {
   assert.deepEqual(
     selectorsFromLabels([
@@ -281,6 +320,20 @@ test("dispatch presets normalize and validate custom input", () => {
       }),
     /only with preset=custom/,
   );
+  for (const selector of [
+    "ci:e2e:smoke",
+    "ci:e2e:all",
+    "ci:e2e:selenium:all",
+  ]) {
+    assert.throws(
+      () =>
+        selectorsFromDispatch({
+          preset: "custom",
+          selectors: selector,
+        }),
+      /only exact capability selectors/,
+    );
+  }
 });
 
 test("catalog validation rejects drift-prone metadata", () => {
@@ -324,6 +377,57 @@ test("catalog validation rejects drift-prone metadata", () => {
     () => validateCatalog(missingReport),
     /must include every result report/,
   );
+
+  const selfHosted = structuredClone(catalog);
+  selfHosted.capabilities[0].runner = "self-hosted";
+  assert.throws(
+    () => validateCatalog(selfHosted),
+    /standard GitHub-hosted runner/,
+  );
+
+  const unapprovedHosted = structuredClone(catalog);
+  unapprovedHosted.capabilities[0].runner = "ubuntu-24.04";
+  assert.throws(
+    () => validateCatalog(unapprovedHosted),
+    /outside guardrails.allowed_runners/,
+  );
+
+  const excessiveParallelism = structuredClone(catalog);
+  excessiveParallelism.guardrails.max_parallel = 7;
+  assert.throws(
+    () => validateCatalog(excessiveParallelism),
+    /cannot exceed 6/,
+  );
+
+  const windowsAbsolutePath = structuredClone(catalog);
+  windowsAbsolutePath.capabilities[0].evidence =
+    "C:\\outside\\result.png";
+  assert.throws(
+    () => validateCatalog(windowsAbsolutePath),
+    /repository-relative/,
+  );
+
+  const currentDirectoryPath = structuredClone(catalog);
+  currentDirectoryPath.capabilities[0].evidence = ".";
+  assert.throws(
+    () => validateCatalog(currentDirectoryPath),
+    /repository-relative/,
+  );
+
+  const escapedDiagnostics = structuredClone(catalog);
+  escapedDiagnostics.capabilities[0].evidence =
+    "tests/e2e/other/result.png";
+  assert.throws(
+    () => validateCatalog(escapedDiagnostics),
+    /beneath diagnostics/,
+  );
+
+  const taskPrefixCollision = structuredClone(catalog);
+  taskPrefixCollision.capabilities[0].task = "e2e:seleniumish";
+  assert.throws(
+    () => validateCatalog(taskPrefixCollision),
+    /must invoke its tool's E2E task/,
+  );
 });
 
 test("catalog tasks resolve to committed canonical mise tasks", async () => {
@@ -332,6 +436,12 @@ test("catalog tasks resolve to committed canonical mise tasks", async () => {
   missingTask.capabilities[0].task = "e2e:selenium:missing";
   await assert.rejects(
     validateCatalogTasks(missingTask, process.cwd()),
+    /references missing mise task/,
+  );
+  const directoryOnlyTask = structuredClone(catalog);
+  directoryOnlyTask.capabilities[0].task = "e2e:fixtures:web-calculator";
+  await assert.rejects(
+    validateCatalogTasks(directoryOnlyTask, process.cwd()),
     /references missing mise task/,
   );
 });
@@ -347,4 +457,6 @@ test("planner summary exposes selected cost before execution", () => {
   assert.match(summary, /selenium-ubuntu-chromium/);
   assert.match(summary, /ubuntu-latest, chromium, standard/);
   assert.match(summary, /Maximum parallel jobs: \*\*3\*\*/);
+  assert.match(summary, /Skipped capabilities/);
+  assert.match(summary, /cypress-ubuntu-chrome/);
 });

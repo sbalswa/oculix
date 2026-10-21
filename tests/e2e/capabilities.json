@@ -1,6 +1,11 @@
 {
   "schema_version": 1,
   "guardrails": {
+    "allowed_runners": [
+      "ubuntu-latest",
+      "macos-latest",
+      "windows-latest"
+    ],
     "max_custom_cells": 6,
     "max_parallel": 3
   },
