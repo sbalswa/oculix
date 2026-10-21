@@ -1,0 +1,212 @@
+name: Reusable E2E capability executor
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git commit to validate
+        required: true
+        type: string
+      mise_version:
+        description: Pinned mise version
+        required: true
+        type: string
+      id:
+        description: Stable capability identifier
+        required: true
+        type: string
+      position:
+        description: Capability position in the selected matrix
+        required: true
+        type: number
+      total:
+        description: Total capabilities in the selected matrix
+        required: true
+        type: number
+      tool:
+        description: E2E tool name
+        required: true
+        type: string
+      runner:
+        description: GitHub-hosted runner label
+        required: true
+        type: string
+      os:
+        description: Operating-system dimension
+        required: true
+        type: string
+      browser:
+        description: Browser dimension
+        required: true
+        type: string
+      environment:
+        description: Mise environment selection
+        required: true
+        type: string
+      task:
+        description: Mise task to execute
+        required: true
+        type: string
+      diagnostics:
+        description: Artifact upload path
+        required: true
+        type: string
+      evidence:
+        description: End-user evidence path
+        required: true
+        type: string
+      required_files:
+        description: JSON array of required report and evidence paths
+        required: true
+        type: string
+      result_reports:
+        description: JSON array of result report paths
+        required: true
+        type: string
+      require_accessibility:
+        description: Require accessibility results in reports
+        required: true
+        type: boolean
+      linux_packages:
+        description: Space-separated Linux packages to install
+        required: false
+        default: ""
+        type: string
+      oculix_chromium_disable_sandbox:
+        description: Hosted Oculix Chromium sandbox exception
+        required: false
+        default: ""
+        type: string
+      use_xvfb:
+        description: Run the mise task under Xvfb
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  execute:
+    name: E2E ${{ inputs.id }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    env:
+      E2E_BROWSER: ${{ inputs.browser }}
+      E2E_OS: ${{ inputs.os }}
+      MISE_ENV: ${{ inputs.environment }}
+      MISE_LOCKED: "1"
+      OCULIX_CHROMIUM_DISABLE_SANDBOX: >-
+        ${{ inputs.oculix_chromium_disable_sandbox }}
+      E2E_USE_XVFB: ${{ inputs.use_xvfb }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ inputs.mise_version }}
+          install_args: --locked
+
+      - name: Install matrix Linux dependencies
+        if: ${{ runner.os == 'Linux' && inputs.linux_packages != '' }}
+        shell: bash
+        env:
+          E2E_LINUX_PACKAGES: ${{ inputs.linux_packages }}
+        run: |
+          read -r -a packages <<<"$E2E_LINUX_PACKAGES"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
+
+      - name: Run mise task ${{ inputs.task }} on Unix
+        id: run-unix
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        env:
+          E2E_TASK: ${{ inputs.task }}
+        run: |
+          if [[ "$E2E_USE_XVFB" == "true" ]]; then
+            xvfb-run -a -s '-screen 0 1280x1024x24' \
+              mise run "$E2E_TASK"
+          else
+            mise run "$E2E_TASK"
+          fi
+
+      - name: Run mise task ${{ inputs.task }} on Windows
+        id: run-windows
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          E2E_TASK: ${{ inputs.task }}
+        run: |
+          & mise run $env:E2E_TASK
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Validate reports and end-user result evidence
+        id: evidence
+        if: >-
+          ${{
+            steps.run-unix.outcome == 'success' ||
+            steps.run-windows.outcome == 'success'
+          }}
+        shell: bash
+        env:
+          E2E_CAPABILITY_ID: ${{ inputs.id }}
+          E2E_EVIDENCE_FILE: ${{ inputs.evidence }}
+          E2E_REQUIRED_FILES: ${{ inputs.required_files }}
+          E2E_REQUIRE_ACCESSIBILITY: ${{ inputs.require_accessibility }}
+          E2E_RESULT_REPORTS: ${{ inputs.result_reports }}
+        run: |
+          node .github/scripts/validate-e2e-reports.mjs
+          printf 'End-user result evidence: %s\n' "$E2E_EVIDENCE_FILE"
+
+      - name: Summarize capability result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          E2E_BROWSER_NAME: ${{ inputs.browser }}
+          E2E_CAPABILITY_ID: ${{ inputs.id }}
+          E2E_EVIDENCE_FILE: ${{ inputs.evidence }}
+          E2E_EVIDENCE_RESULT: ${{ steps.evidence.outcome }}
+          E2E_OS_NAME: ${{ inputs.os }}
+          E2E_POSITION: ${{ inputs.position }}
+          E2E_RESULT: >-
+            ${{
+              runner.os == 'Windows' &&
+              steps.run-windows.outcome ||
+              steps.run-unix.outcome
+            }}
+          E2E_TASK_NAME: ${{ inputs.task }}
+          E2E_TOTAL: ${{ inputs.total }}
+          E2E_TOOL_NAME: ${{ inputs.tool }}
+        run: |
+          {
+            printf "### \`%s\`\n\n" "$E2E_CAPABILITY_ID"
+            printf -- "- Capability: \`%s\` of \`%s\`\n" \
+              "$E2E_POSITION" "$E2E_TOTAL"
+            printf -- "- Tool: \`%s\`\n" "$E2E_TOOL_NAME"
+            printf -- "- OS: \`%s\`\n" "$E2E_OS_NAME"
+            printf -- "- Browser: \`%s\`\n" "$E2E_BROWSER_NAME"
+            printf -- "- Task: \`%s\`\n" "$E2E_TASK_NAME"
+            printf -- "- End-user evidence: \`%s\` (\`%s\`)\n" \
+              "$E2E_EVIDENCE_FILE" "$E2E_EVIDENCE_RESULT"
+            printf -- "- Report contract: \`%s\`\n" \
+              "$E2E_EVIDENCE_RESULT"
+            printf -- "- Result: \`%s\`\n" "$E2E_RESULT"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload E2E evidence and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-${{ inputs.id }}
+          path: ${{ inputs.diagnostics }}
+          if-no-files-found: warn
+          retention-days: 7

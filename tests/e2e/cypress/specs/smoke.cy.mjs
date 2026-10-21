@@ -1,3 +1,9 @@
+import {
+  auditAccessibility,
+  enforceAccessibility,
+  recordAssertion,
+} from "../accessibility.mjs";
+
 const SMOKE_DOCUMENT = `<!doctype html>
 <html lang="en">
   <head><meta charset="utf-8"><title>Cypress smoke</title></head>
@@ -25,5 +31,9 @@ describe("Cypress smoke", () => {
       .should("have.text", "ready")
       .click()
       .should("have.text", "clicked");
+    cy.screenshot("result", { capture: "viewport" });
+    recordAssertion("Smoke control changed from ready to clicked");
+    auditAccessibility("final");
+    enforceAccessibility();
   });
 });

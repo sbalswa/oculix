@@ -2,12 +2,18 @@ import { expect, test } from "@playwright/test";
 import playwrightPackage from "@playwright/test/package.json" with {
   type: "json",
 };
+import { writeRuntimeMetadata } from "./reporting.mjs";
 
 test("interacts with an in-memory page", async ({
   browser,
   browserName,
   page,
 }) => {
+  await writeRuntimeMetadata({
+    browserName,
+    browserVersion: browser.version(),
+    scenario: "smoke",
+  });
   const networkRequests = [];
   page.on("request", (request) => networkRequests.push(request.url()));
 
