@@ -32,6 +32,15 @@ steps {
     )
     check = "mise run test:toolchain-maintenance"
   }
+  ["dependency-qualification-tests"] {
+    glob = List(
+      ".github/scripts/dependency-qualification/*.mjs",
+      "tests/dependency-qualification/**/*.json",
+      "tests/dependency-qualification/**/*.md",
+      "tests/e2e/capabilities.json",
+    )
+    check = "mise run test:dependency-qualification"
+  }
 
   ["byte_order_marker"] = Builtins.byte_order_marker
   ["betterleaks"] = Builtins.betterleaks
