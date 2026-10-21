@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "guardrails": {
+    "max_custom_cells": 6,
+    "max_parallel": 3
+  },
+  "capabilities": [
+    {
+      "id": "selenium-ubuntu-chromium",
+      "selector": "ci:e2e:selenium:ubuntu:chromium",
+      "tool": "selenium",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "browser": "chromium",
+      "environment": "web-e2e",
+      "task": "e2e:selenium",
+      "scenarios": [
+        "smoke",
+        "web-calculator"
+      ],
+      "diagnostics": "tests/e2e/selenium/diagnostics/",
+      "evidence": "tests/e2e/selenium/diagnostics/web-calculator/result.png",
+      "required_files": [
+        "tests/e2e/selenium/diagnostics/web-calculator/result.png",
+        "tests/e2e/selenium/diagnostics/web-calculator/result.json",
+        "tests/e2e/selenium/diagnostics/web-calculator/accessibility.json",
+        "tests/e2e/selenium/diagnostics/web-calculator/accessibility-summary.md"
+      ],
+      "result_reports": [
+        "tests/e2e/selenium/diagnostics/web-calculator/result.json"
+      ],
+      "require_accessibility": true,
+      "linux_packages": [],
+      "oculix_chromium_disable_sandbox": false,
+      "use_xvfb": false,
+      "smoke": true,
+      "stability": "stable",
+      "cost_class": "standard"
+    },
+    {
+      "id": "cypress-ubuntu-chrome",
+      "selector": "ci:e2e:cypress:ubuntu:chrome",
+      "tool": "cypress",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "browser": "chrome",
+      "environment": "web-e2e",
+      "task": "e2e:cypress",
+      "scenarios": [
+        "smoke",
+        "web-calculator"
+      ],
+      "diagnostics": "tests/e2e/cypress/diagnostics/",
+      "evidence": "tests/e2e/cypress/diagnostics/web-calculator/screenshots/web-calculator.cy.mjs/result.png",
+      "required_files": [
+        "tests/e2e/cypress/diagnostics/smoke/run.json",
+        "tests/e2e/cypress/diagnostics/smoke/accessibility.json",
+        "tests/e2e/cypress/diagnostics/smoke/accessibility.md",
+        "tests/e2e/cypress/diagnostics/smoke/screenshots/**/*.png",
+        "tests/e2e/cypress/diagnostics/smoke/videos/**/*.mp4",
+        "tests/e2e/cypress/diagnostics/web-calculator/run.json",
+        "tests/e2e/cypress/diagnostics/web-calculator/accessibility.json",
+        "tests/e2e/cypress/diagnostics/web-calculator/accessibility.md",
+        "tests/e2e/cypress/diagnostics/web-calculator/screenshots/**/*.png",
+        "tests/e2e/cypress/diagnostics/web-calculator/videos/**/*.mp4",
+        "tests/e2e/cypress/diagnostics/summary.json",
+        "tests/e2e/cypress/diagnostics/summary.md"
+      ],
+      "result_reports": [
+        "tests/e2e/cypress/diagnostics/smoke/run.json",
+        "tests/e2e/cypress/diagnostics/web-calculator/run.json"
+      ],
+      "require_accessibility": true,
+      "linux_packages": [],
+      "oculix_chromium_disable_sandbox": false,
+      "use_xvfb": false,
+      "smoke": false,
+      "stability": "stable",
+      "cost_class": "standard"
+    },
+    {
+      "id": "playwright-ubuntu-chromium",
+      "selector": "ci:e2e:playwright:ubuntu:chromium",
+      "tool": "playwright",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "browser": "chromium",
+      "environment": "web-e2e",
+      "task": "e2e:playwright",
+      "scenarios": [
+        "smoke",
+        "web-calculator"
+      ],
+      "diagnostics": "tests/e2e/playwright/test-results/",
+      "evidence": "tests/e2e/playwright/test-results/web-calculator/final.png",
+      "required_files": [
+        "tests/e2e/playwright/test-results/smoke/result.json",
+        "tests/e2e/playwright/test-results/smoke/playwright-report.json",
+        "tests/e2e/playwright/test-results/smoke/html-report/index.html",
+        "tests/e2e/playwright/test-results/smoke/artifacts/**/*.webm",
+        "tests/e2e/playwright/test-results/web-calculator/result.json",
+        "tests/e2e/playwright/test-results/web-calculator/accessibility.json",
+        "tests/e2e/playwright/test-results/web-calculator/accessibility-summary.json",
+        "tests/e2e/playwright/test-results/web-calculator/accessibility-summary.md",
+        "tests/e2e/playwright/test-results/web-calculator/final.png",
+        "tests/e2e/playwright/test-results/web-calculator/playwright-report.json",
+        "tests/e2e/playwright/test-results/web-calculator/html-report/index.html",
+        "tests/e2e/playwright/test-results/web-calculator/artifacts/**/*.webm"
+      ],
+      "result_reports": [
+        "tests/e2e/playwright/test-results/smoke/result.json",
+        "tests/e2e/playwright/test-results/web-calculator/result.json"
+      ],
+      "require_accessibility": true,
+      "linux_packages": [],
+      "oculix_chromium_disable_sandbox": false,
+      "use_xvfb": false,
+      "smoke": false,
+      "stability": "stable",
+      "cost_class": "standard"
+    },
+    {
+      "id": "oculix-ubuntu-chromium",
+      "selector": "ci:e2e:oculix:ubuntu:chromium",
+      "tool": "oculix",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "browser": "chromium",
+      "environment": "oculix,web-e2e",
+      "task": "e2e:oculix:web-calculator",
+      "scenarios": [
+        "web-calculator"
+      ],
+      "diagnostics": "oculix-web-calculator-diagnostics/",
+      "evidence": "oculix-web-calculator-diagnostics/result.png",
+      "required_files": [
+        "oculix-web-calculator-diagnostics/result.png"
+      ],
+      "result_reports": [],
+      "require_accessibility": false,
+      "linux_packages": [
+        "xdotool"
+      ],
+      "oculix_chromium_disable_sandbox": true,
+      "use_xvfb": true,
+      "smoke": false,
+      "stability": "stable",
+      "cost_class": "standard"
+    }
+  ]
+}
