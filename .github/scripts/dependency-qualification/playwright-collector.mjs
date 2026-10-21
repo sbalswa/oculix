@@ -2,10 +2,12 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   cp,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,6 +42,17 @@ const PACKAGE_TESTS = [
   "process-runner.test.mjs",
   "reporting.test.mjs",
 ];
+const RUNTIME_METADATA_PREFIX = "OCULIX_PLAYWRIGHT_RUNTIME=";
+const RUNTIME_METADATA_SCRIPT = [
+  'import { chromium } from "playwright-core";',
+  "const executablePath = chromium.executablePath();",
+  "const match = /(?:^|[\\\\/])(?:chromium|chromium_headless_shell)-(\\d+)(?:[\\\\/]|$)/u.exec(executablePath);",
+  "process.stdout.write(",
+  `  ${JSON.stringify(RUNTIME_METADATA_PREFIX)} +`,
+  '    JSON.stringify({ browser: "chromium", executablePath, revision: match?.[1] ?? null }) +',
+  '    "\\n",',
+  ");",
+].join("\n");
 
 class MetadataError extends Error {
   constructor(reasonCode, message, state = "unknown") {
@@ -109,6 +122,124 @@ function exactString(value, label) {
   return value;
 }
 
+const SEMVER_PATTERN =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u;
+const PARTIAL_VERSION_PATTERN =
+  /^(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])){0,2}$/u;
+const INTEGRITY_PATTERN = /^sha(?:256|384|512)-[A-Za-z0-9+/]+={0,2}$/u;
+
+function assertSemver(value, label) {
+  exactString(value, label);
+  const match = SEMVER_PATTERN.exec(value);
+  if (match === null) {
+    throw new MetadataError(
+      "SEMVER_METADATA_INVALID",
+      `${label} must be a strict semantic version`,
+    );
+  }
+  const prerelease = match[4]?.split(".") ?? [];
+  if (
+    prerelease.some((identifier) =>
+      /^\d+$/u.test(identifier) &&
+      identifier.length > 1 &&
+      identifier.startsWith("0"))
+  ) {
+    throw new MetadataError(
+      "SEMVER_METADATA_INVALID",
+      `${label} has a numeric prerelease identifier with a leading zero`,
+    );
+  }
+  return value;
+}
+
+function validComparator(token) {
+  const match = /^(?:[<>]=?|[=~^])?(.*)$/u.exec(token);
+  if (match === null) {
+    return false;
+  }
+  const version = match[1];
+  if (SEMVER_PATTERN.test(version)) {
+    return true;
+  }
+  if (!PARTIAL_VERSION_PATTERN.test(version)) {
+    return false;
+  }
+  const segments = version.split(".");
+  const wildcard = segments.findIndex((segment) => /^[xX*]$/u.test(segment));
+  return wildcard === -1 ||
+    segments.slice(wildcard).every((segment) => /^[xX*]$/u.test(segment));
+}
+
+function assertSemverRange(value, label) {
+  exactString(value, label);
+  const normalized = value.trim().replace(
+    /([<>]=?|[=~^])\s+(?=[0-9xX*])/gu,
+    "$1",
+  );
+  if (normalized.length === 0 || /[,;]/u.test(normalized)) {
+    throw new MetadataError(
+      "SEMVER_RANGE_INVALID",
+      `${label} must be a valid semantic-version range`,
+    );
+  }
+  for (const alternative of normalized.split(/\s*\|\|\s*/u)) {
+    if (alternative.length === 0) {
+      throw new MetadataError(
+        "SEMVER_RANGE_INVALID",
+        `${label} contains an empty range alternative`,
+      );
+    }
+    const hyphen = /^(\S+)\s+-\s+(\S+)$/u.exec(alternative);
+    const valid = hyphen === null
+      ? alternative.split(/\s+/u).every(validComparator)
+      : validComparator(hyphen[1]) && validComparator(hyphen[2]);
+    if (!valid) {
+      throw new MetadataError(
+        "SEMVER_RANGE_INVALID",
+        `${label} must be a valid semantic-version range`,
+      );
+    }
+  }
+  return value.trim();
+}
+
+function assertIntegrity(value, label) {
+  if (typeof value !== "string" || !INTEGRITY_PATTERN.test(value)) {
+    throw new MetadataError(
+      "PACKAGE_INTEGRITY_INVALID",
+      `${label} must be a valid SRI digest`,
+    );
+  }
+  const encoded = value.slice(value.indexOf("-") + 1);
+  const decoded = Buffer.from(encoded, "base64");
+  if (
+    decoded.length === 0 ||
+    decoded.toString("base64").replace(/=+$/u, "") !==
+      encoded.replace(/=+$/u, "")
+  ) {
+    throw new MetadataError(
+      "PACKAGE_INTEGRITY_INVALID",
+      `${label} must contain canonical base64 digest bytes`,
+    );
+  }
+  return value;
+}
+
+function assertTarball(value, label) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") {
+      throw new Error("not HTTPS");
+    }
+  } catch {
+    throw new MetadataError(
+      "PACKAGE_TARBALL_INVALID",
+      `${label} must be an absolute HTTPS URL`,
+    );
+  }
+  return value;
+}
+
 function currentPackageCohort(packageJson, lockfile) {
   const root = lockfile.packages?.[""];
   if (root === undefined) {
@@ -117,11 +248,11 @@ function currentPackageCohort(packageJson, lockfile) {
       "package-lock.json does not contain its root package",
     );
   }
-  const axe = exactString(
+  const axe = assertSemver(
     packageJson.devDependencies?.["@axe-core/playwright"],
     "package.json @axe-core/playwright",
   );
-  const test = exactString(
+  const test = assertSemver(
     packageJson.devDependencies?.["@playwright/test"],
     "package.json @playwright/test",
   );
@@ -139,11 +270,11 @@ function currentPackageCohort(packageJson, lockfile) {
   const testEntry = packageEntry(lockfile, "@playwright/test");
   const playwrightEntry = packageEntry(lockfile, "playwright");
   const coreEntry = packageEntry(lockfile, "playwright-core");
-  const playwright = exactString(
+  const playwright = assertSemver(
     testEntry.dependencies?.playwright,
     "@playwright/test dependency on playwright",
   );
-  const core = exactString(
+  const core = assertSemver(
     playwrightEntry.dependencies?.["playwright-core"],
     "playwright dependency on playwright-core",
   );
@@ -160,21 +291,48 @@ function currentPackageCohort(packageJson, lockfile) {
       "@playwright/test, playwright, and playwright-core are not exact lockstep pins",
     );
   }
+  const packages = {
+    "@axe-core/playwright": axe,
+    "@playwright/test": test,
+    playwright,
+    "playwright-core": core,
+  };
+  const integrities = Object.fromEntries(
+    PACKAGE_NAMES.map((name) => [
+      name,
+      assertIntegrity(
+        packageEntry(lockfile, name).integrity,
+        `${name} lock integrity`,
+      ),
+    ]),
+  );
+  const tarballs = Object.fromEntries(
+    PACKAGE_NAMES.map((name) => [
+      name,
+      assertTarball(
+        packageEntry(lockfile, name).resolved,
+        `${name} lock tarball`,
+      ),
+    ]),
+  );
+  const nodeRanges = Object.fromEntries(
+    PACKAGE_NAMES.map((name) => [
+      name,
+      assertSemverRange(
+        packageEntry(lockfile, name).engines?.node,
+        `${name} Node range`,
+      ),
+    ]),
+  );
   return {
-    packages: {
-      "@axe-core/playwright": axe,
-      "@playwright/test": test,
-      playwright,
-      "playwright-core": core,
-    },
-    nodeRanges: Object.fromEntries(
-      PACKAGE_NAMES.map((name) => [
-        name,
-        packageEntry(lockfile, name).engines?.node ?? "unspecified",
-      ]),
+    packages,
+    integrities,
+    tarballs,
+    nodeRanges,
+    axePeerRange: assertSemverRange(
+      axeEntry.peerDependencies?.["playwright-core"],
+      "@axe-core/playwright playwright-core peer range",
     ),
-    axePeerRange:
-      axeEntry.peerDependencies?.["playwright-core"] ?? "unspecified",
   };
 }
 
@@ -194,6 +352,9 @@ function registryVersion(packument, name, version = null) {
       `npm metadata for ${name}${version === null ? "" : `@${version}`} is incomplete`,
     );
   }
+  assertSemver(selected, `${name} version`);
+  assertIntegrity(record.dist.integrity, `${name} npm integrity`);
+  assertTarball(record.dist.tarball, `${name} npm tarball`);
   return record;
 }
 
@@ -206,7 +367,7 @@ function candidatePackageCohort(packuments) {
     packuments["@axe-core/playwright"],
     "@axe-core/playwright",
   );
-  const playwrightVersion = exactString(
+  const playwrightVersion = assertSemver(
     test.dependencies?.playwright,
     "@playwright/test candidate dependency on playwright",
   );
@@ -215,7 +376,7 @@ function candidatePackageCohort(packuments) {
     "playwright",
     playwrightVersion,
   );
-  const coreVersion = exactString(
+  const coreVersion = assertSemver(
     playwright.dependencies?.["playwright-core"],
     "playwright candidate dependency on playwright-core",
   );
@@ -233,34 +394,39 @@ function candidatePackageCohort(packuments) {
       "@playwright/test, playwright, and playwright-core candidate metadata is not lockstep",
     );
   }
+  const records = {
+    "@axe-core/playwright": axe,
+    "@playwright/test": test,
+    playwright,
+    "playwright-core": core,
+  };
   return {
-    records: {
-      "@axe-core/playwright": axe,
-      "@playwright/test": test,
-      playwright,
-      "playwright-core": core,
-    },
+    records,
     packages: Object.fromEntries(
-      Object.entries({
-        "@axe-core/playwright": axe,
-        "@playwright/test": test,
-        playwright,
-        "playwright-core": core,
-      }).map(([name, record]) => [name, record.version]),
+      Object.entries(records).map(([name, record]) => [name, record.version]),
     ),
-    nodeRanges: Object.fromEntries(
-      Object.entries({
-        "@axe-core/playwright": axe,
-        "@playwright/test": test,
-        playwright,
-        "playwright-core": core,
-      }).map(([name, record]) => [
+    integrities: Object.fromEntries(
+      Object.entries(records).map(([name, record]) => [
         name,
-        record.engines?.node ?? "unspecified",
+        record.dist.integrity,
       ]),
     ),
-    axePeerRange:
-      axe.peerDependencies?.["playwright-core"] ?? "unspecified",
+    tarballs: Object.fromEntries(
+      Object.entries(records).map(([name, record]) => [
+        name,
+        record.dist.tarball,
+      ]),
+    ),
+    nodeRanges: Object.fromEntries(
+      Object.entries(records).map(([name, record]) => [
+        name,
+        assertSemverRange(record.engines?.node, `${name} Node range`),
+      ]),
+    ),
+    axePeerRange: assertSemverRange(
+      axe.peerDependencies?.["playwright-core"],
+      "@axe-core/playwright playwright-core peer range",
+    ),
   };
 }
 
@@ -319,8 +485,14 @@ function browserEvidence(browser, coreVersion, observedAt) {
   };
 }
 
-function packageVersion(packages) {
-  return stableJson(packages);
+function packageVersion(cohort) {
+  return stableJson({
+    axePeerRange: cohort.axePeerRange,
+    integrities: cohort.integrities,
+    nodeRanges: cohort.nodeRanges,
+    packages: cohort.packages,
+    tarballs: cohort.tarballs,
+  });
 }
 
 function browserVersion(record) {
@@ -353,7 +525,7 @@ function baseComponents({
       lane: PROVIDER_ID,
       ecosystem: "npm",
       current: {
-        version: packageVersion(current.packages),
+        version: packageVersion(current),
         evidence: currentEvidence,
       },
       candidate: null,
@@ -587,7 +759,7 @@ export async function collectPlaywrightCohort({
   }
 
   const packageChanged =
-    packageVersion(candidate.packages) !== packageVersion(current.packages);
+    packageVersion(candidate) !== packageVersion(current);
   if (!packageChanged && browserProblem === null) {
     const document = {
       schema_version: 1,
@@ -625,7 +797,7 @@ export async function collectPlaywrightCohort({
       browserProblem ??= error;
     }
     components[0].candidate = {
-      version: packageVersion(candidate.packages),
+      version: packageVersion(candidate),
       evidence: PACKAGE_NAMES.map((name) =>
         npmEvidence(candidate.records[name], observedAt)),
     };
@@ -686,8 +858,9 @@ function decodedCandidate(observation) {
     throw new Error("Observation does not contain a complete Playwright candidate");
   }
   return {
-    packages: JSON.parse(packages.version),
+    ...JSON.parse(packages.version),
     browser: JSON.parse(browser.version),
+    browserEvidence: browser.evidence[0],
   };
 }
 
@@ -712,7 +885,9 @@ export function createPlaywrightQualificationPlan({
   const environmentFor = (capability) => ({
     E2E_BROWSER: capability.browser,
     E2E_OS: capability.os,
+    PLAYWRIGHT_BROWSERS_PATH: join(packageRoot, ".playwright-browsers"),
     PLAYWRIGHT_PROJECT: capability.browser,
+    npm_config_cache: join(packageRoot, ".npm-cache"),
   });
   return {
     provider_id: PROVIDER_ID,
@@ -736,13 +911,50 @@ export function createPlaywrightQualificationPlan({
       ],
       cwd: packageRoot,
       capability_id: null,
-      environment: {},
+      environment: {
+        npm_config_cache: join(packageRoot, ".npm-cache"),
+      },
     },
-    preparation: capabilities.map((capability) => ({
-      id: `prepare-${capability.id}`,
-      phase: "prepare",
+    preparation: capabilities.flatMap((capability) => [
+      {
+        id: `prepare-packages-${capability.id}`,
+        phase: "prepare",
+        command: "npm",
+        arguments: [
+          "ci",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund",
+        ],
+        cwd: packageRoot,
+        capability_id: capability.id,
+        environment: environmentFor(capability),
+      },
+      {
+        id: `prepare-browser-${capability.id}`,
+        phase: "prepare",
+        command: "npm",
+        arguments: [
+          "exec",
+          "--",
+          "playwright",
+          "install",
+          capability.browser,
+        ],
+        cwd: packageRoot,
+        capability_id: capability.id,
+        environment: environmentFor(capability),
+      },
+    ]),
+    runtime_metadata: capabilities.map((capability) => ({
+      id: `runtime-${capability.id}`,
+      phase: "runtime-metadata",
       command: process.execPath,
-      arguments: [harness, "prepare", capability.browser],
+      arguments: [
+        "--input-type=module",
+        "--eval",
+        RUNTIME_METADATA_SCRIPT,
+      ],
       cwd: packageRoot,
       capability_id: capability.id,
       environment: environmentFor(capability),
@@ -790,23 +1002,18 @@ async function defaultCreateWorkspace(sourceRoot) {
     join(tmpdir(), "oculix-playwright-qualification-"),
   );
   const workspaceRoot = join(temporaryRoot, "repository");
-  await cp(sourceRoot, workspaceRoot, {
-    recursive: true,
-    filter(source) {
-      const repositoryPath = relative(sourceRoot, source);
-      if (repositoryPath === "") {
-        return true;
-      }
-      const parts = repositoryPath.split(sep);
-      if (parts.includes(".git") || parts.includes("node_modules")) {
-        return false;
-      }
-      return !repositoryPath
-        .split(sep)
-        .join("/")
-        .startsWith(`${PACKAGE_DIRECTORY}/test-results`);
-    },
-  });
+  const trackedPaths = (await gitOutput(sourceRoot, ["ls-files", "-z"]))
+    .toString("utf8")
+    .split("\0")
+    .filter((path) => path.length > 0)
+    .sort();
+  for (const path of trackedPaths) {
+    const destination = join(workspaceRoot, path);
+    await mkdir(dirname(destination), { recursive: true });
+    await cp(join(sourceRoot, path), destination, {
+      preserveTimestamps: true,
+    });
+  }
   return {
     root: workspaceRoot,
     async cleanup() {
@@ -815,11 +1022,89 @@ async function defaultCreateWorkspace(sourceRoot) {
   };
 }
 
-function warningLines(output) {
-  return output
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter((line) => /\bwarn(?:ing)?\b/iu.test(line));
+function warningDescription(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value !== null && typeof value === "object") {
+    if (typeof value.message === "string") {
+      return value.message.trim();
+    }
+    if (typeof value.title === "string") {
+      return value.title.trim();
+    }
+    return stableJson(value);
+  }
+  return String(value);
+}
+
+function structuredWarnings(value, { warningContext = false } = {}) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) =>
+      structuredWarnings(entry, { warningContext }));
+  }
+  if (typeof value !== "object") {
+    return warningContext ? [warningDescription(value)] : [];
+  }
+
+  const warnings = [];
+  const level = value.level ?? value.severity ?? value.type;
+  const isWarning =
+    typeof level === "string" &&
+    /^warnings?$/iu.test(level.trim());
+  if (warningContext || isWarning) {
+    warnings.push(warningDescription(value));
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (/^warnings?$/iu.test(key)) {
+      warnings.push(
+        ...structuredWarnings(entry, { warningContext: true }),
+      );
+    } else if (
+      ["annotations", "diagnostics", "messages"].includes(key)
+    ) {
+      warnings.push(...structuredWarnings(entry));
+    }
+  }
+  return warnings.filter((warning) => warning.length > 0);
+}
+
+function outputWarnings(output) {
+  const warnings = [];
+  for (const rawLine of output.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line.length === 0) {
+      continue;
+    }
+    if (
+      /\bwarn(?:ing)?s?\b/iu.test(line) ||
+      /^::warning(?:\s|::)/iu.test(line)
+    ) {
+      warnings.push(line);
+    }
+    try {
+      warnings.push(...structuredWarnings(JSON.parse(line)));
+    } catch {
+      // Non-JSON process output is handled by the textual warning matcher.
+    }
+  }
+  return warnings;
+}
+
+function runtimeMetadataFromOutput(output) {
+  for (const line of output.split(/\r?\n/u)) {
+    if (line.startsWith(RUNTIME_METADATA_PREFIX)) {
+      try {
+        return JSON.parse(line.slice(RUNTIME_METADATA_PREFIX.length));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 export async function runQualificationStep(step) {
@@ -851,9 +1136,10 @@ export async function runQualificationStep(step) {
         stdout,
         stderr,
         warnings: uniqueSorted([
-          ...warningLines(stdout),
-          ...warningLines(stderr),
+          ...outputWarnings(stdout),
+          ...outputWarnings(stderr),
         ]),
+        runtimeMetadata: runtimeMetadataFromOutput(stdout),
       });
     });
   });
@@ -863,8 +1149,69 @@ async function verifyAppliedCandidate(workspaceRoot, candidate) {
   const packageJson = await readJson(join(workspaceRoot, PACKAGE_PATH));
   const lockfile = await readJson(join(workspaceRoot, LOCK_PATH));
   const applied = currentPackageCohort(packageJson, lockfile);
-  if (packageVersion(applied.packages) !== packageVersion(candidate.packages)) {
-    throw new Error("Ephemeral package state does not match the candidate cohort");
+  if (packageVersion(applied) !== packageVersion(candidate)) {
+    throw new Error(
+      "Ephemeral package versions, integrities, tarballs, or ranges " +
+        "do not match the observed candidate cohort",
+    );
+  }
+  return {
+    integrities: applied.integrities,
+    packages: applied.packages,
+    tarballs: applied.tarballs,
+  };
+}
+
+function pathInside(parent, child) {
+  const relativePath = relative(resolve(parent), resolve(child));
+  return relativePath !== ".." &&
+    !relativePath.startsWith(`..${sep}`) &&
+    !resolve(child).startsWith(`${resolve(parent)}${sep}..`);
+}
+
+async function verifyRuntimeBrowser({
+  workspaceRoot,
+  candidate,
+  runtimeMetadata,
+}) {
+  const installedMetadataPath = join(
+    workspaceRoot,
+    PACKAGE_DIRECTORY,
+    "node_modules/playwright-core/browsers.json",
+  );
+  const installedMetadata = await readJson(installedMetadataPath);
+  const installedChromium = chromiumRecord(installedMetadata);
+  if (
+    digest(installedMetadata) !== candidate.browserEvidence.digest ||
+    installedChromium.revision !== candidate.browser.revision
+  ) {
+    throw new Error(
+      "Installed playwright-core browser metadata does not match " +
+        "the observed candidate evidence",
+    );
+  }
+  if (
+    runtimeMetadata?.browser !== "chromium" ||
+    runtimeMetadata.revision !== candidate.browser.revision ||
+    typeof runtimeMetadata.executablePath !== "string"
+  ) {
+    throw new Error(
+      "Runtime Chromium revision does not match the observed candidate",
+    );
+  }
+  const browserRoot = join(
+    workspaceRoot,
+    PACKAGE_DIRECTORY,
+    ".playwright-browsers",
+  );
+  if (!pathInside(browserRoot, runtimeMetadata.executablePath)) {
+    throw new Error(
+      "Runtime Chromium executable is outside the ephemeral package boundary",
+    );
+  }
+  const executable = await stat(runtimeMetadata.executablePath);
+  if (!executable.isFile() || executable.size === 0) {
+    throw new Error("Runtime Chromium executable is missing or empty");
   }
 }
 
@@ -875,7 +1222,7 @@ async function filesBelow(root) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
         await visit(path);
-      } else if (entry.isFile()) {
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
         result.push(relative(root, path).split(sep).join("/"));
       }
     }
@@ -905,9 +1252,204 @@ function globExpression(pattern) {
   return new RegExp(`${expression}$`, "u");
 }
 
+function isObject(value) {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value);
+}
+
+function validTimestamp(value) {
+  return typeof value === "string" &&
+    !Number.isNaN(Date.parse(value)) &&
+    /Z$/u.test(value);
+}
+
+async function validateArtifactSemantics(workspaceRoot, path) {
+  const contents = await readFile(join(workspaceRoot, path));
+  if (path.endsWith(".png")) {
+    const pngSignature = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
+    if (
+      contents.length < 24 ||
+      !contents.subarray(0, 8).equals(pngSignature) ||
+      contents.subarray(12, 16).toString("ascii") !== "IHDR"
+    ) {
+      return `${path} is not a structurally identifiable PNG`;
+    }
+  } else if (path.endsWith(".webm") && contents.length === 0) {
+    return `${path} is an empty video artifact`;
+  } else if (path.endsWith(".html")) {
+    const html = contents.toString("utf8");
+    if (!/<html(?:\s|>)/iu.test(html) || !/<\/html>/iu.test(html)) {
+      return `${path} is not a complete HTML document`;
+    }
+  } else if (path.endsWith(".json")) {
+    try {
+      JSON.parse(contents.toString("utf8"));
+    } catch {
+      return `${path} is not valid JSON`;
+    }
+  } else if (path.endsWith(".md") && contents.toString("utf8").trim() === "") {
+    return `${path} is empty Markdown`;
+  }
+  return null;
+}
+
+function validateResultReport(report, capability, candidate, reportPath) {
+  const problems = [];
+  const scenario = report?.scenario;
+  if (
+    !isObject(report) ||
+    report.schemaVersion !== 1 ||
+    report.tool !== "playwright" ||
+    report.capabilityId !== capability.id ||
+    !capability.scenarios.includes(scenario) ||
+    report.status !== "passed"
+  ) {
+    problems.push(
+      `result report ${reportPath} has an invalid identity or status`,
+    );
+    return problems;
+  }
+  if (
+    !isObject(report.assertion) ||
+    report.assertion.status !== "passed" ||
+    report.assertion.expectedStatus !== "passed" ||
+    !Array.isArray(report.assertion.errors) ||
+    report.assertion.errors.length !== 0
+  ) {
+    problems.push(`result report ${reportPath} has invalid assertions`);
+  }
+  if (
+    !isObject(report.timestamps) ||
+    !validTimestamp(report.timestamps.startedAt) ||
+    !validTimestamp(report.timestamps.completedAt) ||
+    !Number.isFinite(report.timestamps.durationMs) ||
+    report.timestamps.durationMs < 0
+  ) {
+    problems.push(`result report ${reportPath} has invalid timestamps`);
+  }
+  if (
+    !isObject(report.environment) ||
+    report.environment.browser?.project !== capability.browser ||
+    typeof report.environment.browser?.version !== "string" ||
+    report.environment.browser.version.length === 0 ||
+    !isObject(report.environment.versions) ||
+    report.environment.versions.playwright !==
+      candidate.packages["@playwright/test"] ||
+    report.environment.versions.axe !==
+      candidate.packages["@axe-core/playwright"] ||
+    typeof report.environment.versions.node !== "string"
+  ) {
+    problems.push(`result report ${reportPath} has invalid runtime metadata`);
+  }
+  const scenarioRoot =
+    `${PACKAGE_DIRECTORY}/test-results/${scenario}`;
+  const expectedArtifacts = {
+    htmlReport: `${scenarioRoot}/html-report/index.html`,
+    nativeJsonReport: `${scenarioRoot}/playwright-report.json`,
+    result: `${scenarioRoot}/result.json`,
+  };
+  if (
+    !isObject(report.artifacts) ||
+    !Object.entries(expectedArtifacts).every(
+      ([key, value]) => report.artifacts[key] === value,
+    ) ||
+    !Array.isArray(report.artifacts.attachments)
+  ) {
+    problems.push(`result report ${reportPath} has invalid artifact paths`);
+  }
+  if (
+    scenario === "web-calculator" &&
+    (
+      report.artifacts?.accessibility !==
+        `${scenarioRoot}/accessibility.json` ||
+      report.artifacts?.accessibilitySummary !==
+        `${scenarioRoot}/accessibility-summary.json` ||
+      report.artifacts?.accessibilitySummaryMarkdown !==
+        `${scenarioRoot}/accessibility-summary.md` ||
+      report.artifacts?.finalScreenshot !== `${scenarioRoot}/final.png`
+    )
+  ) {
+    problems.push(
+      `result report ${reportPath} does not bind accessibility evidence`,
+    );
+  }
+  return problems;
+}
+
+function validateNativeReport(report, path) {
+  if (
+    !isObject(report) ||
+    !isObject(report.config) ||
+    !Array.isArray(report.suites) ||
+    !Array.isArray(report.errors) ||
+    report.errors.length !== 0 ||
+    !isObject(report.stats) ||
+    report.stats.unexpected !== 0
+  ) {
+    return [`native Playwright report ${path} is invalid or unsuccessful`];
+  }
+  return [];
+}
+
+function validFindingCounts(value) {
+  return isObject(value) &&
+    Number.isInteger(value.rules) &&
+    value.rules >= 0 &&
+    Number.isInteger(value.nodes) &&
+    value.nodes >= 0;
+}
+
+function validateAccessibility(raw, summary, markdown) {
+  const problems = [];
+  if (
+    !isObject(raw) ||
+    !isObject(raw.testEngine) ||
+    !isObject(raw.testEnvironment) ||
+    !isObject(raw.testRunner) ||
+    !validTimestamp(raw.timestamp) ||
+    typeof raw.url !== "string" ||
+    !["violations", "incomplete", "passes", "inapplicable"].every(
+      (key) => Array.isArray(raw[key]),
+    ) ||
+    raw.violations.length !== 0
+  ) {
+    problems.push("raw accessibility report is invalid or has violations");
+  }
+  if (
+    !isObject(summary) ||
+    summary.status !== "passed" ||
+    !isObject(summary.policy) ||
+    !isObject(summary.counts) ||
+    !["violations", "incomplete", "passes", "inapplicable"].every(
+      (key) => validFindingCounts(summary.counts[key]),
+    ) ||
+    summary.counts.violations.rules !== 0 ||
+    summary.counts.violations.nodes !== 0 ||
+    !Array.isArray(summary.violations) ||
+    summary.violations.length !== 0 ||
+    !Array.isArray(summary.incomplete)
+  ) {
+    problems.push(
+      "accessibility summary is invalid or reports blocking violations",
+    );
+  }
+  if (
+    typeof markdown !== "string" ||
+    !/Status:\s+\*\*passed\*\*/iu.test(markdown) ||
+    !/Violations:\s+0 rule\(s\)\s+\/\s+0 affected node\(s\)/iu.test(markdown)
+  ) {
+    problems.push("accessibility Markdown summary does not report zero violations");
+  }
+  return problems;
+}
+
 async function defaultInspectCapability({
   workspaceRoot,
   capability,
+  candidate,
 }) {
   const allFiles = await filesBelow(workspaceRoot);
   const problems = [];
@@ -918,12 +1460,28 @@ async function defaultInspectCapability({
     if (matches.length === 0) {
       problems.push(`missing required artifact ${pattern}`);
     }
-    matches.forEach((path) => matchedFiles.add(path));
+    for (const path of matches) {
+      matchedFiles.add(path);
+      const semanticProblem = await validateArtifactSemantics(
+        workspaceRoot,
+        path,
+      );
+      if (semanticProblem !== null) {
+        problems.push(semanticProblem);
+      }
+    }
   }
   if (!allFiles.includes(capability.evidence)) {
     problems.push(`missing primary evidence ${capability.evidence}`);
   } else {
     matchedFiles.add(capability.evidence);
+    const semanticProblem = await validateArtifactSemantics(
+      workspaceRoot,
+      capability.evidence,
+    );
+    if (semanticProblem !== null) {
+      problems.push(semanticProblem);
+    }
   }
 
   const observedScenarios = new Set();
@@ -940,13 +1498,9 @@ async function defaultInspectCapability({
       problems.push(`invalid result report ${reportPath}: ${error.message}`);
       continue;
     }
-    if (
-      report.capabilityId !== capability.id ||
-      report.status !== "passed" ||
-      report.assertion?.status !== "passed"
-    ) {
-      problems.push(`result report ${reportPath} did not pass for ${capability.id}`);
-    }
+    problems.push(
+      ...validateResultReport(report, capability, candidate, reportPath),
+    );
     if (typeof report.scenario === "string") {
       observedScenarios.add(report.scenario);
     }
@@ -960,8 +1514,44 @@ async function defaultInspectCapability({
     }
   }
   for (const scenario of capability.scenarios) {
+    const scenarioRoot =
+      `${PACKAGE_DIRECTORY}/test-results/${scenario}`;
+    const nativePath = `${scenarioRoot}/playwright-report.json`;
+    if (allFiles.includes(nativePath)) {
+      try {
+        problems.push(
+          ...validateNativeReport(
+            await readJson(join(workspaceRoot, nativePath)),
+            nativePath,
+          ),
+        );
+      } catch (error) {
+        problems.push(`invalid native report ${nativePath}: ${error.message}`);
+      }
+    }
+  }
+  for (const scenario of capability.scenarios) {
     if (!observedScenarios.has(scenario)) {
       problems.push(`missing passing result for scenario ${scenario}`);
+    }
+  }
+  if (capability.require_accessibility) {
+    const root = `${PACKAGE_DIRECTORY}/test-results/web-calculator`;
+    try {
+      problems.push(
+        ...validateAccessibility(
+          await readJson(join(workspaceRoot, `${root}/accessibility.json`)),
+          await readJson(
+            join(workspaceRoot, `${root}/accessibility-summary.json`),
+          ),
+          await readFile(
+            join(workspaceRoot, `${root}/accessibility-summary.md`),
+            "utf8",
+          ),
+        ),
+      );
+    } catch (error) {
+      problems.push(`invalid accessibility artifacts: ${error.message}`);
     }
   }
 
@@ -981,11 +1571,179 @@ async function defaultInspectCapability({
 }
 
 function normalizeStepResult(result) {
+  const stdout = typeof result?.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result?.stderr === "string" ? result.stderr : "";
   return {
     exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : 1,
     signal: result?.signal ?? null,
-    warnings: uniqueSorted(result?.warnings ?? []),
+    warnings: uniqueSorted([
+      ...structuredWarnings(result?.warnings, { warningContext: true }),
+      ...structuredWarnings(result?.structuredWarnings, {
+        warningContext: true,
+      }),
+      ...structuredWarnings(result?.annotations),
+      ...outputWarnings(stdout),
+      ...outputWarnings(stderr),
+    ]),
+    runtimeMetadata:
+      result?.runtimeMetadata ?? runtimeMetadataFromOutput(stdout),
   };
+}
+
+async function gitOutput(repositoryRoot, arguments_) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn("git", arguments_, {
+      cwd: repositoryRoot,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", rejectPromise);
+    child.on("close", (exitCode) => {
+      if (exitCode !== 0) {
+        rejectPromise(
+          new Error(
+            Buffer.concat(stderr).toString("utf8").trim() ||
+              `git ${arguments_.join(" ")} exited ${exitCode}`,
+          ),
+        );
+        return;
+      }
+      resolvePromise(Buffer.concat(stdout));
+    });
+  });
+}
+
+function repositoryNameFromRemote(remote) {
+  const match =
+    /^(?:git@github\.com:|https:\/\/github\.com\/)([^/]+\/[^/]+?)(?:\.git)?$/u
+      .exec(remote.trim());
+  return match?.[1] ?? null;
+}
+
+export async function inspectRepositoryState(repositoryRoot) {
+  const [topLevel, revision, status, remote, tracked] = await Promise.all([
+    gitOutput(repositoryRoot, ["rev-parse", "--show-toplevel"]),
+    gitOutput(repositoryRoot, ["rev-parse", "HEAD"]),
+    gitOutput(repositoryRoot, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ]),
+    gitOutput(repositoryRoot, ["remote", "get-url", "origin"]),
+    gitOutput(repositoryRoot, ["ls-files", "-z"]),
+  ]);
+  const trackedPaths = tracked
+    .toString("utf8")
+    .split("\0")
+    .filter((path) => path.length > 0)
+    .sort();
+  const trackedFiles = new Map(
+    await Promise.all(
+      trackedPaths.map(async (path) => [
+        path,
+        digest(await readFile(join(repositoryRoot, path))),
+      ]),
+    ),
+  );
+  return {
+    root: resolve(topLevel.toString("utf8").trim()),
+    revision: revision.toString("utf8").trim(),
+    repositoryName: repositoryNameFromRemote(
+      remote.toString("utf8").trim(),
+    ),
+    clean: status.length === 0,
+    trackedFiles,
+  };
+}
+
+function sourceInspectionFailures(inspection, observation, repositoryRoot) {
+  const failures = [];
+  if (inspection.root !== resolve(repositoryRoot)) {
+    failures.push("SOURCE_ROOT_MISMATCH");
+  }
+  if (inspection.revision !== observation.repository.revision) {
+    failures.push("SOURCE_REVISION_MISMATCH");
+  }
+  if (inspection.repositoryName !== observation.repository.name) {
+    failures.push("SOURCE_REPOSITORY_MISMATCH");
+  }
+  if (!inspection.clean) {
+    failures.push("SOURCE_DIRTY");
+  }
+  if (!(inspection.trackedFiles instanceof Map)) {
+    failures.push("SOURCE_MANIFEST_INVALID");
+  }
+  return failures;
+}
+
+async function verifyWorkspaceRevision(workspaceRoot, trackedFiles) {
+  const actualPaths = await filesBelow(workspaceRoot);
+  const expectedPaths = [...trackedFiles.keys()].sort();
+  if (stableJson(actualPaths) !== stableJson(expectedPaths)) {
+    throw new Error(
+      "Ephemeral workspace contains files outside the repository revision",
+    );
+  }
+  for (const [path, expectedDigest] of trackedFiles) {
+    let contents;
+    try {
+      contents = await readFile(join(workspaceRoot, path));
+    } catch {
+      throw new Error(`Ephemeral workspace is missing tracked file ${path}`);
+    }
+    if (digest(contents) !== expectedDigest) {
+      throw new Error(
+        `Ephemeral workspace does not match the repository revision at ${path}`,
+      );
+    }
+  }
+}
+
+async function snapshotTree(root) {
+  return new Map(
+    await Promise.all(
+      (await filesBelow(root)).map(async (path) => [
+        path,
+        digest(await readFile(join(root, path))),
+      ]),
+    ),
+  );
+}
+
+async function workspaceBoundaryViolations(workspaceRoot, baseline) {
+  const current = await snapshotTree(workspaceRoot);
+  const paths = new Set([...baseline.keys(), ...current.keys()]);
+  return [...paths]
+    .filter((path) => {
+      if (
+        path === PACKAGE_DIRECTORY ||
+        path.startsWith(`${PACKAGE_DIRECTORY}/`)
+      ) {
+        return false;
+      }
+      return baseline.get(path) !== current.get(path);
+    })
+    .sort();
+}
+
+async function sourceManifestChanges(repositoryRoot, trackedFiles) {
+  const changed = [];
+  for (const [path, expectedDigest] of trackedFiles) {
+    try {
+      if (
+        digest(await readFile(join(repositoryRoot, path))) !== expectedDigest
+      ) {
+        changed.push(path);
+      }
+    } catch {
+      changed.push(path);
+    }
+  }
+  return changed.sort();
 }
 
 async function snapshotSource(repositoryRoot) {
@@ -1031,11 +1789,18 @@ function qualificationEvidence({
     revision: repositoryRevision,
     digest: digest({
       artifactDigest,
-      steps: transcript.map(({ id, exitCode, signal, warnings }) => ({
-        id,
-        exitCode,
-        signal,
-        warnings,
+      steps: transcript.map((step) => ({
+        id: step.id,
+        exitCode: step.exitCode,
+        signal: step.signal,
+        warnings: step.warnings,
+        installMetadata: step.installMetadata ?? null,
+        runtimeMetadata: step.runtimeMetadata == null
+          ? null
+          : {
+              browser: step.runtimeMetadata.browser,
+              revision: step.runtimeMetadata.revision,
+            },
       })),
     }),
     started_at: startedAt,
@@ -1086,6 +1851,7 @@ export async function qualifyPlaywrightCandidate({
   generatedAt,
   capabilityPath = join(repositoryRoot, "tests/e2e/capabilities.json"),
   createWorkspace = defaultCreateWorkspace,
+  inspectRepository = inspectRepositoryState,
   runStep = runQualificationStep,
   inspectCapability = defaultInspectCapability,
 }) {
@@ -1115,7 +1881,6 @@ export async function qualifyPlaywrightCandidate({
   }
 
   const candidate = decodedCandidate(observation);
-  const sourceSnapshot = await snapshotSource(repositoryRoot);
   const transcript = [];
   const capabilityFailures = new Map(
     affectedCapabilities.map((id) => [id, []]),
@@ -1127,6 +1892,10 @@ export async function qualifyPlaywrightCandidate({
   const globalFailures = [];
   let workspace = null;
   let plan = null;
+  let sourceInspection = null;
+  let sourceSnapshot = null;
+  let sourceAccepted = false;
+  let workspaceBaseline = null;
 
   async function execute(step) {
     let result;
@@ -1147,25 +1916,79 @@ export async function qualifyPlaywrightCandidate({
     for (const capabilityId of warningTarget) {
       capabilityWarnings.get(capabilityId).push(...result.warnings);
     }
+    if (workspace !== null && workspaceBaseline !== null) {
+      const boundaryChanges = await workspaceBoundaryViolations(
+        workspace.root,
+        workspaceBaseline,
+      );
+      if (boundaryChanges.length > 0) {
+        globalFailures.push("WORKSPACE_BOUNDARY_VIOLATION");
+      }
+    }
     return result;
   }
 
   try {
-    workspace = await createWorkspace(repositoryRoot);
-    plan = createPlaywrightQualificationPlan({
-      observation,
-      workspaceRoot: workspace.root,
-      capabilityCatalog: catalog,
-    });
+    try {
+      sourceInspection = await inspectRepository(repositoryRoot);
+      globalFailures.push(
+        ...sourceInspectionFailures(
+          sourceInspection,
+          observation,
+          repositoryRoot,
+        ),
+      );
+      sourceAccepted = globalFailures.length === 0;
+      if (sourceAccepted) {
+        sourceSnapshot = await snapshotSource(repositoryRoot);
+      }
+    } catch {
+      globalFailures.push("SOURCE_INSPECTION_FAILED");
+    }
 
-    const applyResult = await execute(plan.apply);
-    if (applyResult.exitCode !== 0) {
-      globalFailures.push("APPLICATION_FAILED");
-    } else {
-      try {
-        await verifyAppliedCandidate(workspace.root, candidate);
-      } catch {
+    if (globalFailures.length === 0) {
+      workspace = await createWorkspace(repositoryRoot);
+      if (
+        resolve(workspace.root) === resolve(repositoryRoot) ||
+        pathInside(repositoryRoot, workspace.root) ||
+        pathInside(workspace.root, repositoryRoot)
+      ) {
+        globalFailures.push("WORKSPACE_NOT_EPHEMERAL");
+      } else {
+        try {
+          await verifyWorkspaceRevision(
+            workspace.root,
+            sourceInspection.trackedFiles,
+          );
+          workspaceBaseline = await snapshotTree(workspace.root);
+        } catch {
+          globalFailures.push("WORKSPACE_REVISION_MISMATCH");
+        }
+      }
+    }
+
+    if (globalFailures.length === 0) {
+      plan = createPlaywrightQualificationPlan({
+        observation,
+        workspaceRoot: workspace.root,
+        capabilityCatalog: catalog,
+      });
+
+      const applyResult = await execute(plan.apply);
+      if (applyResult.exitCode !== 0) {
         globalFailures.push("APPLICATION_FAILED");
+      } else if (globalFailures.length === 0) {
+        try {
+          const installMetadata = await verifyAppliedCandidate(
+            workspace.root,
+            candidate,
+          );
+          transcript.find(
+            (step) => step.id === plan.apply.id,
+          ).installMetadata = installMetadata;
+        } catch {
+          globalFailures.push("APPLICATION_FAILED");
+        }
       }
     }
 
@@ -1179,9 +2002,37 @@ export async function qualifyPlaywrightCandidate({
         }
       }
 
-      const packageResult = await execute(plan.package_tests);
-      if (packageResult.exitCode !== 0) {
-        globalFailures.push("PACKAGE_TESTS_FAILED");
+      if (globalFailures.length === 0) {
+        for (const step of plan.runtime_metadata) {
+          if (capabilityFailures.get(step.capability_id).length > 0) {
+            continue;
+          }
+          const result = await execute(step);
+          if (result.exitCode !== 0) {
+            capabilityFailures.get(step.capability_id).push(
+              "RUNTIME_BROWSER_MISMATCH",
+            );
+            continue;
+          }
+          try {
+            await verifyRuntimeBrowser({
+              workspaceRoot: workspace.root,
+              candidate,
+              runtimeMetadata: result.runtimeMetadata,
+            });
+          } catch {
+            capabilityFailures.get(step.capability_id).push(
+              "RUNTIME_BROWSER_MISMATCH",
+            );
+          }
+        }
+      }
+
+      if (globalFailures.length === 0) {
+        const packageResult = await execute(plan.package_tests);
+        if (packageResult.exitCode !== 0) {
+          globalFailures.push("PACKAGE_TESTS_FAILED");
+        }
       }
 
       if (globalFailures.length === 0) {
@@ -1210,6 +2061,7 @@ export async function qualifyPlaywrightCandidate({
           const inspection = await inspectCapability({
             workspaceRoot: workspace.root,
             capability: capabilitiesById.get(capabilityId),
+            candidate,
           });
           artifactResults.set(capabilityId, inspection);
           capabilityWarnings.get(capabilityId).push(
@@ -1226,12 +2078,37 @@ export async function qualifyPlaywrightCandidate({
   } catch {
     globalFailures.push("QUALIFICATION_INFRASTRUCTURE_FAILED");
   } finally {
-    const changedSource = await restoreChangedSource(
-      repositoryRoot,
-      sourceSnapshot,
-    );
+    const changedSource = sourceSnapshot === null
+      ? []
+      : await restoreChangedSource(repositoryRoot, sourceSnapshot);
     if (changedSource.length > 0) {
       globalFailures.push("PACKAGE_STATE_MUTATED");
+    }
+    if (
+      sourceAccepted &&
+      sourceInspection?.trackedFiles instanceof Map
+    ) {
+      const sourceChanges = await sourceManifestChanges(
+        repositoryRoot,
+        sourceInspection.trackedFiles,
+      );
+      if (sourceChanges.length > 0) {
+        globalFailures.push("SOURCE_STATE_MUTATED");
+      }
+      try {
+        const finalInspection = await inspectRepository(repositoryRoot);
+        if (
+          sourceInspectionFailures(
+            finalInspection,
+            observation,
+            repositoryRoot,
+          ).length > 0
+        ) {
+          globalFailures.push("SOURCE_STATE_MUTATED");
+        }
+      } catch {
+        globalFailures.push("SOURCE_STATE_MUTATED");
+      }
     }
     await workspace?.cleanup?.();
   }
@@ -1255,6 +2132,7 @@ export async function qualifyPlaywrightCandidate({
             plan?.apply,
             plan?.package_tests,
             ...(plan?.preparation ?? []),
+            ...(plan?.runtime_metadata ?? []),
             ...(plan?.execution ?? []),
           ].find(({ id } = {}) => id === step.id);
           return plannedStep?.capability_id == null ||
