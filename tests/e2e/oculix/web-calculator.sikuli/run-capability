@@ -86,7 +86,6 @@ else
 fi
 user_data_directory="$session_directory/chromium-profile"
 browser_log="$diagnostics_directory/chromium.log"
-browser_debug_port=9222
 browser_binary=""
 browser_pid=""
 cleanup_failed=0
@@ -121,7 +120,6 @@ host_description="$(
   printf 'runner_arch=%s\n' "${RUNNER_ARCH:-unavailable}"
   printf 'image_os=%s\n' "${ImageOS:-unavailable}"
   printf 'image_version=%s\n' "${ImageVersion:-unavailable}"
-  printf 'browser_debug_port=%s\n' "$browser_debug_port"
 } | tee "$diagnostics_directory/environment.txt"
 
 if [[ -z "$browser_binary" ]]; then
@@ -143,8 +141,6 @@ chromium_arguments=(
   --no-default-browser-check
   --no-first-run
   --ozone-platform=x11
-  --remote-debugging-address=127.0.0.1
-  --remote-debugging-port="$browser_debug_port"
   --user-data-dir="$user_data_directory"
   "--window-position=0,0"
   "--window-size=1280,1024"
@@ -178,28 +174,15 @@ printf 'chromium_sandbox=%s\n' "$chromium_sandbox" |
   >"$browser_log" 2>&1 &
 browser_pid=$!
 
-for _ in {1..100}; do
-  if exec 3<>"/dev/tcp/127.0.0.1/$browser_debug_port"; then
-    exec 3>&-
-    exec 3<&-
-    break
-  fi
+for _ in {1..30}; do
   if ! kill -0 "$browser_pid" 2>/dev/null; then
     record_diagnostic \
       "browser-launch-error.txt" \
-      "Chromium exited before its DevTools endpoint became ready."
+      "Chromium exited during its launch stabilization window."
     fail "Chromium exited during launch; see diagnostics."
   fi
   sleep 0.1
 done
-if ! exec 3<>"/dev/tcp/127.0.0.1/$browser_debug_port"; then
-  record_diagnostic \
-    "browser-launch-error.txt" \
-    "Chromium did not become ready within 10 seconds."
-  fail "Chromium timed out during launch; see diagnostics."
-fi
-exec 3>&-
-exec 3<&-
 
 export E2E_OS="$selected_os"
 export E2E_BROWSER="$selected_browser"
