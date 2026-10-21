@@ -1695,14 +1695,107 @@ const CLUSTER_CHILD_IDS = new Set([
   "ec",
 ]);
 
+function ebmlLaceVint(contents, offset, limit) {
+  if (offset >= limit) {
+    return null;
+  }
+  const first = contents[offset];
+  let width = 1;
+  let marker = 0x80;
+  while (width <= 8 && (first & marker) === 0) {
+    width += 1;
+    marker >>= 1;
+  }
+  if (width > 8 || offset + width > limit) {
+    return null;
+  }
+  let value = BigInt(first & (marker - 1));
+  for (let index = 1; index < width; index += 1) {
+    value = (value << 8n) | BigInt(contents[offset + index]);
+  }
+  return { value, width };
+}
+
 function validSimpleBlock(contents, element) {
   const track = ebmlVint(contents, element.dataStart);
-  return (
-    track !== null &&
-    track.value !== null &&
-    track.value > 0n &&
-    element.end - element.dataStart >= track.width + 4
-  );
+  if (
+    track === null ||
+    track.value === null ||
+    track.value <= 0n ||
+    element.dataStart + track.width + 3 >= element.end
+  ) {
+    return false;
+  }
+
+  const flagsOffset = element.dataStart + track.width + 2;
+  const flags = contents[flagsOffset];
+  if ((flags & 0x70) !== 0) {
+    return false;
+  }
+
+  const lacing = (flags & 0x06) >> 1;
+  let offset = flagsOffset + 1;
+  if (lacing === 0) {
+    return offset < element.end;
+  }
+  if (offset >= element.end) {
+    return false;
+  }
+
+  const frameCount = contents[offset] + 1;
+  offset += 1;
+  if (frameCount < 2) {
+    return false;
+  }
+
+  if (lacing === 2) {
+    const frameBytes = element.end - offset;
+    return frameBytes >= frameCount && frameBytes % frameCount === 0;
+  }
+
+  let knownFrameBytes = 0n;
+  if (lacing === 1) {
+    for (let frame = 0; frame < frameCount - 1; frame += 1) {
+      let frameSize = 0;
+      let sizeByte = 0xff;
+      while (sizeByte === 0xff) {
+        if (offset >= element.end) {
+          return false;
+        }
+        sizeByte = contents[offset];
+        offset += 1;
+        frameSize += sizeByte;
+      }
+      if (frameSize === 0) {
+        return false;
+      }
+      knownFrameBytes += BigInt(frameSize);
+    }
+  } else {
+    const firstSize = ebmlLaceVint(contents, offset, element.end);
+    if (firstSize === null || firstSize.value === 0n) {
+      return false;
+    }
+    offset += firstSize.width;
+    let previousSize = firstSize.value;
+    knownFrameBytes = previousSize;
+    for (let frame = 1; frame < frameCount - 1; frame += 1) {
+      const encodedDelta = ebmlLaceVint(contents, offset, element.end);
+      if (encodedDelta === null) {
+        return false;
+      }
+      offset += encodedDelta.width;
+      const bias =
+        (1n << BigInt(encodedDelta.width * 7 - 1)) - 1n;
+      previousSize += encodedDelta.value - bias;
+      if (previousSize <= 0n) {
+        return false;
+      }
+      knownFrameBytes += previousSize;
+    }
+  }
+
+  return knownFrameBytes < BigInt(element.end - offset);
 }
 
 function validateClusterChildren(
