@@ -198,6 +198,24 @@ function validationState(observation, validation, contractOptions) {
 
 const NODE_MAJOR_RELATION =
   "node-runtime major must equal node-release-channel";
+const PLAYWRIGHT_PACKAGE_NAMES = [
+  "@axe-core/playwright",
+  "@playwright/test",
+  "playwright",
+  "playwright-core",
+];
+const PLAYWRIGHT_LOCKSTEP_NAMES = [
+  "@playwright/test",
+  "playwright",
+  "playwright-core",
+];
+const PLAYWRIGHT_PACKAGE_IDENTITY_KEYS = [
+  "axePeerRange",
+  "integrities",
+  "nodeRanges",
+  "packages",
+  "tarballs",
+];
 const VERSION_PART = "(?:0|[1-9][0-9]*)";
 const FULL_VERSION_PATTERN = new RegExp(
   `^(${VERSION_PART})\\.(${VERSION_PART})\\.(${VERSION_PART})$`,
@@ -433,6 +451,93 @@ function hasExactMapKeys(value, expected) {
   );
 }
 
+function isNonemptyTrimmedString(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.trim() === value
+  );
+}
+
+function hasStrictVersionValues(value) {
+  try {
+    for (const version of Object.values(value)) {
+      parseVersion(version);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasSupportedRangeValues(value) {
+  return Object.values(value).every(
+    (range) =>
+      isNonemptyTrimmedString(range) &&
+      evaluateVersionRange("0.0.0", range).supported,
+  );
+}
+
+function parsePlaywrightPackageIdentity(value) {
+  const identity = parseVersionObject(value);
+  if (
+    identity === null ||
+    !hasExactObjectKeys(identity, PLAYWRIGHT_PACKAGE_IDENTITY_KEYS) ||
+    !isNonemptyTrimmedString(identity.axePeerRange) ||
+    !evaluateVersionRange("0.0.0", identity.axePeerRange).supported
+  ) {
+    return null;
+  }
+  for (const key of ["integrities", "nodeRanges", "packages", "tarballs"]) {
+    if (
+      identity[key] === null ||
+      typeof identity[key] !== "object" ||
+      Array.isArray(identity[key]) ||
+      !hasExactObjectKeys(identity[key], PLAYWRIGHT_PACKAGE_NAMES)
+    ) {
+      return null;
+    }
+  }
+  if (
+    !Object.values(identity.integrities).every(isNonemptyTrimmedString) ||
+    !Object.values(identity.tarballs).every(isNonemptyTrimmedString) ||
+    !hasSupportedRangeValues(identity.nodeRanges) ||
+    !Object.values(identity.packages).every(isNonemptyTrimmedString) ||
+    !hasStrictVersionValues(identity.packages)
+  ) {
+    return null;
+  }
+  return identity;
+}
+
+function parsePlaywrightBrowserIdentity(value) {
+  const identity = parseVersionObject(value);
+  if (
+    identity === null ||
+    !hasExactObjectKeys(identity, ["name", "revision"]) ||
+    !isNonemptyTrimmedString(identity.name) ||
+    !isNonemptyTrimmedString(identity.revision) ||
+    identity.name === "unknown" ||
+    identity.revision === "unknown"
+  ) {
+    return null;
+  }
+  return identity;
+}
+
+function parsePlaywrightLockstepConstraint(value) {
+  if (
+    value === undefined ||
+    !hasExactObjectKeys(value, PLAYWRIGHT_LOCKSTEP_NAMES) ||
+    !Object.values(value).every(isNonemptyTrimmedString) ||
+    !hasStrictVersionValues(value) ||
+    new Set(Object.values(value)).size !== 1
+  ) {
+    return null;
+  }
+  return value;
+}
+
 function evaluateRanges(version, ranges) {
   for (const range of ranges) {
     const result = evaluateVersionRange(version, range);
@@ -523,14 +628,28 @@ function evaluateRequires(constraint, from, to) {
 
   const json = parseJsonObject(constraint);
   if (json !== null) {
+    const source = parsePlaywrightPackageIdentity(from.selection.version);
     if (
       json === undefined ||
-      Object.keys(json).length === 0 ||
-      Object.values(json).some((value) => typeof value !== "string")
+      source === null ||
+      !hasExactObjectKeys(json, PLAYWRIGHT_PACKAGE_NAMES) ||
+      !Object.values(json).every(isNonemptyTrimmedString) ||
+      !hasSupportedRangeValues(json)
     ) {
       return unsupported();
     }
-    return evaluateRanges(to.selection.version, Object.values(json));
+    if (
+      from.selection.state === "candidate" &&
+      PLAYWRIGHT_PACKAGE_NAMES.some(
+        (name) => source.nodeRanges[name] !== json[name],
+      )
+    ) {
+      return supported(false);
+    }
+    return evaluateRanges(
+      to.selection.version,
+      Object.values(source.nodeRanges),
+    );
   }
 
   const entries = parseKeyValueConstraint(constraint);
@@ -578,23 +697,20 @@ function evaluateMustMatch(constraint, from, to) {
   }
   const json = parseJsonObject(constraint);
   if (json !== null) {
-    const source = parseVersionObject(from.selection.version);
+    const source = parsePlaywrightPackageIdentity(from.selection.version);
+    const target = parsePlaywrightBrowserIdentity(to.selection.version);
+    const lockstep = parsePlaywrightLockstepConstraint(json);
     if (
-      json === undefined ||
       source === null ||
-      !hasExactObjectKeys(json, [
-        "@playwright/test",
-        "playwright",
-        "playwright-core",
-      ]) ||
-      Object.values(json).some((value) => typeof value !== "string")
+      target === null ||
+      lockstep === null
     ) {
       return unsupported();
     }
-    const values = Object.values(json);
     return supported(
-      new Set(values).size === 1 &&
-      Object.entries(json).every(([key, value]) => source[key] === value),
+      PLAYWRIGHT_LOCKSTEP_NAMES.every(
+        (name) => source.packages[name] === lockstep[name],
+      ),
     );
   }
 
@@ -625,7 +741,16 @@ function evaluateMustMatch(constraint, from, to) {
     );
   }
 
-  return evaluateVersionRange(to.selection.version, constraint);
+  const source = evaluateVersionRange(from.selection.version, constraint);
+  const target = evaluateVersionRange(to.selection.version, constraint);
+  if (!source.supported || !target.supported) {
+    return unsupported();
+  }
+  return supported(
+    source.satisfied &&
+    target.satisfied &&
+    from.selection.version === to.selection.version,
+  );
 }
 
 function splitPackageReference(value) {
@@ -648,8 +773,8 @@ function evaluateBundles(constraint, from, to) {
   }
   const json = parseJsonObject(constraint);
   if (json !== null) {
-    const source = parseVersionObject(from.selection.version);
-    const target = parseVersionObject(to.selection.version);
+    const source = parsePlaywrightPackageIdentity(from.selection.version);
+    const target = parsePlaywrightBrowserIdentity(to.selection.version);
     const packageReference =
       typeof json?.package === "string"
         ? splitPackageReference(json.package)
@@ -663,15 +788,22 @@ function evaluateBundles(constraint, from, to) {
         "package",
         "revision",
       ]) ||
-      !hasExactObjectKeys(target, ["name", "revision"]) ||
       packageReference === null ||
-      typeof json.browser !== "string" ||
-      typeof json.revision !== "string"
+      packageReference.name !== "playwright-core" ||
+      !isNonemptyTrimmedString(json.browser) ||
+      !isNonemptyTrimmedString(json.package) ||
+      !isNonemptyTrimmedString(json.revision) ||
+      json.browser === "unknown" ||
+      json.revision === "unknown" ||
+      !hasStrictVersionValues({
+        package: packageReference.version,
+      })
     ) {
       return unsupported();
     }
     return supported(
-      source[packageReference.name] === packageReference.version &&
+      source.packages[packageReference.name] ===
+        packageReference.version &&
       target.name === json.browser &&
       target.revision === json.revision,
     );
@@ -722,7 +854,8 @@ function evaluatePolicyAlign(constraint, from, to) {
   }
   const json = parseJsonObject(constraint);
   if (json !== null) {
-    const source = parseVersionObject(from.selection.version);
+    const source = parsePlaywrightPackageIdentity(from.selection.version);
+    const target = parsePlaywrightBrowserIdentity(to.selection.version);
     const packageReference =
       typeof json?.package === "string"
         ? splitPackageReference(json.package)
@@ -734,19 +867,28 @@ function evaluatePolicyAlign(constraint, from, to) {
     if (
       json === undefined ||
       source === null ||
+      target === null ||
+      !hasExactObjectKeys(json, ["package", "peer"]) ||
       packageReference === null ||
-      peerReference === null
+      peerReference === null ||
+      packageReference.name !== "@axe-core/playwright" ||
+      peerReference.name !== "playwright-core" ||
+      !isNonemptyTrimmedString(json.package) ||
+      !isNonemptyTrimmedString(json.peer) ||
+      !hasStrictVersionValues({
+        package: packageReference.version,
+      })
     ) {
       return unsupported();
     }
     if (
-      source[packageReference.name] !== packageReference.version ||
-      typeof source[peerReference.name] !== "string"
+      source.packages[packageReference.name] !==
+        packageReference.version
     ) {
       return supported(false);
     }
     return evaluateVersionRange(
-      source[peerReference.name],
+      source.packages[peerReference.name],
       peerReference.version,
     );
   }

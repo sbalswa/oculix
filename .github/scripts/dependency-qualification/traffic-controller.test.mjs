@@ -32,6 +32,12 @@ const EVIDENCE_DIGEST =
   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 const capabilityCatalog = await readCapabilityCatalog(CAPABILITY_PATH);
+const playwright85Observation = JSON.parse(
+  await readFile(
+    new URL("playwright-85.observation.json", FIXTURE_ROOT),
+    "utf8",
+  ),
+);
 const contractOptions = {
   capabilityCatalogDigest: capabilityCatalog.digest,
   capabilityIds: capabilityCatalog.ids,
@@ -561,7 +567,7 @@ test("Selenium state-scoped Node ranges produce a coupled assignment", () => {
   );
 });
 
-test("Playwright canonical JSON relations evaluate deterministically", () => {
+test("actual #85 Playwright collector output evaluates deterministically", () => {
   const node = observation({
     capabilities: ["playwright-ubuntu-chromium"],
     candidateVersion: null,
@@ -569,88 +575,7 @@ test("Playwright canonical JSON relations evaluate deterministically", () => {
     id: "node",
   });
   node.components[0].id = "node-runtime";
-
-  const currentPackages = JSON.stringify({
-    "@axe-core/playwright": "4.14.0",
-    "@playwright/test": "1.64.0",
-    playwright: "1.64.0",
-    "playwright-core": "1.64.0",
-  });
-  const candidatePackages = JSON.stringify({
-    "@axe-core/playwright": "4.15.0",
-    "@playwright/test": "1.65.0",
-    playwright: "1.65.0",
-    "playwright-core": "1.65.0",
-  });
-  const playwright = observation({
-    capabilities: ["playwright-ubuntu-chromium"],
-    candidateVersion: candidatePackages,
-    currentVersion: currentPackages,
-    id: "playwright",
-  });
-  playwright.components[0].id = "playwright-packages";
-  addComponent(playwright, {
-    candidateVersion: JSON.stringify({
-      name: "chromium",
-      revision: "1200",
-    }),
-    currentVersion: JSON.stringify({
-      name: "chromium",
-      revision: "1194",
-    }),
-    ecosystem: "playwright",
-    id: "playwright-browser",
-  });
-  playwright.relations = [
-    {
-      id: "playwright-lockstep",
-      type: "must-match",
-      from: "playwright-packages",
-      to: "playwright-browser",
-      hard: true,
-      constraint: JSON.stringify({
-        "@playwright/test": "1.65.0",
-        playwright: "1.65.0",
-        "playwright-core": "1.65.0",
-      }),
-    },
-    {
-      id: "playwright-node-ranges",
-      type: "requires",
-      from: "playwright-packages",
-      to: "node-runtime",
-      hard: true,
-      constraint: JSON.stringify({
-        "@axe-core/playwright": ">=22.12.0",
-        "@playwright/test": ">=20",
-        playwright: ">=20",
-        "playwright-core": ">=20",
-      }),
-    },
-    {
-      id: "playwright-bundled-chromium",
-      type: "bundles",
-      from: "playwright-packages",
-      to: "playwright-browser",
-      hard: true,
-      constraint: JSON.stringify({
-        package: "playwright-core@1.65.0",
-        browser: "chromium",
-        revision: "1200",
-      }),
-    },
-    {
-      id: "playwright-axe-alignment",
-      type: "policy-align",
-      from: "playwright-packages",
-      to: "playwright-browser",
-      hard: false,
-      constraint: JSON.stringify({
-        package: "@axe-core/playwright@4.15.0",
-        peer: "playwright-core@^1.65.0",
-      }),
-    },
-  ];
+  const playwright = structuredClone(playwright85Observation);
 
   const plan = solve([playwright, node], [validation(playwright)]);
 
@@ -659,6 +584,228 @@ test("Playwright canonical JSON relations evaluate deterministically", () => {
     reason_codes: ["INDEPENDENTLY_COMPATIBLE"],
   });
   assert.deepEqual(plan.minimal_blockers, []);
+});
+
+test("Playwright relations reject malformed collector identities and bundle fields", () => {
+  const cases = [
+    {
+      id: "flat-package-identity",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const packages = JSON.parse(
+          source.components[0].candidate.version,
+        ).packages;
+        source.components[0].candidate.version = JSON.stringify(packages);
+      },
+    },
+    {
+      id: "missing-package-identity-member",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[0].candidate.version,
+        );
+        delete identity.tarballs;
+        source.components[0].candidate.version = JSON.stringify(identity);
+      },
+    },
+    {
+      id: "unknown-package-identity-member",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[0].candidate.version,
+        );
+        identity.unexpected = {};
+        source.components[0].candidate.version = JSON.stringify(identity);
+      },
+    },
+    {
+      id: "missing-nested-package",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[0].candidate.version,
+        );
+        delete identity.packages.playwright;
+        source.components[0].candidate.version = JSON.stringify(identity);
+      },
+    },
+    {
+      id: "unknown-nested-package",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[0].candidate.version,
+        );
+        identity.packages.unexpected = "1.65.0";
+        source.components[0].candidate.version = JSON.stringify(identity);
+      },
+    },
+    {
+      id: "invalid-nested-package-version",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[0].candidate.version,
+        );
+        identity.packages.playwright = "1.65";
+        source.components[0].candidate.version = JSON.stringify(identity);
+      },
+    },
+    {
+      id: "invalid-lockstep-constraint-version",
+      relationId: "playwright-lockstep",
+      mutate(source) {
+        const constraint = JSON.parse(source.relations[0].constraint);
+        constraint.playwright = "1.65";
+        source.relations[0].constraint = JSON.stringify(constraint);
+      },
+    },
+    {
+      id: "flat-browser-identity",
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        source.components[1].candidate.version = "chromium@1200";
+      },
+    },
+    {
+      id: "missing-browser-identity-member",
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        source.components[1].candidate.version =
+          JSON.stringify({ name: "chromium" });
+      },
+    },
+    {
+      id: "unknown-browser-identity-member",
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        source.components[1].candidate.version = JSON.stringify({
+          name: "chromium",
+          revision: "1200",
+          unexpected: "accepted-before-audit",
+        });
+      },
+    },
+    {
+      id: "invalid-bundle-package-version",
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        const constraint = JSON.parse(source.relations[0].constraint);
+        constraint.package = "playwright-core@1.65";
+        source.relations[0].constraint = JSON.stringify(constraint);
+      },
+    },
+    ...["browser", "package", "revision"].map((field) => ({
+      id: `empty-bundle-${field}`,
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        const constraint = JSON.parse(source.relations[0].constraint);
+        constraint[field] = "";
+        source.relations[0].constraint = JSON.stringify(constraint);
+      },
+    })),
+    ...["name", "revision"].map((field) => ({
+      id: `empty-browser-${field}`,
+      relationId: "playwright-bundled-chromium",
+      mutate(source) {
+        const identity = JSON.parse(
+          source.components[1].candidate.version,
+        );
+        identity[field] = "";
+        source.components[1].candidate.version = JSON.stringify(identity);
+      },
+    })),
+  ];
+
+  for (const scenario of cases) {
+    const playwright = structuredClone(playwright85Observation);
+    playwright.relations = [
+      playwright.relations.find(
+        ({ id }) => id === scenario.relationId,
+      ),
+    ];
+    scenario.mutate(playwright);
+
+    const plan = solve([playwright], [validation(playwright)]);
+
+    assert.equal(plan.disposition.state, "incompatible", scenario.id);
+    assert.deepEqual(
+      plan.minimal_blockers,
+      [scenario.relationId],
+      scenario.id,
+    );
+  }
+});
+
+test("semver must-match compares both endpoint identities", () => {
+  for (const {
+    expectedState,
+    fromVersion,
+    id,
+    toVersion,
+  } of [
+    {
+      expectedState: "cohort-planned",
+      fromVersion: "141.0.7390",
+      id: "matching",
+      toVersion: "141.0.7390",
+    },
+    {
+      expectedState: "incompatible",
+      fromVersion: "141.0.7391",
+      id: "mismatched-source",
+      toVersion: "141.0.7390",
+    },
+    {
+      expectedState: "incompatible",
+      fromVersion: "141.0",
+      id: "invalid-source",
+      toVersion: "141.0.7390",
+    },
+    {
+      expectedState: "incompatible",
+      fromVersion: "141.0.7390",
+      id: "invalid-target",
+      toVersion: "141.0",
+    },
+  ]) {
+    const selenium = observation({
+      capabilities: ["selenium-ubuntu-chromium"],
+      candidateVersion: fromVersion,
+      currentVersion: fromVersion,
+      id: "selenium",
+    });
+    selenium.components[0].id = "selenium-runner-browser";
+    addComponent(selenium, {
+      candidateVersion: toVersion,
+      currentVersion: toVersion,
+      ecosystem: "runner",
+      id: "selenium-runner-driver",
+    });
+    selenium.relations = [
+      {
+        id: "selenium-runner-browser-driver",
+        type: "must-match",
+        from: "selenium-runner-browser",
+        to: "selenium-runner-driver",
+        hard: true,
+        constraint: "=141.0.7390",
+      },
+    ];
+
+    const plan = solve([selenium], [validation(selenium)]);
+
+    assert.equal(plan.disposition.state, expectedState, id);
+    assert.deepEqual(
+      plan.minimal_blockers,
+      expectedState === "incompatible"
+        ? ["selenium-runner-browser-driver"]
+        : [],
+      id,
+    );
+  }
 });
 
 test("structured must-match and bundle schemas reject missing or unknown members", () => {
