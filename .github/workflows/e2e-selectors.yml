@@ -36,6 +36,8 @@ permissions:
   contents: read
 
 concurrency:
+  # Unrelated label events get a one-off group so they cannot cancel selected
+  # work. Relevant PR events retain the PR group so removal/closure can.
   group: >-
     e2e-selectors-${{
       (
