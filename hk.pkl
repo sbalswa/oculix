@@ -23,6 +23,15 @@ steps {
   ["zizmor"] = (Builtins.zizmor) {
     check = "zizmor --persona=auditor --strict-collection --no-progress {{files}}"
   }
+  ["toolchain-maintenance-tests"] {
+    glob = List(
+      ".github/scripts/toolchain-maintenance",
+      "tests/toolchain-maintenance/*.bash",
+      "tests/toolchain-maintenance/*.bats",
+      "tests/toolchain-maintenance/fixtures/*",
+    )
+    check = "mise run test:toolchain-maintenance"
+  }
 
   ["byte_order_marker"] = Builtins.byte_order_marker
   ["betterleaks"] = Builtins.betterleaks

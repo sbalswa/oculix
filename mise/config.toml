@@ -4,6 +4,7 @@ min_version = "2026.10.9"
 lockfile = true
 
 [tools]
+bats = { version = "1.14.0", os = ["linux", "macos"] }
 betterleaks = "1.9.0"
 hk = "2.6.0"
 jactionlint = "2.1.0"
@@ -17,3 +18,8 @@ run = "hk install --mise"
 [tasks.ci]
 description = "Run the checks required by CI"
 run = "hk check --all"
+
+[tasks."test:toolchain-maintenance"]
+description = "Run the mocked toolchain-maintenance Bats suite"
+run = "bats tests/toolchain-maintenance"
+run_windows = "echo Toolchain-maintenance Bats tests run on Unix hosts."
