@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   cp,
   mkdir,
@@ -8,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -103,19 +104,109 @@ async function candidateWorkspace(sourceRoot) {
   );
   const root = join(temporaryRoot, "repository");
   await cp(sourceRoot, root, { recursive: true });
-  await cp(
-    new URL("candidate-package.json", FIXTURE_ROOT),
-    join(root, "tests/e2e/playwright/package.json"),
-  );
-  await cp(
-    new URL("candidate-package-lock.json", FIXTURE_ROOT),
-    join(root, "tests/e2e/playwright/package-lock.json"),
-  );
   return {
     root,
     async cleanup() {
       await rm(temporaryRoot, { force: true, recursive: true });
     },
+  };
+}
+
+function testDigest(contents) {
+  return `sha256:${createHash("sha256").update(contents).digest("hex")}`;
+}
+
+async function testRepositoryInspection(repository, overrides = {}) {
+  const trackedPaths = [
+    "tests/e2e/capabilities.json",
+    "tests/e2e/playwright/package-lock.json",
+    "tests/e2e/playwright/package.json",
+  ];
+  return {
+    root: resolve(repository.root),
+    revision: REVISION,
+    repositoryName: "sbalswa/oculix",
+    clean: true,
+    trackedFiles: new Map(
+      await Promise.all(
+        trackedPaths.map(async (path) => [
+          path,
+          testDigest(await readFile(join(repository.root, path))),
+        ]),
+      ),
+    ),
+    ...overrides,
+  };
+}
+
+function qualificationOptions(repository, overrides = {}) {
+  return {
+    repositoryRoot: repository.root,
+    generatedAt: GENERATED_AT,
+    createWorkspace: candidateWorkspace,
+    inspectRepository: () => testRepositoryInspection(repository),
+    ...overrides,
+  };
+}
+
+async function applyCandidate(step) {
+  if (step.phase !== "apply") {
+    return;
+  }
+  await cp(
+    new URL("candidate-package.json", FIXTURE_ROOT),
+    join(step.cwd, "package.json"),
+  );
+  await cp(
+    new URL("candidate-package-lock.json", FIXTURE_ROOT),
+    join(step.cwd, "package-lock.json"),
+  );
+}
+
+async function prepareRuntime(step, { revision = "1200" } = {}) {
+  if (step.phase !== "prepare") {
+    return;
+  }
+  const browserMetadata = await fixture("browser-metadata.json");
+  const metadataRoot = join(step.cwd, "node_modules/playwright-core");
+  const executable = join(
+    step.cwd,
+    `.playwright-browsers/chromium-${revision}/chrome`,
+  );
+  await mkdir(metadataRoot, { recursive: true });
+  await mkdir(join(executable, ".."), { recursive: true });
+  await writeFile(
+    join(metadataRoot, "browsers.json"),
+    `${JSON.stringify(browserMetadata["1.65.0"])}\n`,
+  );
+  await writeFile(executable, "browser\n");
+}
+
+function runtimeResult(step, { revision = "1200" } = {}) {
+  if (step.phase !== "runtime-metadata") {
+    return {};
+  }
+  const executablePath = join(
+    step.cwd,
+    `.playwright-browsers/chromium-${revision}/chrome`,
+  );
+  return {
+    stdout:
+      `OCULIX_PLAYWRIGHT_RUNTIME=${JSON.stringify({
+        browser: "chromium",
+        executablePath,
+        revision,
+      })}\n`,
+  };
+}
+
+async function passingStep(step, options = {}) {
+  await applyCandidate(step);
+  await prepareRuntime(step, options);
+  return {
+    exitCode: 0,
+    warnings: [],
+    ...runtimeResult(step, options),
   };
 }
 
@@ -145,21 +236,81 @@ async function packageState(repository) {
   );
 }
 
+async function qualifyWithArtifacts(repository, mutateArtifacts) {
+  const observation = await collect(repository);
+  return qualifyPlaywrightCandidate({
+    observation,
+    ...qualificationOptions(repository),
+    async runStep(step) {
+      const result = await passingStep(step);
+      if (step.scenario === "web-calculator") {
+        await writePassingArtifacts(step.cwd);
+        await mutateArtifacts?.(step.cwd);
+      }
+      return result;
+    },
+  });
+}
+
 async function writePassingArtifacts(packageRoot) {
   for (const scenario of ["smoke", "web-calculator"]) {
     const resultRoot = join(packageRoot, "test-results", scenario);
     await mkdir(join(resultRoot, "html-report"), { recursive: true });
     await mkdir(join(resultRoot, "artifacts"), { recursive: true });
-    await writeFile(join(resultRoot, "html-report/index.html"), "<html></html>\n");
-    await writeFile(join(resultRoot, "playwright-report.json"), "{}\n");
+    await writeFile(
+      join(resultRoot, "html-report/index.html"),
+      "<!doctype html><html><body>passed</body></html>\n",
+    );
+    await writeFile(
+      join(resultRoot, "playwright-report.json"),
+      `${JSON.stringify({
+        config: {},
+        suites: [],
+        errors: [],
+        stats: {
+          expected: 1,
+          skipped: 0,
+          unexpected: 0,
+          flaky: 0,
+        },
+      })}\n`,
+    );
     await writeFile(join(resultRoot, "artifacts/video.webm"), "video\n");
+    const scenarioRoot =
+      `tests/e2e/playwright/test-results/${scenario}`;
     await writeFile(
       join(resultRoot, "result.json"),
       `${JSON.stringify({
+        schemaVersion: 1,
         capabilityId: "playwright-ubuntu-chromium",
+        tool: "playwright",
         scenario,
         status: "passed",
-        assertion: { status: "passed" },
+        timestamps: {
+          startedAt: "2026-10-21T17:00:00.000Z",
+          completedAt: "2026-10-21T17:00:01.000Z",
+          durationMs: 1000,
+        },
+        environment: {
+          arch: "x64",
+          browser: {
+            name: "chromium",
+            project: "chromium",
+            version: "142.0.7400.0",
+          },
+          operatingSystem: "ubuntu",
+          platform: "linux",
+          versions: {
+            axe: "4.15.0",
+            node: "v24.22.0",
+            playwright: "1.65.0",
+          },
+        },
+        assertion: {
+          errors: [],
+          expectedStatus: "passed",
+          status: "passed",
+        },
         accessibility:
           scenario === "web-calculator"
             ? {
@@ -167,6 +318,23 @@ async function writePassingArtifacts(packageRoot) {
                 counts: { violations: { rules: 0, nodes: 0 } },
               }
             : { status: "not-run", counts: null },
+        artifacts: {
+          htmlReport: `${scenarioRoot}/html-report/index.html`,
+          nativeJsonReport: `${scenarioRoot}/playwright-report.json`,
+          result: `${scenarioRoot}/result.json`,
+          attachments: [],
+          ...(scenario === "web-calculator"
+            ? {
+                accessibility:
+                  `${scenarioRoot}/accessibility.json`,
+                accessibilitySummary:
+                  `${scenarioRoot}/accessibility-summary.json`,
+                accessibilitySummaryMarkdown:
+                  `${scenarioRoot}/accessibility-summary.md`,
+                finalScreenshot: `${scenarioRoot}/final.png`,
+              }
+            : {}),
+        },
       })}\n`,
     );
   }
@@ -174,16 +342,54 @@ async function writePassingArtifacts(packageRoot) {
     packageRoot,
     "test-results/web-calculator",
   );
-  await writeFile(join(calculatorRoot, "accessibility.json"), "{}\n");
+  await writeFile(
+    join(calculatorRoot, "accessibility.json"),
+    `${JSON.stringify({
+      incomplete: [],
+      inapplicable: [],
+      passes: [],
+      testEngine: { name: "axe-core", version: "4.15.0" },
+      testEnvironment: { orientationAngle: 0 },
+      testRunner: { name: "axe" },
+      timestamp: "2026-10-21T17:00:00.000Z",
+      url: "http://127.0.0.1/",
+      violations: [],
+    })}\n`,
+  );
   await writeFile(
     join(calculatorRoot, "accessibility-summary.json"),
-    '{"status":"passed","counts":{"violations":{"rules":0,"nodes":0}}}\n',
+    `${JSON.stringify({
+      status: "passed",
+      policy: {
+        automatedStandard: "WCAG 2.0, 2.1, and 2.2 Level A/AA",
+        blocking: "any-violation",
+        incomplete: "retained-nonblocking",
+        tags: ["wcag2a"],
+      },
+      counts: {
+        incomplete: { rules: 0, nodes: 0 },
+        inapplicable: { rules: 0, nodes: 0 },
+        passes: { rules: 0, nodes: 0 },
+        violations: { rules: 0, nodes: 0 },
+      },
+      incomplete: [],
+      violations: [],
+    })}\n`,
   );
   await writeFile(
     join(calculatorRoot, "accessibility-summary.md"),
-    "# Accessibility\n\nPassed.\n",
+    "# Accessibility\n\n- Status: **passed**\n" +
+      "- Violations: 0 rule(s) / 0 affected node(s) (blocking)\n",
   );
-  await writeFile(join(calculatorRoot, "final.png"), "png\n");
+  await writeFile(
+    join(calculatorRoot, "final.png"),
+    Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]),
+      Buffer.from("IHDR"),
+      Buffer.alloc(13),
+    ]),
+  );
 }
 
 test("collection is deterministic and records the complete candidate cohort", async () => {
@@ -212,13 +418,25 @@ test("collection is deterministic and records the complete candidate cohort", as
       ],
     );
 
-    const packages = JSON.parse(first.components[0].candidate.version);
-    assert.deepEqual(packages, {
+    const packageManifest = JSON.parse(
+      first.components[0].candidate.version,
+    );
+    assert.deepEqual(packageManifest.packages, {
       "@axe-core/playwright": "4.15.0",
       "@playwright/test": "1.65.0",
       playwright: "1.65.0",
       "playwright-core": "1.65.0",
     });
+    assert.deepEqual(packageManifest.integrities, {
+      "@axe-core/playwright": "sha512-Y2FuZGlkYXRlLWF4ZQ==",
+      "@playwright/test": "sha512-Y2FuZGlkYXRlLXRlc3Q=",
+      playwright: "sha512-Y2FuZGlkYXRlLXBsYXl3cmlnaHQ=",
+      "playwright-core": "sha512-Y2FuZGlkYXRlLWNvcmU=",
+    });
+    assert.equal(
+      packageManifest.tarballs["playwright-core"],
+      "https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.0.tgz",
+    );
     assert.deepEqual(JSON.parse(first.components[1].candidate.version), {
       name: "chromium",
       revision: "1200",
@@ -388,6 +606,22 @@ test("qualification plan confines mutation and orders tests before scenarios", a
     assert.match(plan.apply.cwd, /^\/ephemeral\/repository\//u);
     assert.deepEqual(plan.capabilities, ["playwright-ubuntu-chromium"]);
     assert.equal(plan.package_tests.phase, "package-test");
+    assert.equal(plan.preparation.length, 2);
+    assert.ok(
+      plan.preparation.every(
+        (step) =>
+          step.cwd.startsWith(
+            "/ephemeral/repository/tests/e2e/playwright",
+          ) &&
+          step.environment.PLAYWRIGHT_BROWSERS_PATH.startsWith(
+            "/ephemeral/repository/tests/e2e/playwright",
+          ) &&
+          step.environment.npm_config_cache.startsWith(
+            "/ephemeral/repository/tests/e2e/playwright",
+          ) &&
+          !step.arguments.includes("--with-deps"),
+      ),
+    );
     assert.deepEqual(
       plan.execution.map(({ scenario }) => scenario),
       ["smoke", "web-calculator"],
@@ -409,15 +643,13 @@ test("warning-free all-capability evidence independently qualifies", async () =>
     const phases = [];
     const validation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
+      ...qualificationOptions(repository),
       async runStep(step) {
         phases.push(step.phase);
         if (step.scenario === "web-calculator") {
           await writePassingArtifacts(step.cwd);
         }
-        return { exitCode: 0, warnings: [] };
+        return passingStep(step);
       },
     });
     const after = await packageState(repository);
@@ -432,6 +664,8 @@ test("warning-free all-capability evidence independently qualifies", async () =>
     assert.deepEqual(phases, [
       "apply",
       "prepare",
+      "prepare",
+      "runtime-metadata",
       "package-test",
       "capability",
       "capability",
@@ -450,15 +684,13 @@ test("preparation failure cannot qualify, run scenarios, or mutate source state"
     const executed = [];
     const validation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
+      ...qualificationOptions(repository),
       async runStep(step) {
         executed.push(step.id);
-        return {
-          exitCode: step.phase === "prepare" ? 1 : 0,
-          warnings: [],
-        };
+        if (step.phase === "prepare") {
+          return { exitCode: 1, warnings: [] };
+        }
+        return passingStep(step);
       },
       async inspectCapability() {
         assert.fail("artifacts must not be admitted after failed preparation");
@@ -484,13 +716,12 @@ test("scenario execution failure cannot qualify or mutate source state", async (
     const before = await packageState(repository);
     const validation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
+      ...qualificationOptions(repository),
       async runStep(step) {
+        const result = await passingStep(step);
         return {
+          ...result,
           exitCode: step.scenario === "web-calculator" ? 1 : 0,
-          warnings: [],
         };
       },
       async inspectCapability() {
@@ -515,12 +746,11 @@ test("warnings and incomplete artifact contracts prevent admission", async () =>
     const observation = await collect(repository);
     const warningValidation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
+      ...qualificationOptions(repository),
       async runStep(step) {
+        const result = await passingStep(step);
         return {
-          exitCode: 0,
+          ...result,
           warnings:
             step.scenario === "smoke" ? ["browser emitted warning"] : [],
         };
@@ -540,11 +770,9 @@ test("warnings and incomplete artifact contracts prevent admission", async () =>
 
     const artifactValidation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
-      async runStep() {
-        return { exitCode: 0, warnings: [] };
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        return passingStep(step);
       },
       async inspectCapability() {
         return {
@@ -572,17 +800,16 @@ test("source mutation is restored and reported as a qualification failure", asyn
     const before = await packageState(repository);
     const validation = await qualifyPlaywrightCandidate({
       observation,
-      repositoryRoot: repository.root,
-      generatedAt: GENERATED_AT,
-      createWorkspace: candidateWorkspace,
+      ...qualificationOptions(repository),
       async runStep(step) {
+        const result = await passingStep(step);
         if (step.phase === "prepare") {
           await writeFile(
             join(repository.root, "tests/e2e/playwright/package.json"),
             "{}\n",
           );
         }
-        return { exitCode: 0, warnings: [] };
+        return result;
       },
       async inspectCapability() {
         return passingInspection();
@@ -596,6 +823,387 @@ test("source mutation is restored and reported as a qualification failure", asyn
     assert.deepEqual(await packageState(repository), before);
   } finally {
     await repository.cleanup();
+  }
+});
+
+test("artifact admission rejects semantically invalid evidence", async (t) => {
+  const cases = [
+    [
+      "fake PNG",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/web-calculator/final.png"),
+          "not a png\n",
+        );
+      },
+    ],
+    [
+      "empty video",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          "",
+        );
+      },
+    ],
+    [
+      "invalid HTML",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/html-report/index.html"),
+          "not html\n",
+        );
+      },
+    ],
+    [
+      "invalid native report",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/playwright-report.json"),
+          '{"stats":{"unexpected":0}}\n',
+        );
+      },
+    ],
+    [
+      "invalid result structure",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/result.json"),
+          '{"status":"passed"}\n',
+        );
+      },
+    ],
+    [
+      "accessibility violation",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility.json",
+        );
+        const report = JSON.parse(await readFile(path, "utf8"));
+        report.violations.push({ id: "blocking", nodes: [{}] });
+        await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const repository = await createRepository();
+      try {
+        const validation = await qualifyWithArtifacts(repository, mutate);
+        assert.equal(validation.disposition.state, "blocked");
+        assert.ok(
+          validation.disposition.reason_codes.includes(
+            "ARTIFACT_VALIDATION_FAILED",
+          ),
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("tested locks must match observed integrities and tarballs", async (t) => {
+  for (const field of ["integrity", "resolved"]) {
+    await t.test(field, async () => {
+      const repository = await createRepository();
+      try {
+        const observation = await collect(repository);
+        const validation = await qualifyPlaywrightCandidate({
+          observation,
+          ...qualificationOptions(repository),
+          async runStep(step) {
+            const result = await passingStep(step);
+            if (step.phase === "apply") {
+              const path = join(step.cwd, "package-lock.json");
+              const lockfile = JSON.parse(await readFile(path, "utf8"));
+              lockfile.packages["node_modules/playwright-core"][field] =
+                field === "integrity"
+                  ? "sha512-dGFtcGVyZWQ="
+                  : "https://example.invalid/tampered.tgz";
+              await writeFile(path, `${JSON.stringify(lockfile)}\n`);
+            }
+            return result;
+          },
+          async inspectCapability() {
+            return passingInspection();
+          },
+        });
+        assert.deepEqual(validation.disposition.reason_codes, [
+          "APPLICATION_FAILED",
+        ]);
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("actual runtime browser revision must match candidate evidence", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collect(repository);
+    const validation = await qualifyPlaywrightCandidate({
+      observation,
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        return passingStep(step, { revision: "9999" });
+      },
+      async inspectCapability() {
+        return passingInspection();
+      },
+    });
+
+    assert.equal(validation.disposition.state, "blocked");
+    assert.deepEqual(validation.disposition.reason_codes, [
+      "RUNTIME_BROWSER_MISMATCH",
+    ]);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("qualification rejects dirty, wrong-revision, and unrelated sources", async (t) => {
+  const cases = [
+    ["dirty", { clean: false }, "SOURCE_DIRTY"],
+    [
+      "wrong revision",
+      { revision: "f".repeat(40) },
+      "SOURCE_REVISION_MISMATCH",
+    ],
+    [
+      "unrelated repository",
+      { repositoryName: "someone/else" },
+      "SOURCE_REPOSITORY_MISMATCH",
+    ],
+    [
+      "wrong root",
+      { root: "/unrelated/repository" },
+      "SOURCE_ROOT_MISMATCH",
+    ],
+  ];
+
+  for (const [name, overrides, reason] of cases) {
+    await t.test(name, async () => {
+      const repository = await createRepository();
+      try {
+        const observation = await collect(repository);
+        let workspaceCreated = false;
+        const validation = await qualifyPlaywrightCandidate({
+          observation,
+          ...qualificationOptions(repository),
+          async inspectRepository() {
+            return testRepositoryInspection(repository, overrides);
+          },
+          async createWorkspace() {
+            workspaceCreated = true;
+            throw new Error("source rejection must precede workspace creation");
+          },
+        });
+        assert.equal(workspaceCreated, false);
+        assert.deepEqual(validation.disposition.reason_codes, [reason]);
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("ephemeral workspace must contain exactly the source revision", async (t) => {
+  for (const mutation of ["changed tracked file", "extra ignored file"]) {
+    await t.test(mutation, async () => {
+      const repository = await createRepository();
+      try {
+        const observation = await collect(repository);
+        const validation = await qualifyPlaywrightCandidate({
+          observation,
+          ...qualificationOptions(repository),
+          async createWorkspace(sourceRoot) {
+            const workspace = await candidateWorkspace(sourceRoot);
+            await writeFile(
+              mutation === "changed tracked file"
+                ? join(workspace.root, "tests/e2e/capabilities.json")
+                : join(workspace.root, "ignored-extra.txt"),
+              "{}\n",
+            );
+            return workspace;
+          },
+        });
+        assert.deepEqual(validation.disposition.reason_codes, [
+          "WORKSPACE_REVISION_MISMATCH",
+        ]);
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("plural, mixed-case, and structured warnings block admission", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collect(repository);
+    const validation = await qualifyPlaywrightCandidate({
+      observation,
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        const result = await passingStep(step);
+        if (step.scenario !== "smoke") {
+          return result;
+        }
+        return {
+          ...result,
+          stdout: "WaRnInGs: plural warning form\n",
+          structuredWarnings: [
+            { message: "structured warning object" },
+          ],
+          annotations: [
+            { level: "WARNING", message: "annotation warning" },
+          ],
+        };
+      },
+      async inspectCapability() {
+        return passingInspection();
+      },
+    });
+
+    assert.equal(validation.disposition.state, "blocked");
+    assert.deepEqual(validation.disposition.reason_codes, [
+      "VALIDATION_WARNINGS",
+    ]);
+    assert.ok(
+      validation.results[0].warnings.some((warning) =>
+        warning.includes("WaRnInGs")),
+    );
+    assert.ok(
+      validation.results[0].warnings.includes("structured warning object"),
+    );
+    assert.ok(
+      validation.results[0].warnings.includes("annotation warning"),
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("writes outside the ephemeral Playwright package boundary fail", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collect(repository);
+    const validation = await qualifyPlaywrightCandidate({
+      observation,
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        const result = await passingStep(step);
+        if (step.phase === "apply") {
+          await writeFile(
+            resolve(step.cwd, "../../..", "outside-package.txt"),
+            "unexpected write\n",
+          );
+        }
+        return result;
+      },
+    });
+    assert.deepEqual(validation.disposition.reason_codes, [
+      "WORKSPACE_BOUNDARY_VIOLATION",
+    ]);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("candidate versions and Node or peer ranges require strict semver", async (t) => {
+  const cases = [
+    [
+      "version",
+      (metadata) => {
+        const packument = metadata["@playwright/test"];
+        const record = packument.versions["1.65.0"];
+        delete packument.versions["1.65.0"];
+        packument["dist-tags"].latest = "01.65.0";
+        record.version = "01.65.0";
+        packument.versions["01.65.0"] = record;
+      },
+      "SEMVER_METADATA_INVALID",
+    ],
+    [
+      "Node range",
+      (metadata) => {
+        metadata.playwright.versions["1.65.0"].engines.node =
+          "definitely not semver";
+      },
+      "SEMVER_RANGE_INVALID",
+    ],
+    [
+      "peer range",
+      (metadata) => {
+        metadata["@axe-core/playwright"].versions["4.15.0"]
+          .peerDependencies["playwright-core"] = ">=1.0.0; rm -rf";
+      },
+      "SEMVER_RANGE_INVALID",
+    ],
+  ];
+
+  for (const [name, mutate, reason] of cases) {
+    await t.test(name, async () => {
+      const repository = await createRepository();
+      try {
+        const npm = await fixture("npm-metadata.json");
+        const browsers = await fixture("browser-metadata.json");
+        mutate(npm);
+        const observation = await collectPlaywrightCohort({
+          repositoryRoot: repository.root,
+          repository: {
+            name: "sbalswa/oculix",
+            revision: REVISION,
+          },
+          generatedAt: GENERATED_AT,
+          async npmMetadata(packageName) {
+            return structuredClone(npm[packageName]);
+          },
+          async browserMetadata(version) {
+            return structuredClone(browsers[version]);
+          },
+        });
+        assert.equal(observation.disposition.state, "unknown");
+        assert.deepEqual(observation.disposition.reason_codes, [reason]);
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("invalid current versions and ranges fail collection closed", async (t) => {
+  for (const field of ["version", "range"]) {
+    await t.test(field, async () => {
+      const repository = await createRepository();
+      try {
+        if (field === "version") {
+          const path = join(repository.root, "tests/e2e/playwright/package.json");
+          const packageJson = JSON.parse(await readFile(path, "utf8"));
+          packageJson.devDependencies["@playwright/test"] = "1.64";
+          await writeFile(path, `${JSON.stringify(packageJson)}\n`);
+        } else {
+          const path = join(
+            repository.root,
+            "tests/e2e/playwright/package-lock.json",
+          );
+          const lockfile = JSON.parse(await readFile(path, "utf8"));
+          lockfile.packages["node_modules/playwright"].engines.node =
+            "1.x.3";
+          await writeFile(path, `${JSON.stringify(lockfile)}\n`);
+        }
+        await assert.rejects(
+          collect(repository),
+          /semantic version|semantic-version range/,
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    });
   }
 });
 
