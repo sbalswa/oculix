@@ -1706,10 +1706,11 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
       result.executor.policy.authority.github_api_permission,
       "none",
     );
+    assert.equal(result.executor.policy.candidate_code, "untrusted");
     assert.deepEqual(result.executor.policy.isolation, {
       disposable: true,
       github_api_access: false,
-      network: "candidate-registry-only",
+      network: "pinned-candidate-registry-plus-loopback-only",
       privileges: "unprivileged",
       repository_write_access: false,
       secrets: "none",
@@ -1740,6 +1741,9 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
     assert.ok(
       result.executor.attestations.every(
         (attestation) =>
+          attestation.candidate_code === "untrusted" &&
+          attestation.isolation.network ===
+            "pinned-candidate-registry-plus-loopback-only" &&
           attestation.request_digest ===
             result.executor.request.request_digest &&
           attestation.plan_digest ===
@@ -1805,6 +1809,22 @@ test("cross-job artifact strictly validates authority, execution, results, and r
       }],
       ["read-only mutable seed", (value) => {
         value.executor.policy.filesystem.mutable_seed.access = "read-only";
+      }],
+      ["missing candidate-code policy", (value) => {
+        delete value.executor.policy.candidate_code;
+      }],
+      ["unknown candidate-code policy", (value) => {
+        value.executor.policy.candidate_code = "trusted";
+      }],
+      ["missing network policy", (value) => {
+        delete value.executor.policy.isolation.network;
+      }],
+      ["unknown network policy", (value) => {
+        value.executor.policy.isolation.network = "internet";
+      }],
+      ["stale network policy", (value) => {
+        value.executor.policy.isolation.network =
+          "candidate-registry-only";
       }],
       ["execution after expiry", (value) => {
         value.executor.executions[0].completed_at =
@@ -2208,11 +2228,16 @@ test("missing or forged executor attestations fail closed", async () => {
   for (const mutation of [
     "missing",
     "candidate",
+    "candidate-code-missing",
+    "candidate-code-unknown",
     "challenge",
     "environment",
     "expires",
     "executable",
     "isolation",
+    "network-missing",
+    "network-stale",
+    "network-unknown",
     "payload",
     "signature",
     "tools",
@@ -2230,6 +2255,10 @@ test("missing or forged executor attestations fail closed", async () => {
             return undefined;
           } else if (mutation === "candidate") {
             forged.candidate_digest = "0".repeat(64);
+          } else if (mutation === "candidate-code-missing") {
+            delete forged.candidate_code;
+          } else if (mutation === "candidate-code-unknown") {
+            forged.candidate_code = "trusted";
           } else if (mutation === "challenge") {
             forged.challenge = "d".repeat(64);
           } else if (mutation === "environment") {
@@ -2238,6 +2267,12 @@ test("missing or forged executor attestations fail closed", async () => {
             forged.expires_at = "2026-10-21T18:23:00.000Z";
           } else if (mutation === "executable") {
             forged.executable_identity_digest = `sha256:${"0".repeat(64)}`;
+          } else if (mutation === "network-missing") {
+            delete forged.isolation.network;
+          } else if (mutation === "network-stale") {
+            forged.isolation.network = "candidate-registry-only";
+          } else if (mutation === "network-unknown") {
+            forged.isolation.network = "internet";
           } else if (mutation === "payload") {
             forged.payload = "forbidden";
           } else if (mutation === "signature") {
