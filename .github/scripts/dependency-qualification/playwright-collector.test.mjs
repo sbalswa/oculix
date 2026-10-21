@@ -6,6 +6,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,6 +25,7 @@ import {
   createPlaywrightQualificationPlan,
   PLAYWRIGHT_MANAGED_PATHS,
   qualifyPlaywrightCandidate,
+  runQualificationStep,
 } from "./playwright-collector.mjs";
 
 const FIXTURE_ROOT = new URL(
@@ -253,6 +255,35 @@ async function qualifyWithArtifacts(repository, mutateArtifacts) {
 }
 
 async function writePassingArtifacts(packageRoot) {
+  const accessibilitySummary = {
+    status: "passed",
+    testEngine: { name: "axe-core", version: "4.15.0" },
+    testEnvironment: { orientationAngle: 0 },
+    testRunner: { name: "axe" },
+    timestamp: "2026-10-21T17:00:00.000Z",
+    url: "http://127.0.0.1/",
+    policy: {
+      automatedStandard: "WCAG 2.0, 2.1, and 2.2 Level A/AA",
+      blocking: "any-violation",
+      incomplete: "retained-nonblocking",
+      tags: [
+        "wcag2a",
+        "wcag2aa",
+        "wcag21a",
+        "wcag21aa",
+        "wcag22a",
+        "wcag22aa",
+      ],
+    },
+    counts: {
+      incomplete: { rules: 0, nodes: 0 },
+      inapplicable: { rules: 0, nodes: 0 },
+      passes: { rules: 0, nodes: 0 },
+      violations: { rules: 0, nodes: 0 },
+    },
+    incomplete: [],
+    violations: [],
+  };
   for (const scenario of ["smoke", "web-calculator"]) {
     const resultRoot = join(packageRoot, "test-results", scenario);
     await mkdir(join(resultRoot, "html-report"), { recursive: true });
@@ -264,8 +295,14 @@ async function writePassingArtifacts(packageRoot) {
     await writeFile(
       join(resultRoot, "playwright-report.json"),
       `${JSON.stringify({
-        config: {},
-        suites: [],
+        config: { rootDir: packageRoot },
+        suites: [
+          {
+            title: scenario,
+            file: `${scenario}.spec.mjs`,
+            specs: [{ file: `${scenario}.spec.mjs` }],
+          },
+        ],
         errors: [],
         stats: {
           expected: 1,
@@ -275,7 +312,13 @@ async function writePassingArtifacts(packageRoot) {
         },
       })}\n`,
     );
-    await writeFile(join(resultRoot, "artifacts/video.webm"), "video\n");
+    await writeFile(
+      join(resultRoot, "artifacts/video.webm"),
+      Buffer.concat([
+        Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+        Buffer.from("webm-video"),
+      ]),
+    );
     const scenarioRoot =
       `tests/e2e/playwright/test-results/${scenario}`;
     await writeFile(
@@ -287,8 +330,14 @@ async function writePassingArtifacts(packageRoot) {
         scenario,
         status: "passed",
         timestamps: {
-          startedAt: "2026-10-21T17:00:00.000Z",
-          completedAt: "2026-10-21T17:00:01.000Z",
+          startedAt:
+            scenario === "smoke"
+              ? "2026-10-21T17:00:00.000Z"
+              : "2026-10-21T17:00:02.000Z",
+          completedAt:
+            scenario === "smoke"
+              ? "2026-10-21T17:00:01.000Z"
+              : "2026-10-21T17:00:03.000Z",
           durationMs: 1000,
         },
         environment: {
@@ -313,16 +362,19 @@ async function writePassingArtifacts(packageRoot) {
         },
         accessibility:
           scenario === "web-calculator"
-            ? {
-                status: "passed",
-                counts: { violations: { rules: 0, nodes: 0 } },
-              }
+            ? accessibilitySummary
             : { status: "not-run", counts: null },
         artifacts: {
           htmlReport: `${scenarioRoot}/html-report/index.html`,
           nativeJsonReport: `${scenarioRoot}/playwright-report.json`,
           result: `${scenarioRoot}/result.json`,
-          attachments: [],
+          attachments: [
+            {
+              contentType: "video/webm",
+              name: "video",
+              path: `${scenarioRoot}/artifacts/video.webm`,
+            },
+          ],
           ...(scenario === "web-calculator"
             ? {
                 accessibility:
@@ -358,23 +410,7 @@ async function writePassingArtifacts(packageRoot) {
   );
   await writeFile(
     join(calculatorRoot, "accessibility-summary.json"),
-    `${JSON.stringify({
-      status: "passed",
-      policy: {
-        automatedStandard: "WCAG 2.0, 2.1, and 2.2 Level A/AA",
-        blocking: "any-violation",
-        incomplete: "retained-nonblocking",
-        tags: ["wcag2a"],
-      },
-      counts: {
-        incomplete: { rules: 0, nodes: 0 },
-        inapplicable: { rules: 0, nodes: 0 },
-        passes: { rules: 0, nodes: 0 },
-        violations: { rules: 0, nodes: 0 },
-      },
-      incomplete: [],
-      violations: [],
-    })}\n`,
+    `${JSON.stringify(accessibilitySummary)}\n`,
   );
   await writeFile(
     join(calculatorRoot, "accessibility-summary.md"),
@@ -383,12 +419,11 @@ async function writePassingArtifacts(packageRoot) {
   );
   await writeFile(
     join(calculatorRoot, "final.png"),
-    Buffer.concat([
-      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-      Buffer.from([0x00, 0x00, 0x00, 0x0d]),
-      Buffer.from("IHDR"),
-      Buffer.alloc(13),
-    ]),
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC" +
+        "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
   );
 }
 
@@ -838,11 +873,32 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
       },
     ],
     [
+      "PNG with corrupt chunk CRC",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/final.png",
+        );
+        const png = await readFile(path);
+        png[png.length - 1] ^= 0xff;
+        await writeFile(path, png);
+      },
+    ],
+    [
       "empty video",
       async (packageRoot) => {
         await writeFile(
           join(packageRoot, "test-results/smoke/artifacts/video.webm"),
           "",
+        );
+      },
+    ],
+    [
+      "nonempty non-WebM video",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          "not actually webm\n",
         );
       },
     ],
@@ -874,6 +930,69 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
       },
     ],
     [
+      "swapped scenario reports",
+      async (packageRoot) => {
+        const smokePath = join(
+          packageRoot,
+          "test-results/smoke/result.json",
+        );
+        const calculatorPath = join(
+          packageRoot,
+          "test-results/web-calculator/result.json",
+        );
+        const [smoke, calculator] = await Promise.all([
+          readFile(smokePath),
+          readFile(calculatorPath),
+        ]);
+        await writeFile(smokePath, calculator);
+        await writeFile(calculatorPath, smoke);
+      },
+    ],
+    [
+      "swapped native scenario reports",
+      async (packageRoot) => {
+        const smokePath = join(
+          packageRoot,
+          "test-results/smoke/playwright-report.json",
+        );
+        const calculatorPath = join(
+          packageRoot,
+          "test-results/web-calculator/playwright-report.json",
+        );
+        const [smoke, calculator] = await Promise.all([
+          readFile(smokePath),
+          readFile(calculatorPath),
+        ]);
+        await writeFile(smokePath, calculator);
+        await writeFile(calculatorPath, smoke);
+      },
+    ],
+    [
+      "nonmonotonic timestamps",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/smoke/result.json",
+        );
+        const report = JSON.parse(await readFile(path, "utf8"));
+        report.timestamps.completedAt = "2026-10-21T16:59:59.000Z";
+        await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+    [
+      "nonmonotonic scenario sequence",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/result.json",
+        );
+        const report = JSON.parse(await readFile(path, "utf8"));
+        report.timestamps.startedAt = "2026-10-21T17:00:00.500Z";
+        report.timestamps.completedAt = "2026-10-21T17:00:01.500Z";
+        await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+    [
       "accessibility violation",
       async (packageRoot) => {
         const path = join(
@@ -882,6 +1001,30 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
         );
         const report = JSON.parse(await readFile(path, "utf8"));
         report.violations.push({ id: "blocking", nodes: [{}] });
+        await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+    [
+      "contradictory accessibility counts",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility-summary.json",
+        );
+        const summary = JSON.parse(await readFile(path, "utf8"));
+        summary.counts.passes.rules = 1;
+        await writeFile(path, `${JSON.stringify(summary)}\n`);
+      },
+    ],
+    [
+      "result contradicts accessibility summary",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/result.json",
+        );
+        const report = JSON.parse(await readFile(path, "utf8"));
+        report.accessibility.status = "failed";
         await writeFile(path, `${JSON.stringify(report)}\n`);
       },
     ],
@@ -1114,6 +1257,116 @@ test("writes outside the ephemeral Playwright package boundary fail", async () =
   }
 });
 
+test("symlinks cannot escape repository, workspace, or package confinement", async (t) => {
+  await t.test("collector package path", async () => {
+    const repository = await createRepository();
+    const externalRoot = await mkdtemp(join(tmpdir(), "playwright-external-"));
+    try {
+      const packagePath = join(
+        repository.root,
+        "tests/e2e/playwright/package.json",
+      );
+      const externalPackage = join(externalRoot, "package.json");
+      await cp(packagePath, externalPackage);
+      await rm(packagePath);
+      await symlink(externalPackage, packagePath);
+      await assert.rejects(
+        collect(repository),
+        /Resolved path escapes confinement/,
+      );
+    } finally {
+      await repository.cleanup();
+      await rm(externalRoot, { force: true, recursive: true });
+    }
+  });
+
+  await t.test("qualification artifact", async () => {
+    const repository = await createRepository();
+    const externalRoot = await mkdtemp(join(tmpdir(), "playwright-external-"));
+    try {
+      const observation = await collect(repository);
+      const externalPng = join(externalRoot, "outside.png");
+      await writeFile(
+        externalPng,
+        Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC" +
+            "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      );
+      const validation = await qualifyPlaywrightCandidate({
+        observation,
+        ...qualificationOptions(repository),
+        async runStep(step) {
+          const result = await passingStep(step);
+          if (step.scenario === "web-calculator") {
+            await writePassingArtifacts(step.cwd);
+            const finalPng = join(
+              step.cwd,
+              "test-results/web-calculator/final.png",
+            );
+            await rm(finalPng);
+            await symlink(externalPng, finalPng);
+          }
+          return result;
+        },
+      });
+      assert.ok(
+        validation.disposition.reason_codes.includes(
+          "WORKSPACE_BOUNDARY_VIOLATION",
+        ),
+      );
+    } finally {
+      await repository.cleanup();
+      await rm(externalRoot, { force: true, recursive: true });
+    }
+  });
+});
+
+test("candidate processes receive only a sanitized environment", async () => {
+  const packageRoot = await mkdtemp(
+    join(tmpdir(), "playwright-sanitized-environment-"),
+  );
+  const previousSecret = process.env.OCULIX_TEST_SECRET;
+  process.env.OCULIX_TEST_SECRET = "must-not-leak";
+  try {
+    const result = await runQualificationStep({
+      command: process.execPath,
+      arguments: [
+        "--input-type=module",
+        "--eval",
+        "process.stdout.write(JSON.stringify(process.env))",
+      ],
+      cwd: packageRoot,
+      environment: {},
+    });
+    const environment = JSON.parse(result.stdout);
+    assert.equal(environment.OCULIX_TEST_SECRET, undefined);
+    assert.equal(environment.HOME, undefined);
+    for (const key of ["TEMP", "TMP", "TMPDIR"]) {
+      assert.ok(environment[key].startsWith(packageRoot));
+    }
+    await assert.rejects(
+      runQualificationStep({
+        command: process.execPath,
+        arguments: ["--version"],
+        cwd: packageRoot,
+        environment: {
+          GITHUB_TOKEN: "must-not-be-accepted",
+        },
+      }),
+      /unsafe environment keys: GITHUB_TOKEN/,
+    );
+  } finally {
+    if (previousSecret === undefined) {
+      delete process.env.OCULIX_TEST_SECRET;
+    } else {
+      process.env.OCULIX_TEST_SECRET = previousSecret;
+    }
+    await rm(packageRoot, { force: true, recursive: true });
+  }
+});
+
 test("candidate versions and Node or peer ranges require strict semver", async (t) => {
   const cases = [
     [
@@ -1125,6 +1378,18 @@ test("candidate versions and Node or peer ranges require strict semver", async (
         packument["dist-tags"].latest = "01.65.0";
         record.version = "01.65.0";
         packument.versions["01.65.0"] = record;
+      },
+      "SEMVER_METADATA_INVALID",
+    ],
+    [
+      "leading-zero prerelease",
+      (metadata) => {
+        const packument = metadata["@playwright/test"];
+        const record = packument.versions["1.65.0"];
+        delete packument.versions["1.65.0"];
+        packument["dist-tags"].latest = "1.65.0-alpha.01";
+        record.version = "1.65.0-alpha.01";
+        packument.versions["1.65.0-alpha.01"] = record;
       },
       "SEMVER_METADATA_INVALID",
     ],
@@ -1144,6 +1409,24 @@ test("candidate versions and Node or peer ranges require strict semver", async (
       },
       "SEMVER_RANGE_INVALID",
     ],
+    ...[
+      ">=1.0.0 - <2.0.0",
+      "1.0.0 -",
+      ">=1.0.0 ||",
+      ">=1.0.0 <",
+      "1.0.0 - 2.0.0 - 3.0.0",
+      "=>1.0.0",
+      "1.x.3",
+      "^1.0.0 <2.0.0",
+      "1.0.0 >=1.0.0",
+      ">=1.0.0-alpha.01",
+    ].map((range) => [
+      `malformed range ${range}`,
+      (metadata) => {
+        metadata.playwright.versions["1.65.0"].engines.node = range;
+      },
+      "SEMVER_RANGE_INVALID",
+    ]),
   ];
 
   for (const [name, mutate, reason] of cases) {
