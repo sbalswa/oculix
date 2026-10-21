@@ -510,6 +510,35 @@ test("unknown evidence prevents readiness without erasing unrelated results", as
   );
 });
 
+test("unknown observations cannot hide stale validation bindings", () => {
+  const node = observation({
+    capabilities: ["playwright-ubuntu-chromium"],
+    candidateVersion: "26.0.0",
+    currentVersion: "24.0.0",
+    disposition: {
+      state: "unknown",
+      reason_codes: ["DISCOVERY_UNKNOWN"],
+    },
+    id: "node",
+  });
+  const staleValidation = validation(node, {
+    disposition: "unknown",
+    reasonCodes: ["VALIDATION_UNKNOWN"],
+    statuses: {
+      "playwright-ubuntu-chromium": "unknown",
+    },
+  });
+  staleValidation.candidate_digest = "1".repeat(64);
+
+  assert.throws(
+    () =>
+      solveTrafficControl(
+        solverInput([node], [staleValidation]),
+      ),
+    /candidate digest must equal/,
+  );
+});
+
 test("advisory relations are reported but never become blockers", () => {
   const cypress = observation({
     capabilities: ["cypress-ubuntu-chrome"],

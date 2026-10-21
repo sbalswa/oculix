@@ -110,6 +110,34 @@ function deterministicTimestamp(providers, validations) {
 }
 
 function validationState(observation, validation, contractOptions) {
+  if (validation !== undefined) {
+    if (validation.provider_id !== observation.provider_id) {
+      throw new Error(
+        `validation provider ${validation.provider_id} does not match ${observation.provider_id}`,
+      );
+    }
+    if (!sameRepository(validation.repository, observation.repository)) {
+      throw new Error(
+        `validation ${validation.provider_id} does not match its observation repository`,
+      );
+    }
+    if (
+      !sameCatalog(
+        validation.capability_catalog,
+        observation.capability_catalog,
+      )
+    ) {
+      throw new Error(
+        `validation ${validation.provider_id} does not match its observation capability catalog`,
+      );
+    }
+    const digest = subjectDigest(observation);
+    if (validation.candidate_digest !== digest) {
+      throw new Error(
+        `validation ${validation.provider_id} candidate digest must equal ${digest}`,
+      );
+    }
+  }
   if (observation.disposition.state === "unknown") {
     return {
       blockers: [observation.provider_id],
@@ -127,39 +155,6 @@ function validationState(observation, validation, contractOptions) {
       blockers: [observation.provider_id],
       eligibility: "unknown",
     };
-  }
-
-  validateDocument(validation, contractOptions);
-  if (validation.kind !== "validation") {
-    throw new Error(
-      `validation for ${observation.provider_id} must be a validation document`,
-    );
-  }
-  if (validation.provider_id !== observation.provider_id) {
-    throw new Error(
-      `validation provider ${validation.provider_id} does not match ${observation.provider_id}`,
-    );
-  }
-  if (!sameRepository(validation.repository, observation.repository)) {
-    throw new Error(
-      `validation ${validation.provider_id} does not match its observation repository`,
-    );
-  }
-  if (
-    !sameCatalog(
-      validation.capability_catalog,
-      observation.capability_catalog,
-    )
-  ) {
-    throw new Error(
-      `validation ${validation.provider_id} does not match its observation capability catalog`,
-    );
-  }
-  const digest = subjectDigest(observation);
-  if (validation.candidate_digest !== digest) {
-    throw new Error(
-      `validation ${validation.provider_id} candidate digest must equal ${digest}`,
-    );
   }
 
   switch (validation.disposition.state) {
@@ -797,6 +792,10 @@ export function solveTrafficControl(providerSetOrInput, options = {}) {
   }
   const validationsByProvider = new Map();
   for (const validation of validations) {
+    validateDocument(validation, contractOptions);
+    if (validation.kind !== "validation") {
+      throw new Error("validations must contain validation documents");
+    }
     if (validationsByProvider.has(validation.provider_id)) {
       throw new Error(
         `duplicate validation provider ${validation.provider_id}`,
