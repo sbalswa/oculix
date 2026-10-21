@@ -12,7 +12,7 @@ Set-Location -LiteralPath $env:MISE_PROJECT_ROOT
 $script = if ($args.Count -gt 0) {
     $args[0]
 } else {
-    "tests/e2e/oculix/basic.sikuli"
+    "tests/e2e/oculix/smoke.sikuli"
 }
 $oculixDirectory = & mise where http:oculixide
 if ($LASTEXITCODE -ne 0) {
