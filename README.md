@@ -6,44 +6,106 @@ Repository tooling lives under the grouped `mise/` configuration directory:
 
 ```text
 mise/
-├── config.toml            # base policy tools + setup/ci tasks
-├── mise.lock              # lock for config.toml (mise naming)
-├── config.oculix.toml     # Java + Oculix jar (MISE_ENV=oculix)
-├── mise.oculix.lock       # lock for config.oculix.toml
+├── config.toml                    # base policy tools + setup/ci tasks
+├── mise.lock                      # lock for config.toml (mise naming)
+├── config.oculix.toml             # Java + Oculix jar (MISE_ENV=oculix)
+├── mise.oculix.lock               # lock for config.oculix.toml
+├── config.web-e2e.toml            # Node.js 24 LTS (MISE_ENV=web-e2e)
+├── mise.web-e2e.lock              # lock for config.web-e2e.toml
 └── tasks/
-    └── oculix/
-        ├── run            # Unix/macOS runner
-        └── run.ps1        # Windows runner
+    ├── oculix/
+    │   ├── run                    # low-level Unix/macOS runner
+    │   └── run.ps1                # low-level Windows runner
+    └── e2e/
+        ├── oculix/                 # canonical Oculix scenarios + aggregate
+        └── fixtures/
+            └── web-calculator/     # fixture serve, smoke, and lifecycle tasks
 ```
 
 - **Base config** (`mise install --locked`): lightweight policy tools only.
 - **`oculix` environment** (`mise -E oculix install --locked`): additionally installs Java and the Oculix artifact.
-- Future environment pairs (for example `web-e2e`) add `mise/config.<env>.toml` + `mise/mise.<env>.lock` without cluttering the repository root.
+- **`web-e2e` environment** (`mise -E web-e2e install --locked`): additionally installs the locked Node.js 24 LTS runtime used by the web fixture and future browser harnesses.
+
+Each optional environment has an adjacent `mise/config.<env>.toml` and
+`mise/mise.<env>.lock` pair without adding configuration files to the repository
+root.
 
 After pulling a config-path move, you may need to trust the new paths once (`mise trust`).
 
-## Oculix cross-platform smoke test
+## Oculix E2E tasks
 
 Oculix (the `oculixide` jar) and Java (Temurin 17) are pinned in the
-`oculix` mise environment. The canonical runner task is `oculix:run`
-(compatibility alias: `oculix`):
+`oculix` mise environment. Install that environment, then run an individual
+canonical scenario or the ordered aggregate:
 
 ```sh
 mise -E oculix install --locked
 # Linux is headless, so wrap in Xvfb:
-xvfb-run -a mise -E oculix run oculix:run
+xvfb-run -a mise -E oculix run e2e:oculix:smoke
+xvfb-run -a mise -E oculix run e2e:oculix:native-calculator
+xvfb-run -a mise -E oculix run e2e:oculix
 # macOS / Windows have a desktop session:
-mise -E oculix run oculix:run
-# Optional script argument (default: tests/e2e/oculix/basic.sikuli):
-mise -E oculix run oculix:run tests/e2e/oculix/calculator.sikuli
+mise -E oculix run e2e:oculix
 ```
 
-In CI, the `oculix` job in `.github/workflows/cross-platform.yml` runs this on
-`ubuntu-latest`, `macos-latest`, and `windows-latest` (trigger via
+`e2e:oculix` runs `e2e:oculix:smoke` followed by
+`e2e:oculix:native-calculator`. The smoke scenario initializes Oculix and
+reports the detected screens and geometry without launching a target
+application. The native-calculator scenario drives the operating system's
+calculator using platform-specific reference images.
+
+The lower-level `oculix:run` task (alias: `oculix`) remains available for
+running any Oculix bundle without adding a canonical scenario task. Its
+optional argument defaults to `tests/e2e/oculix/smoke.sikuli`:
+
+```sh
+xvfb-run -a mise -E oculix run oculix:run
+mise -E oculix run oculix:run tests/e2e/oculix/native-calculator.sikuli
+```
+
+In `.github/workflows/cross-platform.yml`, the `oculix` and `calculator` jobs
+run the smoke and native-calculator scenarios separately on `ubuntu-latest`,
+`macos-latest`, and `windows-latest` (trigger via
 **Actions → Cross-platform runners → Run workflow**).
 
-Future E2E scenario tasks will follow `e2e:<tool>:<scenario>` and call
-`oculix:run` rather than duplicating platform logic.
+## Web calculator fixture
+
+The self-contained calculator at
+`tests/e2e/fixtures/web-calculator/index.html` is served only on
+`127.0.0.1`. It has no package dependencies or external assets. Install the
+`web-e2e` environment before using its tasks:
+
+```sh
+mise -E web-e2e install --locked
+mise -E web-e2e run e2e:fixtures:web-calculator:smoke
+```
+
+The smoke task exercises calculator behavior and the complete server lifecycle,
+including successful and failing child commands, interruption handling, and
+server cleanup.
+
+Framework tasks should use the lifecycle wrapper instead of managing a fixture
+server themselves:
+
+```sh
+mise -E web-e2e run e2e:fixtures:web-calculator:with-server -- \
+  node -e 'console.log(process.env.WEB_CALCULATOR_URL)'
+```
+
+The wrapper starts the server on an available loopback port, waits for its
+readiness message and `/healthz` response, then exposes its URL to the child as
+`WEB_CALCULATOR_URL`. It preserves the child's exit status or forwarded signal
+and stops the server afterward. For manual inspection, the lower-level
+`e2e:fixtures:web-calculator:serve` task starts the same server and prints its
+JSON readiness message; pass `-- --port PORT` to request a specific port.
+
+### Framework work still in progress
+
+The deterministic fixture and shared runtime exist, but the Selenium, Cypress,
+and Playwright harnesses, their browser smoke and web-calculator scenarios, the
+Oculix web-calculator scenario, the cross-tool CI matrix, and the `e2e:all`
+aggregate are not implemented yet. That work remains tracked by
+the [cross-framework E2E epic (#14)](https://github.com/sbalswa/oculix/issues/14).
 
 ### Not yet built (backlog)
 

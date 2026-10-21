@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Provision deterministic Selenium browser and driver paths"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+mise -E web-e2e exec -- npm ci --prefix tests/e2e/selenium
+exec mise -E web-e2e exec -- \
+  npm --prefix tests/e2e/selenium run setup -- "$@"
