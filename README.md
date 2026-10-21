@@ -118,10 +118,9 @@ JSON readiness message; pass `-- --port PORT` to request a specific port.
 
 ## Browser E2E tasks
 
-Selenium, Cypress, and Playwright each own an isolated package under
-`tests/e2e/<tool>/`. Running one tool installs only that package. Every
-aggregate runs a calculator-independent browser smoke first and then the shared
-`clear → 7 → × → 3 → 4 → = → 238` scenario:
+Local E2E tasks use `e2e:<tool>[:<scenario>]`. Selenium, Cypress, and
+Playwright aggregates run a calculator-independent browser smoke followed by
+the shared `clear → 7 → × → 3 → 4 → = → 238` scenario:
 
 ```sh
 mise -E web-e2e run e2e:selenium
@@ -145,8 +144,8 @@ Leaf tasks follow `e2e:<tool>:<scenario>`, for example
 separate operation where deterministic browser provisioning requires it:
 `e2e:selenium:setup` and `e2e:playwright:setup`.
 
-On an Ubuntu desktop with the Oculix native prerequisites installed, the
-ordered aggregate runs all four tool aggregates:
+On an Ubuntu desktop with the Oculix native prerequisites installed,
+`e2e:all` runs the four current stable capabilities in order:
 
 ```sh
 mise -E oculix,web-e2e run e2e:all
@@ -154,31 +153,142 @@ mise -E oculix,web-e2e run e2e:all
 
 ## CI execution and evidence
 
-The `Cross-platform runners` workflow has an opt-in `run_e2e` input. Ordinary
-pull requests leave it disabled and allocate no browser E2E matrix runners.
-Manual or reusable invocations can enable the four explicit Phase 1
-capabilities:
+Remote E2E selection uses `ci:e2e:*` pull-request labels or the
+`Demand-driven E2E selectors` workflow's manual inputs. It is separate from
+the local `e2e:*` task syntax.
+
+The stable capability catalog currently contains four Ubuntu cells:
 
 - Selenium on Ubuntu/Chromium
 - Cypress on Ubuntu/Chrome
 - Playwright on Ubuntu/Chromium
 - Oculix on Ubuntu/Chromium
 
-The matrix is an explicit allowlist rather than an OS × browser product.
-Each capability runs its canonical aggregate or leaf with locked mise
-environments, bounded timeouts, and `fail-fast: false`.
+The catalog is an explicit allowlist, not an OS × browser product. Every
+selected cell has standard cost, uses a GitHub-hosted Ubuntu runner, has a
+20-minute timeout, and runs with `fail-fast: false`. At most three cells run
+concurrently, so a full four-cell selection runs as three cells followed by
+the fourth when runner capacity is available. A pull request with no
+`ci:e2e:*` label allocates no E2E matrix runner.
+
+### Pull-request selectors
+
+Apply one or more of these labels to a pull request:
+
+| Selection | Label | Current expansion |
+| --- | --- | ---: |
+| Smoke | `ci:e2e:smoke` | 1 Selenium cell |
+| Exact Selenium | `ci:e2e:selenium:ubuntu:chromium` | 1 cell |
+| Exact Cypress | `ci:e2e:cypress:ubuntu:chrome` | 1 cell |
+| Exact Playwright | `ci:e2e:playwright:ubuntu:chromium` | 1 cell |
+| Exact Oculix | `ci:e2e:oculix:ubuntu:chromium` | 1 cell |
+| All stable Selenium | `ci:e2e:selenium:all` | 1 cell |
+| All stable Cypress | `ci:e2e:cypress:all` | 1 cell |
+| All stable Playwright | `ci:e2e:playwright:all` | 1 cell |
+| All stable Oculix | `ci:e2e:oculix:all` | 1 cell |
+| All stable capabilities | `ci:e2e:all` | 4 cells |
+
+Tool-wide counts will grow when stable OS/browser capabilities are added to
+that tool. Multiple labels form a de-duplicated union. For example, applying
+the exact Selenium and Cypress labels runs two cells; combining
+`ci:e2e:smoke` with the exact Selenium label still runs one.
+
+Adding or removing a `ci:e2e:*` label replans the pull request and cancels
+obsolete in-progress selector work. Unrelated labels neither select E2E work
+nor cancel it. An unknown `ci:e2e:*` label fails planning instead of silently
+allocating the wrong runner.
+
+Repository label synchronization manages the available label definitions and
+their descriptions. It does not apply a selector to a pull request and
+therefore does not start E2E work.
+
+After changing `tests/e2e/capabilities.json`, preview and verify label drift
+before applying it:
+
+```sh
+mise run github:e2e-labels
+mise run github:e2e-labels -- --check
+mise run github:e2e-labels -- --apply
+```
+
+The task is dry-run by default. `--check` is also read-only and exits nonzero
+on drift. `--apply` creates and updates labels but retains stale managed labels;
+deletion requires the explicit `--apply --prune` combination.
+
+Labels applied by a workflow using GitHub's default `GITHUB_TOKEN` do not
+recursively trigger a new `pull_request:labeled` workflow run. Automation that
+needs to start E2E must dispatch the selector workflow explicitly or apply the
+label using an appropriately authorized GitHub App installation token or
+personal access token. Labels applied manually in the GitHub UI trigger the
+selector workflow normally.
+
+### Manual dispatch
+
+Run `Demand-driven E2E selectors` from the Actions page with one preset:
+
+- `none`: select nothing and allocate no E2E matrix runner.
+- `smoke`: run the current one-cell stable smoke selection.
+- `full`: run all four current stable cells.
+- `custom`: run a comma- or newline-separated list of exact capability IDs or
+  exact labels.
+
+For example, a custom two-cell run accepts:
+
+```text
+selenium-ubuntu-chromium
+ci:e2e:cypress:ubuntu:chrome
+```
+
+The custom field is used only with `preset=custom`; it rejects an empty list,
+unknown selectors, and broad selectors such as `ci:e2e:all`,
+`ci:e2e:smoke`, or `ci:e2e:<tool>:all`. Manual dispatch can opt into an exact
+experimental capability with `include_experimental`; pull-request labels
+select stable capabilities only.
+
+### Artifacts and reports
 
 Successful runs retain a final `238` screenshot for every capability.
-Cypress and Playwright also retain native video. Evidence and diagnostics are
-always uploaded for seven days under the capability ID. Oculix's hosted
-Chromium launch explicitly disables its browser sandbox because the Ubuntu
-runner's AppArmor policy otherwise makes Chromium abort; that opt-in is
-rejected outside GitHub Actions and the fixture remains loopback-only.
+Each selected cell uploads its complete diagnostics directory for seven days
+as `e2e-<capability-id>` in the workflow run's **Artifacts** section:
 
-Framework-native accessibility audits and detailed result reports are tracked
-in [#55](https://github.com/sbalswa/oculix/issues/55). Demand-driven capability
-catalogs, labels, and dispatch selectors are tracked in
-[#15](https://github.com/sbalswa/oculix/issues/15).
+| Artifact | End-user evidence and reports |
+| --- | --- |
+| `e2e-selenium-ubuntu-chromium` | `web-calculator/result.png`, `result.json`, `accessibility.json`, and `accessibility-summary.md` under `tests/e2e/selenium/diagnostics/` |
+| `e2e-cypress-ubuntu-chrome` | Scenario screenshots and `.mp4` videos, `run.json`, `accessibility.json`, and `accessibility.md`, plus `summary.json` and `summary.md`, under `tests/e2e/cypress/diagnostics/` |
+| `e2e-playwright-ubuntu-chromium` | `web-calculator/final.png`, `.webm` videos, trace-on-failure output, native JSON and HTML reports, `result.json`, `accessibility.json`, and accessibility summaries under `tests/e2e/playwright/test-results/` |
+| `e2e-oculix-ubuntu-chromium` | `oculix-web-calculator-diagnostics/result.png` |
+
+The Selenium, Cypress, and Playwright calculator reports enforce automated
+axe-core accessibility policy. Cypress also audits its smoke scenario.
+Incomplete findings remain visible for manual review; blocking violations
+fail the capability after the reports are written. Oculix currently supplies
+visual end-user evidence but no accessibility report.
+
+The Oculix hosted Chromium launch explicitly disables its browser sandbox
+because the Ubuntu runner's AppArmor policy otherwise makes Chromium abort.
+That exception is rejected outside GitHub Actions, and the fixture remains
+loopback-only. Cypress is pinned to Chrome; Electron is not an accepted
+catalog browser.
+
+### Troubleshooting
+
+- **No E2E jobs:** verify that the pull request has a `ci:e2e:*` label, or that
+  manual dispatch uses `smoke`, `full`, or a nonempty `custom` selection.
+- **Planner failure:** remove an unknown selector. With `custom`, provide only
+  exact capability IDs or exact labels, not preset or tool-wide selectors.
+- **A label added by automation did nothing:** the default `GITHUB_TOKEN`
+  suppresses recursive workflow events; explicitly dispatch the workflow or
+  use an appropriately authorized GitHub App token or personal access token.
+- **Transient browser startup or renderer timeout:** rerun the failed job once
+  on the same commit. Investigate repeated failures rather than changing the
+  selector.
+- **Missing artifact:** artifacts are retained for seven days. Check the
+  selected cell's `Validate reports and end-user result evidence` and
+  `Upload E2E evidence and diagnostics` steps; failed runs upload any
+  diagnostics that were produced.
+- **Unexpected cost:** inspect the planner summary before execution. It lists
+  every selected cell, runner, browser, cost class, and the maximum parallel
+  job count.
 
 ### Not yet built (backlog)
 
