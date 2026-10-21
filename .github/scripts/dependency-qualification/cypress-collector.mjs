@@ -3,10 +3,12 @@ import { createHash } from "node:crypto";
 import {
   cp,
   glob,
+  lstat,
   mkdtemp,
   readFile,
   readlink,
   readdir,
+  realpath,
   rm,
   stat,
   writeFile,
@@ -55,6 +57,19 @@ const SEMVER_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u;
 const PARTIAL_VERSION_PATTERN =
   /^(0|[1-9]\d*|[xX*])(?:\.(0|[1-9]\d*|[xX*]))?(?:\.(0|[1-9]\d*|[xX*]))?$/u;
+const CYPRESS_ACCESSIBILITY_POLICY = Object.freeze({
+  blockingViolationCount: 1,
+  incompleteBlocking: false,
+  levels: ["A", "AA"],
+  standards: ["WCAG 2.0", "WCAG 2.1", "WCAG 2.2"],
+  tags: [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "wcag22aa",
+  ],
+});
 
 function hash(value) {
   const contents = ArrayBuffer.isView(value)
@@ -117,9 +132,9 @@ function parseSemver(value, name = "version") {
     );
   }
   return {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
+    major: BigInt(match[1]),
+    minor: BigInt(match[2]),
+    patch: BigInt(match[3]),
     prerelease,
     version: value,
   };
@@ -146,7 +161,13 @@ function comparePrerelease(left, right) {
     const leftNumeric = /^\d+$/u.test(leftIdentifier);
     const rightNumeric = /^\d+$/u.test(rightIdentifier);
     if (leftNumeric && rightNumeric) {
-      return Number(leftIdentifier) - Number(rightIdentifier);
+      const leftNumber = BigInt(leftIdentifier);
+      const rightNumber = BigInt(rightIdentifier);
+      return leftNumber === rightNumber
+        ? 0
+        : leftNumber < rightNumber
+          ? -1
+          : 1;
     }
     if (leftNumeric !== rightNumeric) {
       return leftNumeric ? -1 : 1;
@@ -161,7 +182,7 @@ function compareVersions(left, right) {
   const rightVersion = parseSemver(right, "right version");
   for (const key of ["major", "minor", "patch"]) {
     if (leftVersion[key] !== rightVersion[key]) {
-      return leftVersion[key] - rightVersion[key];
+      return leftVersion[key] < rightVersion[key] ? -1 : 1;
     }
   }
   return comparePrerelease(
@@ -195,17 +216,17 @@ function partialBounds(value) {
   }
   const numbers = identifiers.map((identifier) =>
     identifier === undefined || /^[xX*]$/u.test(identifier)
-      ? 0
-      : Number(identifier),
+      ? 0n
+      : BigInt(identifier),
   );
   const minimum = `${numbers[0]}.${numbers[1]}.${numbers[2]}`;
   if (wildcardIndex === 0) {
     return { minimum: null, maximum: null };
   }
   const maximum = [...numbers];
-  maximum[wildcardIndex - 1] += 1;
+  maximum[wildcardIndex - 1] += 1n;
   for (let index = wildcardIndex; index < maximum.length; index += 1) {
-    maximum[index] = 0;
+    maximum[index] = 0n;
   }
   return {
     minimum,
@@ -277,22 +298,22 @@ function comparatorMatches(version, token) {
     return comparison <= 0;
   }
   if (operator === "~") {
-    const upper = `${parsed.major}.${parsed.minor + 1}.0`;
+    const upper = `${parsed.major}.${parsed.minor + 1n}.0`;
     return comparison >= 0 && compareVersions(version, upper) < 0;
   }
   const upper =
-    parsed.major > 0
-      ? `${parsed.major + 1}.0.0`
-      : parsed.minor > 0
-        ? `0.${parsed.minor + 1}.0`
-        : `0.0.${parsed.patch + 1}`;
+    parsed.major > 0n
+      ? `${parsed.major + 1n}.0.0`
+      : parsed.minor > 0n
+        ? `0.${parsed.minor + 1n}.0`
+        : `0.0.${parsed.patch + 1n}`;
   return comparison >= 0 && compareVersions(version, upper) < 0;
 }
 
 function satisfiesRange(version, range, name = "Node range") {
   parseSemver(version, "resolved Node version");
   assertNonemptyString(range, name);
-  return range.split(/\s*\|\|\s*/u).some((alternative) => {
+  const alternatives = range.split(/\s*\|\|\s*/u).map((alternative) => {
     if (alternative.length === 0) {
       throw new Error(`${name} contains an empty alternative`);
     }
@@ -306,8 +327,11 @@ function satisfiesRange(version, range, name = "Node range") {
       );
     }
     const tokens = alternative.trim().split(/\s+/u);
-    return tokens.every((token) => comparatorMatches(version, token));
+    return tokens
+      .map((token) => comparatorMatches(version, token))
+      .every(Boolean);
   });
+  return alternatives.some(Boolean);
 }
 
 function assertSemverRange(value, name) {
@@ -421,14 +445,25 @@ function binaryMetadata(raw, generatedAt, name) {
   }
   assertExactVersion(raw.version, `${name}.version`);
   assertAbsolutePath(raw.locator, `${name}.locator`);
+  assertAbsolutePath(raw.realpath, `${name}.realpath`);
   assertDigest(raw.digest, `${name}.digest`);
   return {
     version: raw.version,
+    locator: raw.locator,
+    realpath: raw.realpath,
+    digest: raw.digest,
     warnings: normalizeWarnings(raw.warnings, name),
     evidence: {
       type: "cypress-binary",
-      locator: raw.locator,
+      locator: raw.realpath,
       revision: raw.version,
+      digest: raw.digest,
+      observed_at: generatedAt,
+    },
+    locatorEvidence: {
+      type: "cypress-binary-locator",
+      locator: raw.locator,
+      revision: raw.realpath,
       digest: raw.digest,
       observed_at: generatedAt,
     },
@@ -439,10 +474,18 @@ function browserMetadata(raw, capability, generatedAt) {
   if (raw === null || raw === undefined) {
     return null;
   }
-  for (const key of ["browser", "runner", "os", "version", "path"]) {
+  for (const key of [
+    "browser",
+    "runner",
+    "os",
+    "version",
+    "path",
+    "realpath",
+  ]) {
     assertNonemptyString(raw[key], `browser evidence ${key}`);
   }
   assertAbsolutePath(raw.path, "browser evidence path");
+  assertAbsolutePath(raw.realpath, "browser evidence realpath");
   assertDigest(raw.digest, "browser evidence digest");
   return {
     browser: raw.browser.toLowerCase(),
@@ -450,12 +493,20 @@ function browserMetadata(raw, capability, generatedAt) {
     os: raw.os,
     version: raw.version,
     path: raw.path,
+    realpath: raw.realpath,
     digest: raw.digest,
     warnings: normalizeWarnings(raw.warnings, "browser evidence"),
     evidence: {
       type: "external-browser",
-      locator: raw.path,
+      locator: raw.realpath,
       revision: `${raw.browser.toLowerCase()}@${raw.version}`,
+      digest: raw.digest,
+      observed_at: generatedAt,
+    },
+    locatorEvidence: {
+      type: "external-browser-locator",
+      locator: raw.path,
+      revision: raw.realpath,
       digest: raw.digest,
       observed_at: generatedAt,
     },
@@ -701,6 +752,44 @@ async function repositoryIdentity(repositoryRoot) {
   };
 }
 
+async function inspectGitCheckout(repositoryRoot) {
+  const [{ stdout: revision }, { stdout: status }] = await Promise.all([
+    execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }),
+    execFileAsync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+      },
+    ),
+  ]);
+  return {
+    clean: status.length === 0,
+    revision: revision.trim(),
+  };
+}
+
+async function assertSourceCheckout(
+  repositoryRoot,
+  repository,
+  inspector,
+) {
+  const checkout = await inspector(repositoryRoot);
+  if (
+    checkout?.clean !== true ||
+    checkout?.revision !== repository.revision
+  ) {
+    throw new Error(
+      `Cypress qualification requires a clean source checkout at ` +
+        `${repository.revision}`,
+    );
+  }
+}
+
 function browserVersion(browserEvidence) {
   return browserEvidence
     .map(
@@ -759,6 +848,7 @@ function qualificationChecks({
       scope: "global",
       cwd: ".",
       path: cypressBinary.locator,
+      expected_realpath: cypressBinary.realpath,
       expected_digest: cypressBinary.digest,
       expected_version: cypressBinary.version,
       covers: ["package-binary", "immutable-binary-source"],
@@ -797,10 +887,22 @@ function qualificationChecks({
       arguments: ["ci", "--no-audit", "--no-fund"],
       cwd: PACKAGE_DIRECTORY,
       environment: {
-        CYPRESS_INSTALL_BINARY: cypressBinary.locator,
+        CYPRESS_INSTALL_BINARY: cypressBinary.realpath,
       },
       covers: ["candidate-install", "package-binary"],
       writes: [PACKAGE_DIRECTORY],
+    },
+    {
+      id: "cypress-install-provenance",
+      kind: "binary-provenance",
+      scope: "global",
+      cwd: PACKAGE_DIRECTORY,
+      expected_archive_locator: cypressBinary.locator,
+      expected_archive_realpath: cypressBinary.realpath,
+      expected_archive_digest: cypressBinary.digest,
+      expected_binary_version: cypressBinary.version,
+      covers: ["candidate-install", "immutable-binary-source"],
+      writes: [],
     },
     {
       id: "cypress-installed-binary",
@@ -813,8 +915,6 @@ function qualificationChecks({
       covers: ["package-binary"],
       expected_package_version: cypressBinary.version,
       expected_binary_version: cypressBinary.version,
-      expected_source_digest: cypressBinary.digest,
-      expected_source_locator: cypressBinary.locator,
       writes: [],
     },
     {
@@ -846,13 +946,14 @@ function qualificationChecks({
       id: `${capability.id}-external-browser`,
       kind: "browser-evidence",
       scope: capability.id,
-      command: capability.browser_evidence.path,
+      command: capability.browser_evidence.realpath,
       arguments: ["--version"],
       cwd: ".",
       environment: {},
       expected_browser: capability.browser,
+      expected_alias: capability.browser_evidence.path,
       expected_digest: capability.browser_evidence.digest,
-      expected_path: capability.browser_evidence.path,
+      expected_realpath: capability.browser_evidence.realpath,
       expected_version: capability.browser_evidence.version,
       covers: ["external-browser"],
       writes: [],
@@ -871,9 +972,9 @@ function qualificationChecks({
         ],
         cwd: ".",
         environment: {
-          CHROME_BIN: capability.browser_evidence.path,
-          CYPRESS_BROWSER_PATH: capability.browser_evidence.path,
-          CYPRESS_INSTALL_BINARY: cypressBinary.locator,
+          CHROME_BIN: capability.browser_evidence.realpath,
+          CYPRESS_BROWSER_PATH: capability.browser_evidence.realpath,
+          CYPRESS_INSTALL_BINARY: cypressBinary.realpath,
           E2E_BROWSER: capability.browser,
           E2E_OS: capability.os,
         },
@@ -945,9 +1046,11 @@ function qualificationPlan({
     ) ?? lockPackage(currentLock, "cypress").version;
   const binary = {
     version: cypressBinaryVersion,
-    locator: cypressBinary.evidence.locator,
+    locator: cypressBinary.locator,
+    realpath: cypressBinary.realpath,
     digest: cypressBinary.evidence.digest,
     evidence: structuredClone(cypressBinary.evidence),
+    locator_evidence: structuredClone(cypressBinary.locatorEvidence),
   };
   const selectedCapabilities = capabilities.map((capability) => {
     const externalBrowser = browserEvidence.find(
@@ -968,10 +1071,18 @@ function qualificationPlan({
       required_files: [...capability.required_files],
       result_reports: [...capability.result_reports],
       require_accessibility: capability.require_accessibility,
+      accessibility_policy: capability.require_accessibility
+        ? structuredClone(CYPRESS_ACCESSIBILITY_POLICY)
+        : null,
       browser_evidence: {
         path: externalBrowser.path,
+        realpath: externalBrowser.realpath,
         version: externalBrowser.version,
         digest: externalBrowser.digest,
+        evidence: structuredClone(externalBrowser.evidence),
+        locator_evidence: structuredClone(
+          externalBrowser.locatorEvidence,
+        ),
       },
     };
   });
@@ -1219,7 +1330,10 @@ export async function collectCypressCohort({
       ? null
       : {
           version: candidateBinary.value.version,
-          evidence: [candidateBinary.value.evidence],
+          evidence: [
+            candidateBinary.value.evidence,
+            candidateBinary.value.locatorEvidence,
+          ],
         };
   const candidateCount = [
     cypressCandidate,
@@ -1297,6 +1411,9 @@ export async function collectCypressCohort({
           evidence: [
             currentBinary.value?.evidence ??
               packageLockEvidence(lock, "cypress", generatedAt),
+            ...(currentBinary.value?.locatorEvidence === undefined
+              ? []
+              : [currentBinary.value.locatorEvidence]),
           ],
         },
         ecosystem: "cypress-binary",
@@ -1321,7 +1438,10 @@ export async function collectCypressCohort({
           evidence:
             browserValues.length === 0
               ? [catalogFileEvidence]
-              : browserValues.map(({ evidence }) => evidence),
+              : browserValues.flatMap(({ evidence, locatorEvidence }) => [
+                  evidence,
+                  locatorEvidence,
+                ]),
         },
         ecosystem: "runner",
         id: "cypress-external-browser",
@@ -1508,19 +1628,32 @@ function binaryMetadataFromPlan(observation, plan) {
   const evidence = record.evidence.find(
     ({ type }) => type === "cypress-binary",
   );
+  const locatorEvidence = record.evidence.find(
+    ({ type }) => type === "cypress-binary-locator",
+  );
   if (
     evidence === undefined ||
+    locatorEvidence === undefined ||
     plan.cypress_binary.version !== record.version ||
-    plan.cypress_binary.locator !== evidence.locator ||
+    plan.cypress_binary.locator !== locatorEvidence.locator ||
+    plan.cypress_binary.realpath !== evidence.locator ||
+    locatorEvidence.revision !== evidence.locator ||
+    locatorEvidence.digest !== evidence.digest ||
     plan.cypress_binary.digest !== evidence.digest ||
     JSON.stringify(stableValue(plan.cypress_binary.evidence)) !==
-      JSON.stringify(stableValue(evidence))
+      JSON.stringify(stableValue(evidence)) ||
+    JSON.stringify(stableValue(plan.cypress_binary.locator_evidence)) !==
+      JSON.stringify(stableValue(locatorEvidence))
   ) {
     throw new Error("Cypress qualification binary metadata was mutated");
   }
   return {
     version: record.version,
+    locator: locatorEvidence.locator,
+    realpath: evidence.locator,
+    digest: evidence.digest,
     evidence: structuredClone(evidence),
+    locatorEvidence: structuredClone(locatorEvidence),
     warnings: [],
   };
 }
@@ -1535,12 +1668,26 @@ function browserMetadataFromPlan(observation, plan) {
     const evidence = component.current.evidence.find(
       (item) =>
         item.type === "external-browser" &&
-        item.revision === `${capability.browser}@${browser.version}`,
+        item.revision === `${capability.browser}@${browser.version}` &&
+        item.locator === browser.realpath,
+    );
+    const locatorEvidence = component.current.evidence.find(
+      (item) =>
+        item.type === "external-browser-locator" &&
+        item.locator === browser.path &&
+        item.revision === browser.realpath,
     );
     if (
       evidence === undefined ||
-      evidence.locator !== browser.path ||
-      evidence.digest !== browser.digest
+      locatorEvidence === undefined ||
+      evidence.locator !== browser.realpath ||
+      locatorEvidence.revision !== browser.realpath ||
+      locatorEvidence.digest !== evidence.digest ||
+      evidence.digest !== browser.digest ||
+      JSON.stringify(stableValue(browser.evidence)) !==
+        JSON.stringify(stableValue(evidence)) ||
+      JSON.stringify(stableValue(browser.locator_evidence)) !==
+        JSON.stringify(stableValue(locatorEvidence))
     ) {
       throw new Error(
         `Cypress qualification browser metadata for ` +
@@ -1553,9 +1700,11 @@ function browserMetadataFromPlan(observation, plan) {
       os: capability.os,
       version: browser.version,
       path: browser.path,
+      realpath: browser.realpath,
       digest: browser.digest,
       warnings: [],
       evidence: structuredClone(evidence),
+      locatorEvidence: structuredClone(locatorEvidence),
       capabilityId: capability.id,
     };
   });
@@ -1771,6 +1920,71 @@ function verifyLock(plan, workspaceRoot) {
   });
 }
 
+async function verifyBinaryInstallProvenance(
+  check,
+  workspaceRoot,
+  checkResults,
+) {
+  const install = checkResults.find(
+    ({ id }) => id === "cypress-candidate-install",
+  );
+  if (
+    install?.status !== "pass" ||
+    install.environment?.CYPRESS_INSTALL_BINARY !==
+      check.expected_archive_realpath
+  ) {
+    throw new Error(
+      "Cypress install did not use the reviewed binary archive",
+    );
+  }
+  const archiveRealpath = await realpath(
+    check.expected_archive_locator,
+  );
+  const archiveDigest = hash(await readFile(archiveRealpath));
+  if (
+    archiveRealpath !== check.expected_archive_realpath ||
+    archiveDigest !== check.expected_archive_digest
+  ) {
+    throw new Error(
+      "Installed Cypress binary archive provenance does not match review",
+    );
+  }
+  const packageRoot = repositoryPath(workspaceRoot, PACKAGE_DIRECTORY);
+  const cachePath = join(packageRoot, ".cypress-cache");
+  const cacheLink = await lstat(cachePath);
+  if (cacheLink.isSymbolicLink()) {
+    throw new Error("Cypress binary cache must not be a symbolic link");
+  }
+  const [resolvedPackage, resolvedCache] = await Promise.all([
+    realpath(packageRoot),
+    realpath(cachePath),
+  ]);
+  if (!isWithin(resolvedPackage, resolvedCache)) {
+    throw new Error("Cypress binary cache escaped the package workspace");
+  }
+  const cacheEntries = (await treeEntries(resolvedCache)).sort(
+    ([left], [right]) => left.localeCompare(right),
+  );
+  if (
+    !cacheEntries.some(
+      ([path, value]) =>
+        path.startsWith(`${check.expected_binary_version}/`) &&
+        value.startsWith("sha256:"),
+    )
+  ) {
+    throw new Error(
+      "Cypress install produced no observed binary cache files",
+    );
+  }
+  return {
+    archive_digest: archiveDigest,
+    archive_locator: check.expected_archive_locator,
+    archive_realpath: archiveRealpath,
+    binary_version: check.expected_binary_version,
+    cache_digest: metadataDigest(cacheEntries),
+  };
+}
+
 function assertPackageArtifactPath(path, name, { allowGlob = false } = {}) {
   assertNonemptyString(path, name);
   const normalized = path.replaceAll("\\", "/");
@@ -1795,11 +2009,28 @@ async function readNonemptyWorkspaceFile(
   if (!isWithin(workspaceRoot, absolute)) {
     throw new Error(`${name} escapes the ephemeral workspace`);
   }
-  const metadata = await stat(absolute);
+  const linkMetadata = await lstat(absolute);
+  if (linkMetadata.isSymbolicLink()) {
+    throw new Error(`${name} must not be a symbolic link`);
+  }
+  const [resolvedWorkspace, resolvedPackage, resolvedFile] =
+    await Promise.all([
+      realpath(workspaceRoot),
+      realpath(repositoryPath(workspaceRoot, PACKAGE_DIRECTORY)),
+      realpath(absolute),
+    ]);
+  if (
+    !isWithin(resolvedWorkspace, resolvedFile) ||
+    !isWithin(resolvedPackage, resolvedFile) ||
+    resolvedFile !== resolve(absolute)
+  ) {
+    throw new Error(`${name} escapes the ephemeral package workspace`);
+  }
+  const metadata = await stat(resolvedFile);
   if (!metadata.isFile() || metadata.size === 0) {
     throw new Error(`${name} must be a nonempty file`);
   }
-  return readFile(absolute);
+  return readFile(resolvedFile);
 }
 
 async function readWorkspaceJson(workspaceRoot, path, name = path) {
@@ -1842,16 +2073,63 @@ function nestedArtifactPaths(value, paths = []) {
   return paths;
 }
 
-function violationRuleCount(report) {
-  const violations = report.accessibility?.counts?.violations;
-  return typeof violations === "number"
-    ? violations
-    : violations?.rules;
+const ACCESSIBILITY_CATEGORIES = [
+  "incomplete",
+  "inapplicable",
+  "passes",
+  "violations",
+];
+
+function emptyAccessibilityCounts() {
+  return Object.fromEntries(
+    ACCESSIBILITY_CATEGORIES.map((category) => [
+      category,
+      { nodes: 0, rules: 0 },
+    ]),
+  );
+}
+
+function findingCounts(findings, name) {
+  if (!Array.isArray(findings)) {
+    throw new Error(`${name} must be an array`);
+  }
+  let nodes = 0;
+  for (const [index, finding] of findings.entries()) {
+    if (
+      finding === null ||
+      typeof finding !== "object" ||
+      !Array.isArray(finding.nodes)
+    ) {
+      throw new Error(`${name}[${index}].nodes must be an array`);
+    }
+    nodes += finding.nodes.length;
+  }
+  return { nodes, rules: findings.length };
+}
+
+function assertAccessibilityCounts(actual, expected, name) {
+  if (
+    actual === null ||
+    typeof actual !== "object" ||
+    ACCESSIBILITY_CATEGORIES.some(
+      (category) =>
+        !Number.isSafeInteger(actual[category]?.nodes) ||
+        actual[category].nodes < 0 ||
+        !Number.isSafeInteger(actual[category]?.rules) ||
+        actual[category].rules < 0 ||
+        actual[category].nodes !== expected[category].nodes ||
+        actual[category].rules !== expected[category].rules,
+    )
+  ) {
+    throw new Error(`${name} does not match raw axe findings`);
+  }
 }
 
 async function validateAccessibilityArtifact({
   axeVersion,
+  expectedPolicy,
   path,
+  reportAccessibility,
   scenario,
   workspaceRoot,
 }) {
@@ -1866,12 +2144,68 @@ async function validateAccessibilityArtifact({
     accessibility.scenario !== scenario ||
     accessibility.axeCoreVersion !== axeVersion ||
     !Array.isArray(accessibility.audits) ||
-    accessibility.audits.length === 0
+    accessibility.audits.length === 0 ||
+    accessibility.policy === null ||
+    typeof accessibility.policy !== "object" ||
+    JSON.stringify(stableValue(accessibility.policy)) !==
+      JSON.stringify(stableValue(expectedPolicy)) ||
+    JSON.stringify(stableValue(reportAccessibility?.policy)) !==
+      JSON.stringify(stableValue(expectedPolicy))
   ) {
     throw new Error(
       `${scenario} accessibility JSON does not match the candidate run`,
     );
   }
+  const aggregate = emptyAccessibilityCounts();
+  const states = [];
+  for (const [index, audit] of accessibility.audits.entries()) {
+    assertNonemptyString(
+      audit?.state,
+      `${scenario} accessibility audit ${index} state`,
+    );
+    states.push(audit.state);
+    const expected = emptyAccessibilityCounts();
+    for (const category of ACCESSIBILITY_CATEGORIES) {
+      expected[category] = findingCounts(
+        audit.result?.[category],
+        `${scenario} accessibility audit ${index} ${category}`,
+      );
+      aggregate[category].nodes += expected[category].nodes;
+      aggregate[category].rules += expected[category].rules;
+    }
+    assertAccessibilityCounts(
+      audit.counts,
+      expected,
+      `${scenario} accessibility audit ${index} counts`,
+    );
+  }
+  assertAccessibilityCounts(
+    reportAccessibility?.counts,
+    aggregate,
+    `${scenario} run accessibility counts`,
+  );
+  if (
+    JSON.stringify(reportAccessibility?.audits) !==
+      JSON.stringify(states) ||
+    !Number.isSafeInteger(accessibility.policy.blockingViolationCount) ||
+    accessibility.policy.blockingViolationCount < 1
+  ) {
+    throw new Error(
+      `${scenario} run accessibility summary does not match raw audits`,
+    );
+  }
+  const blocking =
+    aggregate.violations.rules >=
+    accessibility.policy.blockingViolationCount;
+  if (
+    reportAccessibility.status !== (blocking ? "failed" : "passed") ||
+    reportAccessibility.blocking !== blocking
+  ) {
+    throw new Error(
+      `${scenario} run accessibility policy result is inconsistent`,
+    );
+  }
+  return { aggregate, blocking, states };
 }
 
 async function validateRequiredArtifacts(capability, workspaceRoot) {
@@ -1999,9 +2333,9 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
     if (
       capability.require_accessibility &&
       (report.accessibility?.status !== "passed" ||
+        report.accessibility?.blocking !== false ||
         !Array.isArray(report.accessibility?.audits) ||
-        report.accessibility.audits.length === 0 ||
-        violationRuleCount(report) !== 0)
+        report.accessibility.audits.length === 0)
     ) {
       throw new Error(
         `${reportPath} lacks passing accessibility evidence`,
@@ -2019,7 +2353,9 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
     if (capability.require_accessibility) {
       await validateAccessibilityArtifact({
         axeVersion: packageVersions["axe-core"],
+        expectedPolicy: capability.accessibility_policy,
         path: report.artifacts?.accessibilityJson,
+        reportAccessibility: report.accessibility,
         scenario: report.scenario,
         workspaceRoot,
       });
@@ -2101,11 +2437,25 @@ function commandEvidence(check, revision, output, startedAt, completedAt) {
 }
 
 export function detectCypressWarnings(output) {
+  const completeOutput = output.trim();
+  if (completeOutput.length > 0) {
+    try {
+      return sortedUnique(structuredWarnings(JSON.parse(completeOutput)));
+    } catch {
+      // Mixed or unstructured command output is processed line by line.
+    }
+  }
   const warnings = [];
   for (const rawLine of output.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (line.length === 0) {
       continue;
+    }
+    try {
+      warnings.push(...structuredWarnings(JSON.parse(line)));
+      continue;
+    } catch {
+      // Continue with text detection for non-JSON command output.
     }
     if (
       /\bwarn(?:ing)?s?\b/iu.test(line) ||
@@ -2113,11 +2463,6 @@ export function detectCypressWarnings(output) {
       /^::warning(?:\s|::)/iu.test(line)
     ) {
       warnings.push(line);
-    }
-    try {
-      warnings.push(...structuredWarnings(JSON.parse(line)));
-    } catch {
-      // Text warning detection above covers non-JSON command output.
     }
   }
   return sortedUnique(warnings);
@@ -2159,6 +2504,20 @@ function structuredWarnings(value, { warningContext = false } = {}) {
     warnings.push(warningDescription(value));
   }
   for (const [key, entry] of Object.entries(value)) {
+    if (/^warnings?count$/iu.test(key)) {
+      const numericCount =
+        typeof entry === "number" && Number.isSafeInteger(entry)
+          ? BigInt(entry)
+          : typeof entry === "string" && /^\d+$/u.test(entry)
+            ? BigInt(entry)
+            : null;
+      if (numericCount === null || numericCount < 0n) {
+        warnings.push(`${key}: invalid`);
+      } else if (numericCount > 0n) {
+        warnings.push(`${key}: ${entry}`);
+      }
+      continue;
+    }
     if (
       /^(?:(?:deprecation|experimental)?warnings?)$/iu.test(key)
     ) {
@@ -2179,12 +2538,14 @@ function structuredWarnings(value, { warningContext = false } = {}) {
 function checkBinding(check, {
   digest,
   locator,
+  realpath: resolvedPath,
   version,
 }) {
   if (check.kind === "file-evidence") {
     return {
       digest,
       locator,
+      realpath: resolvedPath,
       version: check.expected_version,
     };
   }
@@ -2192,13 +2553,12 @@ function checkBinding(check, {
     return {
       digest,
       locator,
+      realpath: resolvedPath,
       version,
     };
   }
   if (check.kind === "binary-evidence") {
     return {
-      digest: check.expected_source_digest,
-      locator: check.expected_source_locator,
       version,
     };
   }
@@ -2215,20 +2575,20 @@ function expectedCheckBinding(check) {
     return {
       digest: check.expected_digest,
       locator: check.path,
+      realpath: check.expected_realpath,
       version: check.expected_version,
     };
   }
   if (check.kind === "browser-evidence") {
     return {
       digest: check.expected_digest,
-      locator: check.expected_path,
+      locator: check.expected_alias,
+      realpath: check.expected_realpath,
       version: check.expected_version,
     };
   }
   if (check.kind === "binary-evidence") {
     return {
-      digest: check.expected_source_digest,
-      locator: check.expected_source_locator,
       version: check.expected_binary_version,
     };
   }
@@ -2248,8 +2608,10 @@ async function runCommandCheck(check, {
   const startedAt = new Date().toISOString();
   if (check.kind === "file-evidence") {
     let actualDigest = null;
+    let actualRealpath = null;
     try {
-      actualDigest = hash(await readFile(check.path));
+      actualRealpath = await realpath(check.path);
+      actualDigest = hash(await readFile(actualRealpath));
     } catch {
       // The failed binding below is recorded as qualification evidence.
     }
@@ -2257,10 +2619,14 @@ async function runCommandCheck(check, {
     const binding = checkBinding(check, {
       digest: actualDigest,
       locator: check.path,
+      realpath: actualRealpath,
     });
     return {
       status:
-        actualDigest === check.expected_digest ? "pass" : "fail",
+        actualRealpath === check.expected_realpath &&
+        actualDigest === check.expected_digest
+          ? "pass"
+          : "fail",
       warnings: [],
       binding,
       evidence: [
@@ -2275,9 +2641,13 @@ async function runCommandCheck(check, {
     };
   }
   try {
+    const executableRealpath =
+      check.kind === "browser-evidence"
+        ? await realpath(check.expected_alias)
+        : null;
     const executableDigest =
       check.kind === "browser-evidence"
-        ? hash(await readFile(check.expected_path))
+        ? hash(await readFile(executableRealpath))
         : null;
     const { stdout, stderr } = await execFileAsync(
       check.command,
@@ -2320,8 +2690,9 @@ async function runCommandCheck(check, {
       digest: executableDigest,
       locator:
         check.kind === "browser-evidence"
-          ? check.expected_path
+          ? check.expected_alias
           : check.expected_source_locator,
+      realpath: executableRealpath,
       version: outputVersion,
     });
     return {
@@ -2330,7 +2701,9 @@ async function runCommandCheck(check, {
         browserVersionMissing ||
         nodeVersionMismatch ||
         (check.kind === "browser-evidence" &&
-          executableDigest !== check.expected_digest)
+          (executableRealpath !== check.expected_realpath ||
+            check.command !== check.expected_realpath ||
+            executableDigest !== check.expected_digest))
           ? "fail"
           : "pass",
       warnings: detectCypressWarnings(output),
@@ -2463,6 +2836,7 @@ export async function qualifyCypressCandidate(
     environment = process.env,
     executeCheck,
     generatedAt = new Date().toISOString(),
+    inspectSourceCheckout = inspectGitCheckout,
     materializeWorkspace = copyRepository,
     repositoryRoot = DEFAULT_REPOSITORY_ROOT,
   } = {},
@@ -2475,6 +2849,11 @@ export async function qualifyCypressCandidate(
     throw new Error("Cypress qualification requires an available candidate");
   }
   const root = resolve(repositoryRoot);
+  await assertSourceCheckout(
+    root,
+    observation.repository,
+    inspectSourceCheckout,
+  );
   const plan = await validateQualificationPrescription(
     collection,
     root,
@@ -2488,6 +2867,11 @@ export async function qualifyCypressCandidate(
   let result;
   let workError;
   try {
+    await assertSourceCheckout(
+      root,
+      observation.repository,
+      inspectSourceCheckout,
+    );
     await materializeWorkspace(root, workspaceRoot);
     const outsideBefore = await outsideBoundaryDigest(
       workspaceRoot,
@@ -2497,7 +2881,29 @@ export async function qualifyCypressCandidate(
     const checkResults = [];
     for (const check of plan.checks) {
       let raw;
-      if (check.kind === "lock-evidence") {
+      if (check.id === "cypress-candidate-install") {
+        await rm(
+          join(
+            repositoryPath(workspaceRoot, PACKAGE_DIRECTORY),
+            ".cypress-cache",
+          ),
+          { force: true, recursive: true },
+        );
+      }
+      if (
+        check.kind === "file-evidence" ||
+        check.kind === "browser-evidence"
+      ) {
+        raw = await runCommandCheck(check, {
+          environment: effectiveCheckEnvironment(
+            environment,
+            workspaceRoot,
+            check.environment,
+          ),
+          revision: observation.repository.revision,
+          workspaceRoot,
+        });
+      } else if (check.kind === "lock-evidence") {
         const startedAt = new Date().toISOString();
         try {
           await verifyLock(plan, workspaceRoot);
@@ -2510,6 +2916,44 @@ export async function qualifyCypressCandidate(
                 check,
                 observation.repository.revision,
                 "lock evidence matched",
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        } catch (error) {
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "fail",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                error.message,
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        }
+      } else if (check.kind === "binary-provenance") {
+        const startedAt = new Date().toISOString();
+        try {
+          const provenance = await verifyBinaryInstallProvenance(
+            check,
+            workspaceRoot,
+            checkResults,
+          );
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "pass",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                JSON.stringify(provenance),
                 startedAt,
                 completedAt,
               ),
@@ -2667,6 +3111,11 @@ export async function qualifyCypressCandidate(
   if (initialSource !== finalSource) {
     throw new Error("Cypress qualification mutated the source repository");
   }
+  await assertSourceCheckout(
+    root,
+    observation.repository,
+    inspectSourceCheckout,
+  );
   if (workError !== undefined) {
     throw workError;
   }

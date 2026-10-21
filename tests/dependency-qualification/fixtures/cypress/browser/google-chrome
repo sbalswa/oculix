@@ -1,0 +1,2 @@
+#!/bin/sh
+printf '%s\n' 'Google Chrome 141.0.7390.54'
