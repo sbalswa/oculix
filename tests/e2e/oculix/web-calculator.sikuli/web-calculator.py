@@ -126,6 +126,11 @@ try:
             % (EXPECTED_RESULT, text)
         )
 
+    evidence = screen.capture().getFile(
+        os.environ["OCULIX_WEB_CALCULATOR_DIAGNOSTICS"],
+        "result",
+    )
+    print("web-calculator: end-user result evidence = %s" % evidence)
     print(
         "web-calculator: %s verified clear, 7 * 34 = %s"
         % (selected_capability, EXPECTED_RESULT)

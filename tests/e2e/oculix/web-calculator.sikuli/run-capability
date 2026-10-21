@@ -178,7 +178,8 @@ printf 'chromium_sandbox=%s\n' "$chromium_sandbox" |
 browser_pid=$!
 
 for _ in {1..100}; do
-  if [[ -s "$readiness_file" ]]; then
+  if [[ -s "$readiness_file" ]] ||
+    grep -q '^DevTools listening on ' "$browser_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$browser_pid" 2>/dev/null; then
@@ -189,7 +190,8 @@ for _ in {1..100}; do
   fi
   sleep 0.1
 done
-if [[ ! -s "$readiness_file" ]]; then
+if [[ ! -s "$readiness_file" ]] &&
+  ! grep -q '^DevTools listening on ' "$browser_log" 2>/dev/null; then
   record_diagnostic \
     "browser-launch-error.txt" \
     "Chromium did not become ready within 10 seconds."

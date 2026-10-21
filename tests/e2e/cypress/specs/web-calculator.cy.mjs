@@ -10,5 +10,6 @@ describe("Web calculator", () => {
     cy.get('button[aria-label="Equals"]').click();
 
     cy.get('[aria-label="Calculator display"]').should("have.text", "238");
+    cy.screenshot("result", { capture: "viewport" });
   });
 });

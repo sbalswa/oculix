@@ -5,7 +5,7 @@ export default defineConfig({
   screenshotOnRunFailure: true,
   screenshotsFolder: "diagnostics/screenshots",
   trashAssetsBeforeRuns: true,
-  video: false,
+  video: true,
   videosFolder: "diagnostics/videos",
   e2e: {
     specPattern: "specs/**/*.cy.mjs",

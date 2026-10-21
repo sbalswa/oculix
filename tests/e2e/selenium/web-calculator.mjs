@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdir, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 import { By, until } from "selenium-webdriver";
 
 import { runScenario } from "./harness.mjs";
+import { DIAGNOSTICS_DIRECTORY } from "./runtime.mjs";
 
 const url = process.env.WEB_CALCULATOR_URL;
 assert.ok(
@@ -35,5 +38,13 @@ await runScenario("web-calculator", async (driver) => {
 
   await driver.wait(until.elementTextIs(display, "238"), 5_000);
   assert.equal(await display.getText(), "238");
+  const evidenceDirectory = resolve(
+    DIAGNOSTICS_DIRECTORY,
+    "web-calculator",
+  );
+  const evidencePath = resolve(evidenceDirectory, "result.png");
+  await mkdir(evidenceDirectory, { recursive: true });
+  await writeFile(evidencePath, await driver.takeScreenshot(), "base64");
+  console.log(`Selenium end-user result evidence: ${evidencePath}`);
   console.log("Selenium web calculator scenario passed: 7 × 34 = 238.");
 });
