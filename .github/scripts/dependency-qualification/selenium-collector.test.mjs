@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createServer } from "node:https";
 import {
   access,
   cp,
@@ -11,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   collectSeleniumObservation,
@@ -38,6 +42,11 @@ const REPOSITORY = {
   name: "sbalswa/oculix",
   revision: REVISION,
 };
+const execFileAsync = promisify(execFile);
+
+function digest(value) {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
 
 async function fixture(name) {
   return JSON.parse(await readFile(new URL(name, FIXTURE_ROOT), "utf8"));
@@ -55,8 +64,41 @@ async function createRepository() {
     join(root, "tests", "e2e", "capabilities.json"),
   );
   await writeFile(join(root, "README.md"), "unchanged\n", "utf8");
+  const executableRoot = join(root, "runner-bin");
+  await mkdir(executableRoot);
+  const browserPath = join(executableRoot, "chromium");
+  const driverPath = join(executableRoot, "chromedriver");
+  const browserContent = "#!/bin/sh\nprintf 'Chromium 141.0.7390.54\\n'\n";
+  const driverContent = "#!/bin/sh\nprintf 'ChromeDriver 141.0.7390.54\\n'\n";
+  await Promise.all([
+    writeFile(browserPath, browserContent, { mode: 0o755 }),
+    writeFile(driverPath, driverContent, { mode: 0o755 }),
+  ]);
   return {
     root,
+    runnerEvidence: {
+      runner: "ubuntu-latest",
+      browser: {
+        name: "chromium",
+        version: "141.0.7390.54",
+        compatibility_key: "141.0.7390",
+        locator: "https://github.com/actions/runner-images/commit/browser",
+        digest: `sha256:${"b".repeat(64)}`,
+        path: browserPath,
+        realpath: browserPath,
+        executable_digest: digest(browserContent),
+      },
+      driver: {
+        name: "chromedriver",
+        version: "141.0.7390.54",
+        compatibility_key: "141.0.7390",
+        locator: "https://github.com/actions/runner-images/commit/driver",
+        digest: `sha256:${"d".repeat(64)}`,
+        path: driverPath,
+        realpath: driverPath,
+        executable_digest: digest(driverContent),
+      },
+    },
     async cleanup() {
       await rm(root, { force: true, recursive: true });
     },
@@ -80,6 +122,13 @@ async function collectCandidate(repositoryRoot, overrides = {}) {
   return collectSeleniumObservation(
     await candidateInputs(repositoryRoot, overrides),
   );
+}
+
+async function collectQualificationCandidate(repository, overrides = {}) {
+  return collectCandidate(repository.root, {
+    runnerEvidence: repository.runnerEvidence,
+    ...overrides,
+  });
 }
 
 function component(observation, id) {
@@ -108,6 +157,212 @@ function rawResult({ stdout = "", stderr = "", exitCode = 0 } = {}) {
   };
 }
 
+async function executeRaw(step, context) {
+  const packageCommand = new Set([
+    "cache-selenium-axe-tarball",
+    "cache-selenium-webdriver-tarball",
+    "apply-selenium-tarballs",
+    "install-selenium-candidate",
+  ]).has(step.id);
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      step.command,
+      step.arguments,
+      {
+        cwd: packageCommand
+          ? context.packageRoot
+          : context.workspaceRoot,
+        encoding: "utf8",
+        env: context.environment,
+        maxBuffer: 10 * 1024 * 1024,
+      },
+    );
+    return rawResult({ stdout, stderr });
+  } catch (error) {
+    return rawResult({
+      exitCode: Number.isInteger(error.code) ? error.code : 1,
+      stdout: error.stdout ?? "",
+      stderr: error.stderr ?? error.message,
+    });
+  }
+}
+
+async function packLocalCandidate(root, packageJson, extras = {}) {
+  const packageRoot = join(root, packageJson.name.replaceAll("/", "-"));
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    `${JSON.stringify(packageJson, null, 2)}\n`,
+  );
+  await writeFile(
+    join(packageRoot, "index.js"),
+    `export const packageName = ${JSON.stringify(packageJson.name)};\n`,
+  );
+  for (const [path, value] of Object.entries(extras)) {
+    const target = join(packageRoot, path);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, value);
+  }
+  const { stdout } = await execFileAsync(
+    "npm",
+    ["pack", "--pack-destination", root, "--json"],
+    { cwd: packageRoot, encoding: "utf8" },
+  );
+  const [{ filename }] = JSON.parse(stdout);
+  return {
+    filename,
+    content: await readFile(join(root, filename)),
+  };
+}
+
+async function localNpmCandidates() {
+  const root = await mkdtemp(join(tmpdir(), "selenium-local-npm-"));
+  const keyPath = join(root, "key.pem");
+  const certificatePath = join(root, "certificate.pem");
+  await execFileAsync("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-nodes",
+    "-keyout",
+    keyPath,
+    "-out",
+    certificatePath,
+    "-days",
+    "1",
+    "-subj",
+    "/CN=127.0.0.1",
+    "-addext",
+    "subjectAltName=IP:127.0.0.1",
+  ]);
+  const axeCorePackage = {
+    name: "axe-core",
+    version: "4.15.0",
+    type: "module",
+  };
+  const axeCore = await packLocalCandidate(root, axeCorePackage);
+  const axe = await packLocalCandidate(root, {
+    name: "@axe-core/webdriverjs",
+    version: "4.15.0",
+    type: "module",
+    dependencies: { "axe-core": "~4.15.0" },
+    peerDependencies: { "selenium-webdriver": ">=4.40.0" },
+    engines: { node: ">=24.0.0" },
+  });
+  const selenium = await packLocalCandidate(root, {
+    name: "selenium-webdriver",
+    version: "4.52.0",
+    type: "module",
+    engines: { node: ">=24.0.0" },
+  });
+  const tarballs = new Map([
+    [`/${axeCore.filename}`, axeCore.content],
+    [`/${axe.filename}`, axe.content],
+    [`/${selenium.filename}`, selenium.content],
+  ]);
+  const packuments = new Map();
+  const server = createServer(
+    {
+      key: await readFile(keyPath),
+      cert: await readFile(certificatePath),
+    },
+    (request, response) => {
+      const content = tarballs.get(request.url);
+      if (content !== undefined) {
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "content-length": content.length,
+        });
+        response.end(content);
+        return;
+      }
+      const packument = packuments.get(request.url);
+      if (packument === undefined) {
+        response.writeHead(404).end();
+        return;
+      }
+      const body = Buffer.from(JSON.stringify(packument));
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": body.length,
+      });
+      response.end(body);
+    },
+  );
+  await new Promise((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const { port } = server.address();
+  const metadata = {
+    "@axe-core/webdriverjs": {
+      name: "@axe-core/webdriverjs",
+      version: "4.15.0",
+      dist: {
+        tarball: `https://127.0.0.1:${port}/${axe.filename}`,
+        integrity: `sha512-${createHash("sha512").update(axe.content).digest("base64")}`,
+      },
+      dependencies: { "axe-core": "~4.15.0" },
+      engines: { node: ">=24.0.0" },
+      peerDependencies: { "selenium-webdriver": ">=4.40.0" },
+    },
+    "selenium-webdriver": {
+      name: "selenium-webdriver",
+      version: "4.52.0",
+      dist: {
+        tarball: `https://127.0.0.1:${port}/${selenium.filename}`,
+        integrity: `sha512-${createHash("sha512").update(selenium.content).digest("base64")}`,
+      },
+      engines: { node: ">=24.0.0" },
+    },
+  };
+  const axePackument = {
+    name: "@axe-core/webdriverjs",
+    "dist-tags": { latest: "4.15.0" },
+    versions: {
+      "4.15.0": metadata["@axe-core/webdriverjs"],
+    },
+  };
+  for (const path of [
+    "/@axe-core%2fwebdriverjs",
+    "/@axe-core%2Fwebdriverjs",
+    "/@axe-core/webdriverjs",
+  ]) {
+    packuments.set(path, axePackument);
+  }
+  packuments.set("/selenium-webdriver", {
+    name: "selenium-webdriver",
+    "dist-tags": { latest: "4.52.0" },
+    versions: {
+      "4.52.0": metadata["selenium-webdriver"],
+    },
+  });
+  packuments.set("/axe-core", {
+    name: "axe-core",
+    "dist-tags": { latest: "4.15.0" },
+    versions: {
+      "4.15.0": {
+        ...axeCorePackage,
+        dist: {
+          tarball: `https://127.0.0.1:${port}/${axeCore.filename}`,
+          integrity: `sha512-${createHash("sha512").update(axeCore.content).digest("base64")}`,
+        },
+      },
+    },
+  });
+  return {
+    metadata,
+    async cleanup() {
+      await new Promise((resolvePromise, rejectPromise) =>
+        server.close((error) =>
+          error === undefined ? resolvePromise() : rejectPromise(error)),
+      );
+      await rm(root, { force: true, recursive: true });
+    },
+  };
+}
+
 async function materializeInstalledPackages(packageRoot) {
   for (const [name, version] of [
     ["@axe-core/webdriverjs", "4.15.0"],
@@ -123,46 +378,71 @@ async function materializeInstalledPackages(packageRoot) {
   }
 }
 
-async function writeCapabilityArtifacts(workspaceRoot, capabilityId) {
-  const scenario =
-    capabilityId === "selenium-ubuntu-chromium"
-      ? "web-calculator"
-      : "smoke";
-  const directory = join(
-    workspaceRoot,
-    "tests",
-    "e2e",
-    "selenium",
-    "diagnostics",
-    scenario,
-  );
-  await mkdir(directory, { recursive: true });
-  await writeFile(join(directory, "result.png"), "png\n", "utf8");
-  await writeFile(
-    join(directory, "result.json"),
-    `${JSON.stringify({
-      schemaVersion: 1,
-      capability: { id: capabilityId },
-      scenario,
-      status: "passed",
-      assertion: { status: "passed" },
-      accessibility:
-        scenario === "web-calculator"
-          ? { status: "passed", counts: { violations: 0 } }
-          : { status: "not-run", counts: null },
-    })}\n`,
-    "utf8",
-  );
+async function writeCapabilityArtifacts(
+  workspaceRoot,
+  capabilityId,
+  reportPaths,
+) {
+  for (const reportPath of reportPaths) {
+    const scenario = reportPath.split("/").at(-2);
+    const directory = dirname(join(workspaceRoot, reportPath));
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "result.png"), "png\n", "utf8");
+    await writeFile(
+      join(directory, "result.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        capability: { id: capabilityId },
+        scenario,
+        status: "passed",
+        assertion: { status: "passed" },
+        accessibility:
+          scenario === "web-calculator"
+            ? { status: "passed", counts: { violations: 0 } }
+            : { status: "not-run", counts: null },
+      })}\n`,
+      "utf8",
+    );
+  }
+}
+
+async function pinCandidateManifest(packageRoot) {
+  const path = join(packageRoot, "package.json");
+  const manifest = JSON.parse(await readFile(path, "utf8"));
+  manifest.dependencies["@axe-core/webdriverjs"] = "4.15.0";
+  manifest.dependencies["selenium-webdriver"] = "4.52.0";
+  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+async function materializeCandidateLock(packageRoot) {
+  const path = join(packageRoot, "package-lock.json");
+  const lock = JSON.parse(await readFile(path, "utf8"));
+  const metadata = await fixture("npm-candidates.json");
+  lock.packages[""].dependencies["@axe-core/webdriverjs"] = "4.15.0";
+  lock.packages[""].dependencies["selenium-webdriver"] = "4.52.0";
+  for (const name of ["@axe-core/webdriverjs", "selenium-webdriver"]) {
+    lock.packages[`node_modules/${name}`] = {
+      version: metadata[name].version,
+      resolved: metadata[name].dist.tarball,
+      integrity: metadata[name].dist.integrity,
+      engines: metadata[name].engines,
+      ...(metadata[name].dependencies === undefined
+        ? {}
+        : { dependencies: metadata[name].dependencies }),
+      ...(metadata[name].peerDependencies === undefined
+        ? {}
+        : { peerDependencies: metadata[name].peerDependencies }),
+    };
+  }
+  await writeFile(path, `${JSON.stringify(lock, null, 2)}\n`);
 }
 
 function passingRunner(observed, overrides = {}) {
   return async (step, context) => {
     observed.push({ step, context });
     if (step.id === "apply-selenium-tarballs") {
-      await cp(
-        new URL("candidate-package-lock.json", FIXTURE_ROOT),
-        join(context.packageRoot, "package-lock.json"),
-      );
+      await pinCandidateManifest(context.packageRoot);
+      await materializeCandidateLock(context.packageRoot);
     }
     if (step.id === "install-selenium-candidate") {
       await materializeInstalledPackages(context.packageRoot);
@@ -183,6 +463,7 @@ function passingRunner(observed, overrides = {}) {
       await writeCapabilityArtifacts(
         context.workspaceRoot,
         step.capability_id,
+        JSON.parse(step.environment.E2E_RESULT_REPORTS),
       );
     }
     return rawResult(
@@ -458,12 +739,33 @@ test("strictly rejects malformed semantic versions and ranges", async () => {
     ">=1.2.3 ||",
     ">x.2",
     "1..2",
+    "1.2",
+    "^1.2",
+    "1.x",
+    ">1",
+    "1.2.3 - 2.0.0",
   ]) {
     assert.throws(
       () => normalizeSemverRange(range),
-      /nonempty|invalid|empty/u,
+      /nonempty|invalid|empty|exact|unsupported/u,
     );
   }
+  assert.equal(normalizeSemverRange(">=24"), ">=24.0.0");
+  assert.equal(semverRangeSatisfies("0.2.9", "^0.2.3"), true);
+  assert.equal(semverRangeSatisfies("0.3.0", "^0.2.3"), false);
+  assert.equal(semverRangeSatisfies("0.0.3", "^0.0.3"), true);
+  assert.equal(semverRangeSatisfies("0.0.4", "^0.0.3"), false);
+  assert.equal(
+    semverRangeSatisfies(
+      "1.2.3-beta.2",
+      ">=1.2.3-beta.1 <1.2.3",
+    ),
+    true,
+  );
+  assert.equal(
+    semverRangeSatisfies("1.2.4-beta.1", ">=1.2.3"),
+    false,
+  );
   assert.equal(
     normalizeSemverRange(
       ">3.0.0-beta  || >= 2.53.1 || >4.0.0-alpha",
@@ -535,29 +837,45 @@ test("qualification plan installs immutable tarballs and binds executables", asy
     const apply = plan.steps.find(
       ({ id }) => id === "apply-selenium-tarballs",
     );
+    const cacheSteps = plan.steps.filter(
+      ({ id }) => id.startsWith("cache-selenium-"),
+    );
 
     assert.deepEqual(plan.workspace, {
       kind: "ephemeral-copy",
       mutation_boundary: "tests/e2e/selenium",
       managed_paths: SELENIUM_MANAGED_PATHS,
     });
+    assert.equal(cacheSteps.length, 2);
     assert.ok(
-      apply.arguments.includes(
-        "https://registry.npmjs.org/@axe-core/webdriverjs/-/webdriverjs-4.15.0.tgz",
+      cacheSteps.every(
+        ({ arguments: arguments_ }) =>
+          arguments_[0] === "cache" &&
+          arguments_[1] === "add" &&
+          arguments_.includes("--cache") &&
+          arguments_.includes(".npm-cache"),
       ),
     );
     assert.ok(
-      apply.arguments.includes(
-        "https://registry.npmjs.org/selenium-webdriver/-/selenium-webdriver-4.52.0.tgz",
-      ),
+      cacheSteps.some(({ arguments: arguments_ }) =>
+        arguments_.includes(
+          "https://registry.npmjs.org/@axe-core/webdriverjs/-/webdriverjs-4.15.0.tgz",
+        )),
     );
     assert.ok(
-      apply.arguments.every(
-        (argument) =>
-          argument !== "selenium-webdriver@4.52.0" &&
-          argument !== "@axe-core/webdriverjs@4.15.0",
-      ),
+      cacheSteps.some(({ arguments: arguments_ }) =>
+        arguments_.includes(
+          "https://registry.npmjs.org/selenium-webdriver/-/selenium-webdriver-4.52.0.tgz",
+        )),
     );
+    assert.ok(
+      apply.arguments.includes("@axe-core/webdriverjs@4.15.0"),
+    );
+    assert.ok(
+      apply.arguments.includes("selenium-webdriver@4.52.0"),
+    );
+    assert.ok(apply.arguments.includes("--save-exact"));
+    assert.ok(apply.arguments.includes("--registry"));
     assert.equal(
       plan.packages[0].dist.integrity,
       "sha512-Y2FuZGlkYXRlLWF4ZQ==",
@@ -587,6 +905,39 @@ test("qualification plan installs immutable tarballs and binds executables", asy
           catalog,
         }),
     );
+
+    for (const mutate of [
+      (candidate) => {
+        relation(candidate, "selenium-webdriver-node").hard = false;
+      },
+      (candidate) => {
+        relation(candidate, "selenium-axe-node").constraint = ">=0.0.0";
+      },
+      (candidate) => {
+        relation(candidate, "selenium-axe-policy-alignment").from =
+          "selenium-runner-browser";
+      },
+    ]) {
+      const redirected = structuredClone(observation);
+      mutate(redirected);
+      assert.throws(
+        () =>
+          createSeleniumQualificationPlan({
+            observation: redirected,
+            catalog,
+          }),
+        /relations do not exactly bind/u,
+      );
+    }
+    assert.deepEqual(
+      plan.selected_capabilities.find(
+        ({ id }) => id === "selenium-ubuntu-chromium",
+      ).result_reports,
+      [
+        "tests/e2e/selenium/diagnostics/smoke/result.json",
+        "tests/e2e/selenium/diagnostics/web-calculator/result.json",
+      ],
+    );
   } finally {
     await repository.cleanup();
   }
@@ -596,7 +947,7 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
   const repository = await createRepository();
   let temporaryRoot;
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const before = await Promise.all(
       SELENIUM_MANAGED_PATHS.map((path) =>
         readFile(join(repository.root, path))),
@@ -677,7 +1028,98 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
           step.warnings === undefined,
       ),
     );
+    assert.ok(
+      observed.every(
+        ({ context }) =>
+          context.environment.GITHUB_WORKSPACE === context.workspaceRoot,
+      ),
+    );
   } finally {
+    await repository.cleanup();
+  }
+});
+
+test("real npm creates and installs the candidate manifest and lock", async () => {
+  const repository = await createRepository();
+  const localRegistry = await localNpmCandidates();
+  let generatedManifest;
+  let generatedLock;
+  let applyRaw;
+  try {
+    const observation = await collectQualificationCandidate(repository, {
+      npm: async (name) => structuredClone(localRegistry.metadata[name]),
+    });
+    const observed = [];
+    const result = await qualify(repository, observation, {
+      environment: {
+        ...process.env,
+        GITHUB_WORKSPACE: "/untrusted/source/workspace",
+        npm_config_strict_ssl: "false",
+      },
+      runCommand: async (step, context) => {
+        observed.push({ step, context });
+        if (
+          [
+            "cache-selenium-axe-tarball",
+            "cache-selenium-webdriver-tarball",
+            "apply-selenium-tarballs",
+            "install-selenium-candidate",
+            "verify-runner-browser",
+            "verify-runner-driver",
+          ].includes(step.id)
+        ) {
+          const raw = await executeRaw(step, context);
+          if (step.id === "apply-selenium-tarballs") {
+            applyRaw = raw;
+          }
+          if (step.id === "apply-selenium-tarballs" && raw.exitCode === 0) {
+            generatedManifest = JSON.parse(
+              await readFile(join(context.packageRoot, "package.json")),
+            );
+            generatedLock = JSON.parse(
+              await readFile(join(context.packageRoot, "package-lock.json")),
+            );
+          }
+          return raw;
+        }
+        if (step.id.endsWith("-artifact-contracts")) {
+          await writeCapabilityArtifacts(
+            context.workspaceRoot,
+            step.capability_id,
+            JSON.parse(step.environment.E2E_RESULT_REPORTS),
+          );
+        }
+        return rawResult();
+      },
+    });
+
+    assert.equal(
+      result.validation.disposition.state,
+      "independently-qualified",
+      JSON.stringify({ applyRaw, result }, null, 2),
+    );
+    assert.deepEqual(generatedManifest.dependencies, {
+      "@axe-core/webdriverjs": "4.15.0",
+      "selenium-webdriver": "4.52.0",
+    });
+    for (const [name, metadata] of Object.entries(localRegistry.metadata)) {
+      const locked = generatedLock.packages[`node_modules/${name}`];
+      assert.equal(
+        generatedLock.packages[""].dependencies[name],
+        metadata.version,
+      );
+      assert.equal(locked.version, metadata.version);
+      assert.equal(locked.resolved, metadata.dist.tarball);
+      assert.equal(locked.integrity, metadata.dist.integrity);
+    }
+    assert.ok(
+      observed.every(
+        ({ context }) =>
+          context.environment.GITHUB_WORKSPACE === context.workspaceRoot,
+      ),
+    );
+  } finally {
+    await localRegistry.cleanup();
     await repository.cleanup();
   }
 });
@@ -685,7 +1127,7 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
 test("caller-supplied statuses or evidence cannot fabricate success", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     let calls = 0;
     const result = await qualify(repository, observation, {
       runCommand: async () => {
@@ -725,7 +1167,7 @@ test("caller-supplied statuses or evidence cannot fabricate success", async () =
 test("wrong lock integrity cannot pass preparation", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const observed = [];
     const runner = passingRunner(observed);
     const result = await qualify(repository, observation, {
@@ -760,7 +1202,7 @@ test("wrong lock integrity cannot pass preparation", async () => {
 test("runner executable identity is verified before scenarios", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const observed = [];
     const result = await qualify(repository, observation, {
       runCommand: passingRunner(observed, {
@@ -777,6 +1219,66 @@ test("runner executable identity is verified before scenarios", async () => {
         ({ step }) => step.capability_id === null,
       ),
     );
+
+    const aliasResult = await qualify(repository, observation, {
+      runCommand: passingRunner([], {
+        browser: {
+          stdout: "NotChromium 141.0.7390.54 accepted alias\n",
+        },
+      }),
+    });
+    assert.deepEqual(aliasResult.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["RUNNER_EXECUTABLE_IDENTITY_MISMATCH"],
+    });
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("runner executable realpath and digest are checked independently", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    await writeFile(
+      repository.runnerEvidence.browser.realpath,
+      "#!/bin/sh\nprintf 'Chromium 141.0.7390.54\\n'\n# changed\n",
+      { mode: 0o755 },
+    );
+    const observed = [];
+    const result = await qualify(repository, observation, {
+      runCommand: passingRunner(observed),
+    });
+
+    assert.deepEqual(result.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["RUNNER_EXECUTABLE_IDENTITY_MISMATCH"],
+    });
+    assert.ok(
+      observed.every(
+        ({ step }) => step.id !== "verify-runner-browser",
+      ),
+    );
+
+    const browserContent = "#!/bin/sh\nprintf 'Chromium 141.0.7390.54\\n'\n";
+    await writeFile(
+      repository.runnerEvidence.browser.realpath,
+      browserContent,
+      { mode: 0o755 },
+    );
+    const redirectedEvidence = structuredClone(repository.runnerEvidence);
+    redirectedEvidence.browser.realpath =
+      `${redirectedEvidence.browser.realpath}-redirected`;
+    const redirected = await collectQualificationCandidate(repository, {
+      runnerEvidence: redirectedEvidence,
+    });
+    const redirectedResult = await qualify(repository, redirected, {
+      runCommand: passingRunner([]),
+    });
+    assert.deepEqual(redirectedResult.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["RUNNER_EXECUTABLE_IDENTITY_MISMATCH"],
+    });
   } finally {
     await repository.cleanup();
   }
@@ -785,7 +1287,7 @@ test("runner executable identity is verified before scenarios", async () => {
 test("captured warnings prevent independent admission", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const result = await qualify(repository, observation, {
       runCommand: passingRunner([], {
         result: (step) =>
@@ -813,7 +1315,7 @@ test("captured warnings prevent independent admission", async () => {
 test("missing artifacts prevent independent admission", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const observed = [];
     const runner = passingRunner(observed);
     const result = await qualify(repository, observation, {
@@ -841,10 +1343,60 @@ test("missing artifacts prevent independent admission", async () => {
   }
 });
 
+test("reports must bijectively cover the selected scenario set", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const runner = passingRunner([]);
+    const result = await qualify(repository, observation, {
+      runCommand: async (step, context) => {
+        const raw = await runner(step, context);
+        if (
+          step.id ===
+          "selenium-ubuntu-chromium-artifact-contracts"
+        ) {
+          const reportPath =
+            "tests/e2e/selenium/diagnostics/web-calculator/result.json";
+          const report = JSON.parse(
+            await readFile(join(context.workspaceRoot, reportPath)),
+          );
+          report.scenario = "smoke";
+          await writeFile(
+            join(context.workspaceRoot, reportPath),
+            `${JSON.stringify(report)}\n`,
+          );
+          await writeCapabilityArtifacts(
+            context.workspaceRoot,
+            step.capability_id,
+            [
+              "tests/e2e/selenium/diagnostics/unselected/result.json",
+            ],
+          );
+        }
+        return raw;
+      },
+    });
+
+    assert.ok(
+      result.validation.disposition.reason_codes.includes(
+        "ARTIFACT_VALIDATION_FAILED",
+      ),
+    );
+    assert.equal(
+      result.validation.results.find(
+        ({ capability_id: id }) => id === "selenium-ubuntu-chromium",
+      ).status,
+      "fail",
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
 test("workspace boundary and source Git-state mutations fail closed", async () => {
   const repository = await createRepository();
   try {
-    const observation = await collectCandidate(repository.root);
+    const observation = await collectQualificationCandidate(repository);
     const outsideRunner = passingRunner([]);
     await assert.rejects(
       qualify(repository, observation, {
@@ -872,6 +1424,29 @@ test("workspace boundary and source Git-state mutations fail closed", async () =
           const raw = await sourceRunner(step, context);
           if (step.id === "test-selenium-package") {
             gitState = "changed\n";
+          }
+          return raw;
+        },
+      }),
+      /changed source Git state/u,
+    );
+
+    const ignoredRunner = passingRunner([]);
+    await assert.rejects(
+      qualify(repository, observation, {
+        runCommand: async (step, context) => {
+          const raw = await ignoredRunner(step, context);
+          if (step.id === "test-selenium-package") {
+            const ignoredPath = join(
+              repository.root,
+              "tests",
+              "e2e",
+              "selenium",
+              "diagnostics",
+              "source-mutation.txt",
+            );
+            await mkdir(dirname(ignoredPath), { recursive: true });
+            await writeFile(ignoredPath, "mutated ignored source\n");
           }
           return raw;
         },
