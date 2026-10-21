@@ -123,25 +123,13 @@ function generatedCandidateLock(lockContents) {
       "releases/download/v4.0.0/oculixide-4.0.0-linux.jar",
       "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-linux.jar",
     )
-    .replace(
-      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    )
     .replaceAll(
       "releases/download/v4.0.0/oculixide-4.0.0-macos.jar",
       "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-macos.jar",
     )
-    .replace(
-      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    )
     .replaceAll(
       "releases/download/v4.0.0/oculixide-4.0.0-windows.jar",
       "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-windows.jar",
-    )
-    .replace(
-      "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     );
 }
 
@@ -155,6 +143,14 @@ function javaRuntimeOutput({
     `    java.vendor = ${vendor}`,
     'openjdk version "17.0.20.1" 2026-10-20',
   ].join("\n");
+}
+
+function isolatedMiseEnvironment(workspacePath) {
+  return {
+    MISE_CONFIG_DIR: `${workspacePath}-mise-config`,
+    MISE_STATE_DIR: `${workspacePath}-mise-state`,
+    MISE_TRUSTED_CONFIG_PATHS: workspacePath,
+  };
 }
 
 test("strict RC parsing rejects lookalikes and leading zeroes", () => {
@@ -618,6 +614,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
     runner: RUNNER,
   });
   const javaIdentity = plan.java;
+  const miseEnvironment = isolatedMiseEnvironment(workspacePath);
   const commands = [];
   try {
     await mkdir(resolve(configPath, ".."), { recursive: true });
@@ -639,6 +636,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
         "http:oculixide",
       ],
       managedPaths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
+      miseEnvironment,
       runCommand: async (command) => {
         commands.push(command);
         await writeFile(
@@ -677,6 +675,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
           "http:oculixide",
         ],
         cwd: workspacePath,
+        environment: miseEnvironment,
       },
     ]);
     assert.match(await readFile(configPath, "utf8"), /4\.1\.0-rc10/u);
@@ -704,6 +703,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
           "http:oculixide",
         ],
         managedPaths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
+        miseEnvironment,
         runCommand: async () => {
           await writeFile(
             lockPath,
@@ -737,6 +737,7 @@ test("generated lock evidence must be structural and exact", async (context) => 
     observation: await candidateObservation(),
     runner: RUNNER,
   });
+  const miseEnvironment = isolatedMiseEnvironment(workspacePath);
   async function prepareWith(
     generatedLock,
     candidateAssets = plan.oculix_assets,
@@ -751,6 +752,7 @@ test("generated lock evidence must be structural and exact", async (context) => 
       javaIdentity: plan.java,
       lockCommand: plan.lock.command,
       managedPaths: plan.workspace.managed_paths,
+      miseEnvironment,
       runCommand: async () => {
         await writeFile(lockPath, generatedLock);
         return { stderr: "", stdout: "" };
@@ -790,15 +792,24 @@ test("generated lock evidence must be structural and exact", async (context) => 
         /must contain one url/,
       );
     });
-    await context.test("wrong candidate digest is rejected", async () => {
+    await context.test("realistic URL-only records are accepted", async () => {
+      const generated = generatedCandidateLock(originalLock);
+      const oculixRecords = generated.slice(
+        0,
+        generated.indexOf("[[tools.java]]"),
+      );
+      assert.equal(oculixRecords.includes("checksum ="), false);
+      await assert.doesNotReject(prepareWith(generated));
+    });
+    await context.test("wrong candidate URL is rejected", async () => {
       await assert.rejects(
         prepareWith(
           generatedCandidateLock(originalLock).replace(
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "oculixide-4.1.0-rc10-linux.jar",
+            "oculixide-4.1.0-rc10-macos.jar",
           ),
         ),
-        /exact candidate asset URL and digest/,
+        /exact immutable candidate asset URL/,
       );
     });
     await context.test("incomplete expected assets cannot bypass checks", async () => {
@@ -819,6 +830,7 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
   const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-source-"));
   const sourcePath = join(temporaryRoot, "source");
   const trackedPath = join(sourcePath, "tracked.txt");
+  const misePath = join(sourcePath, "mise.toml");
   async function git(...args) {
     return execFile("git", args, { cwd: sourcePath });
   }
@@ -828,11 +840,19 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
     await git("config", "user.name", "Oculix RC test");
     await git("config", "user.email", "oculix-rc@example.invalid");
     await writeFile(trackedPath, "claimed revision\n");
-    await git("add", "tracked.txt");
+    await writeFile(
+      misePath,
+      '[env]\nARCHIVED_REVISION = "claimed"\n',
+    );
+    await git("add", "tracked.txt", "mise.toml");
     await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "first");
     const claimedRevision = (await git("rev-parse", "HEAD")).stdout.trim();
     await writeFile(trackedPath, "newer clean revision\n");
-    await git("add", "tracked.txt");
+    await writeFile(
+      misePath,
+      '[env]\nARCHIVED_REVISION = "newer"\n',
+    );
+    await git("add", "tracked.txt", "mise.toml");
     await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "second");
 
     const workspace = await createEphemeralOculixWorkspace({
@@ -843,6 +863,37 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
       assert.equal(
         await readFile(join(workspace.path, "tracked.txt"), "utf8"),
         "claimed revision\n",
+      );
+      assert.deepEqual(
+        Object.keys(workspace.mise_environment).sort(),
+        [
+          "MISE_CONFIG_DIR",
+          "MISE_STATE_DIR",
+          "MISE_TRUSTED_CONFIG_PATHS",
+        ],
+      );
+      assert.equal(
+        workspace.mise_environment.MISE_TRUSTED_CONFIG_PATHS,
+        workspace.path,
+      );
+      const miseEnvironment = await execFile(
+        "mise",
+        ["-C", workspace.path, "env"],
+        {
+          env: {
+            ...process.env,
+            ...workspace.mise_environment,
+            MISE_PARANOID: "1",
+          },
+        },
+      );
+      assert.match(
+        miseEnvironment.stdout,
+        /ARCHIVED_REVISION=claimed/u,
+      );
+      assert.doesNotMatch(
+        miseEnvironment.stdout,
+        /ARCHIVED_REVISION=newer/u,
       );
     } finally {
       await workspace.dispose();
@@ -883,6 +934,9 @@ function successfulQualification(overrides = {}) {
       contractOptions,
       createWorkspace: async () => ({
         ephemeral: true,
+        mise_environment: isolatedMiseEnvironment(
+          "/tmp/oculix-rc-test-workspace",
+        ),
         path: "/tmp/oculix-rc-test-workspace",
         async dispose() {
           disposed = true;
@@ -926,10 +980,14 @@ test("real command warning forms are captured and block qualification", async ()
       stdout: [
         "warning: compiler warning",
         "::warning file=test.mjs::annotation",
+        "mise WARN config files in archived directories require trust",
+        "ExperimentalWarning: feature may change",
+        "CoMpOuNdWaRnInGs: multiple concerns",
         "ordinary output mentioning warning without punctuation",
       ].join("\n"),
       stderr: [
         "[WARNING] Maven warning",
+        "[WARNINGS] plural warning group",
         "npm WARN deprecated dependency",
         "script.py:2: DeprecationWarning: old API",
       ].join("\n"),
@@ -937,7 +995,11 @@ test("real command warning forms are captured and block qualification", async ()
     [
       "warning: compiler warning",
       "::warning file=test.mjs::annotation",
+      "mise WARN config files in archived directories require trust",
+      "ExperimentalWarning: feature may change",
+      "CoMpOuNdWaRnInGs: multiple concerns",
       "[WARNING] Maven warning",
+      "[WARNINGS] plural warning group",
       "npm WARN deprecated dependency",
       "script.py:2: DeprecationWarning: old API",
     ],
@@ -950,7 +1012,7 @@ test("real command warning forms are captured and block qualification", async ()
           args.includes("-XshowSettings:properties")
             ? { stderr: javaRuntimeOutput(), stdout: "" }
             : {
-                stderr: "WARNING: command completed with a warning\n",
+                stderr: "mise WARN command completed with a warning\n",
                 stdout: "",
               },
       }),
@@ -961,7 +1023,7 @@ test("real command warning forms are captured and block qualification", async ()
     reason_codes: ["OCULIX_RC_VALIDATION_WARNING"],
   });
   assert.deepEqual(validation.results[0].warnings, [
-    "WARNING: command completed with a warning",
+    "mise WARN command completed with a warning",
   ]);
   const preparationWarning = successfulQualification({
     prepareCandidate: async ({ javaIdentity }) => ({
@@ -1051,10 +1113,24 @@ test("qualification mutates only an external ephemeral workspace", async () => {
     "/tmp/oculix-rc-test-workspace",
   );
   assert.deepEqual(
+    qualification.calls[0].miseEnvironment,
+    isolatedMiseEnvironment("/tmp/oculix-rc-test-workspace"),
+  );
+  assert.deepEqual(
     qualification.calls
       .filter(({ stage }) => stage === "check")
       .map(({ check }) => check.id),
     ["repository-policy", "oculix-capability"],
+  );
+  assert.equal(
+    qualification.calls
+      .filter(({ stage }) => stage === "check")
+      .every(
+        ({ miseEnvironment }) =>
+          miseEnvironment.MISE_TRUSTED_CONFIG_PATHS ===
+          "/tmp/oculix-rc-test-workspace",
+      ),
+    true,
   );
   assert.doesNotThrow(() =>
     validateIndependentQualification(

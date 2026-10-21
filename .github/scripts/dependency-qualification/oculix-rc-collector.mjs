@@ -34,13 +34,13 @@ const TEMURIN_VENDOR = "Eclipse Adoptium";
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const WARNING_PATTERNS = Object.freeze([
-  /^warn(?:ing)?(?:\s|:)/iu,
-  /^\[warn(?:ing)?\]/iu,
-  /^##\[warning\]/iu,
+  /^warn(?:ing|ings)?(?:\s|:)/iu,
+  /^\[warn(?:ing|ings)?\]/iu,
+  /^##\[warn(?:ing|ings)?\]/iu,
   /^::warning(?:\s|:|$)/iu,
   /^npm\s+warn(?:ing)?\b/iu,
-  /(?:^|:\s)warning\s*:/iu,
-  /\b(?:deprecation|user|runtime|future)warning\s*:/iu,
+  /(?:^|\s)mise\s+warn(?:ing|ings)?\b/iu,
+  /\b[a-z]*warnings?\s*:/iu,
 ]);
 const RESULT_STATUSES = new Set([
   "pass",
@@ -942,7 +942,13 @@ function validateGeneratedOculixLock(
     new Set(expectedAssetPlatforms).size !==
       OCULIX_LOCK_PLATFORMS.length ||
     JSON.stringify(expectedAssetPlatforms) !==
-      JSON.stringify([...OCULIX_LOCK_PLATFORMS].sort())
+      JSON.stringify([...OCULIX_LOCK_PLATFORMS].sort()) ||
+    candidateAssets.some(
+      ({ digest, url }) =>
+        !SHA256_PATTERN.test(digest) ||
+        typeof url !== "string" ||
+        url.length === 0,
+    )
   ) {
     throw new Error(
       "Generated Oculix lock validation requires every candidate asset",
@@ -973,11 +979,10 @@ function validateGeneratedOculixLock(
     );
     const context =
       `${OCULIX_LOCK_PATH} Oculix ${expected.platform}`;
-    const checksum = parseTomlString(section, "checksum", context);
     const url = parseTomlString(section, "url", context);
-    if (checksum !== expected.digest || url !== expected.url) {
+    if (url !== expected.url) {
       throw new Error(
-        `${context} must bind the exact candidate asset URL and digest`,
+        `${context} must bind the exact immutable candidate asset URL`,
       );
     }
   }
@@ -1415,6 +1420,8 @@ export async function createEphemeralOculixWorkspace({
   );
   const workspacePath = join(temporaryRoot, "repository");
   const archivePath = join(temporaryRoot, "repository.tar");
+  const miseConfigPath = join(temporaryRoot, "mise-config");
+  const miseStatePath = join(temporaryRoot, "mise-state");
   try {
     await runCommand({
       command: "git",
@@ -1427,6 +1434,10 @@ export async function createEphemeralOculixWorkspace({
       cwd: root,
     });
     await mkdir(workspacePath);
+    await Promise.all([
+      mkdir(miseConfigPath),
+      mkdir(miseStatePath),
+    ]);
     await runCommand({
       command: "tar",
       args: ["-xf", archivePath, "-C", workspacePath],
@@ -1439,10 +1450,41 @@ export async function createEphemeralOculixWorkspace({
   }
   return {
     ephemeral: true,
+    mise_environment: deepFreeze({
+      MISE_CONFIG_DIR: miseConfigPath,
+      MISE_STATE_DIR: miseStatePath,
+      MISE_TRUSTED_CONFIG_PATHS: workspacePath,
+    }),
     path: workspacePath,
     async dispose() {
       await rm(temporaryRoot, { force: true, recursive: true });
     },
+  };
+}
+
+function requireWorkspaceMiseEnvironment(workspace) {
+  const environment = workspace?.mise_environment;
+  for (const key of [
+    "MISE_CONFIG_DIR",
+    "MISE_STATE_DIR",
+    "MISE_TRUSTED_CONFIG_PATHS",
+  ]) {
+    requireString(environment?.[key], `workspace.mise_environment.${key}`);
+  }
+  if (
+    resolve(environment.MISE_TRUSTED_CONFIG_PATHS) !==
+    resolve(workspace.path) ||
+    !outsideRepository(workspace.path, environment.MISE_CONFIG_DIR) ||
+    !outsideRepository(workspace.path, environment.MISE_STATE_DIR)
+  ) {
+    throw new Error(
+      "Qualification mise trust and state must be isolated to the archived workspace",
+    );
+  }
+  return {
+    MISE_CONFIG_DIR: environment.MISE_CONFIG_DIR,
+    MISE_STATE_DIR: environment.MISE_STATE_DIR,
+    MISE_TRUSTED_CONFIG_PATHS: environment.MISE_TRUSTED_CONFIG_PATHS,
   };
 }
 
@@ -1594,6 +1636,7 @@ export async function prepareOculixRcCandidate({
   javaIdentity,
   lockCommand,
   managedPaths,
+  miseEnvironment = {},
   runCommand = runOculixQualificationCommand,
   workspacePath,
 }) {
@@ -1625,6 +1668,7 @@ export async function prepareOculixRcCandidate({
     command: lockCommand[0],
     args: lockCommand.slice(1),
     cwd: workspacePath,
+    environment: miseEnvironment,
   });
   const after = new Map(
     await Promise.all(
@@ -1671,13 +1715,18 @@ export async function prepareOculixRcCandidate({
 
 export async function executeOculixQualificationCheck({
   check,
+  miseEnvironment = {},
   observeJavaRuntime = observeOculixJavaRuntime,
   plan,
   runCommand = runOculixQualificationCommand,
   workspacePath,
 }) {
+  const environment = {
+    ...check.environment,
+    ...miseEnvironment,
+  };
   const runtime = await observeJavaRuntime({
-    environment: check.environment,
+    environment,
     plan,
     runCommand,
     workspacePath,
@@ -1687,7 +1736,7 @@ export async function executeOculixQualificationCheck({
       command: check.command[0],
       args: check.command.slice(1),
       cwd: workspacePath,
-      environment: check.environment,
+      environment,
     });
     const output = commandOutput(result);
     return {
@@ -1943,6 +1992,7 @@ export async function qualifyOculixRc({
   const plan = createOculixRcQualificationPlan({ observation, runner });
   const component = candidateComponent(observation);
   let workspace;
+  let miseEnvironment;
   let document;
   try {
     workspace = await createWorkspace({
@@ -1959,6 +2009,7 @@ export async function qualifyOculixRc({
         "Qualification workspace must be ephemeral and outside the repository",
       );
     }
+    miseEnvironment = requireWorkspaceMiseEnvironment(workspace);
     let preparation;
     try {
       preparation = await prepareCandidate({
@@ -1968,6 +2019,7 @@ export async function qualifyOculixRc({
         javaIdentity: plan.java,
         lockCommand: plan.lock.command,
         managedPaths: plan.workspace.managed_paths,
+        miseEnvironment,
         workspacePath: workspace.path,
       });
       if (preparation.java_identity_digest !== plan.java.identity_digest) {
@@ -2028,6 +2080,7 @@ export async function qualifyOculixRc({
             candidateDigest: plan.candidate_digest,
             check,
             diffDigest: preparation.diff_digest,
+            miseEnvironment,
             plan,
             workspacePath: workspace.path,
           }),
