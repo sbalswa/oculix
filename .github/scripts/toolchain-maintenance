@@ -673,10 +673,27 @@ dominant_major() {
 
 extract_java_version_evidence() {
   local path="$1"
-  local line line_number=0 raw normalized major
+  local line line_number=0 raw normalized major leading trimmed
+  local indent block_indent=-1
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     ((line_number += 1))
+    leading="${line%%[! ]*}"
+    indent="${#leading}"
+    trimmed="${line#"${leading}"}"
+    if ((block_indent >= 0)); then
+      if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
+        continue
+      fi
+      if ((indent > block_indent)); then
+        continue
+      fi
+      block_indent=-1
+    fi
+    if [[ "$line" =~ ^[[:space:]]*(-[[:space:]]+)?[[:alnum:]_.-]+[[:space:]]*:[[:space:]]*[\|\>][0-9+-]*[[:space:]]*(#.*)?$ ]]; then
+      block_indent="$indent"
+      continue
+    fi
     if [[ ! "$line" =~ ^[[:space:]]*java-version[[:space:]]*:[[:space:]]*(.*)$ ]]; then
       continue
     fi
@@ -851,7 +868,7 @@ format_oculix_java_ignored() {
 
 watch_oculix_jdk() {
   local configured dominant disposition counts declarations ignored body
-  local snapshot_url resolution
+  local snapshot_url resolution resolution_marker
 
   configured="$(configured_java_major)"
   if ! collect_oculix_ci_java_evidence; then
@@ -865,7 +882,9 @@ watch_oculix_jdk() {
   snapshot_url="https://github.com/${oculix_release_repository}/tree/${oculix_ci_commit_sha}/.github/workflows"
 
   if [[ -n "$dominant" && "$dominant" == "$configured" ]]; then
-    resolution="JDK major drift resolved automatically: the configured Temurin major (${configured}) matches the unique dominant Oculix CI major (${dominant}) again.
+    resolution_marker="<!-- oculix-jdk-drift-resolved:${oculix_ci_commit_sha}:temurin-${configured}:dominant-${dominant} -->"
+    resolution="${resolution_marker}
+JDK major drift resolved automatically: the configured Temurin major (${configured}) matches the unique dominant Oculix CI major (${dominant}) again.
 
 Evidence snapshot: ${snapshot_url}"
     resolve_issue "$jdk_drift_issue_title" "$resolution"
@@ -1339,6 +1358,7 @@ triage_issue_number() {
   gh issue list \
     --repo "$repository" \
     --state open \
+    --limit 100 \
     --search "\"${title}\" in:title" \
     --json number,title \
     --jq '.[] | [.number, .title] | @tsv' |
@@ -1412,7 +1432,7 @@ sync_issue() {
 resolve_issue() {
   local title="$1"
   local body="$2"
-  local existing
+  local existing marker comments
 
   if [[ "$dry_run" == "true" ]]; then
     printf 'Would resolve generated issue if open: %s\n%s\n' "$title" "$body"
@@ -1423,7 +1443,20 @@ resolve_issue() {
   if [[ -z "$existing" ]]; then
     return
   fi
-  gh issue comment "$existing" --repo "$repository" --body "$body"
+  marker="${body%%$'\n'*}"
+  comments=""
+  if [[ "$marker" == '<!-- '* ]]; then
+    comments="$(
+      gh issue view "$existing" \
+        --repo "$repository" \
+        --json comments \
+        --jq '.comments[].body'
+    )"
+  fi
+  if [[ "$marker" != '<!-- '* ]] ||
+    ! grep -Fq -- "$marker" <<<"$comments"; then
+    gh issue comment "$existing" --repo "$repository" --body "$body"
+  fi
   gh issue close "$existing" --repo "$repository" --reason completed
 }
 

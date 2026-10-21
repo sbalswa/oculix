@@ -57,6 +57,7 @@ setup() {
   assert_file_contains "${GH_BODY}" "single-quoted.yml"
   assert_file_contains "${GH_BODY}" '${{ matrix.java }}'
   assert_file_contains "${GH_BODY}" "17-21"
+  assert_file_not_contains "${GH_BODY}" "java-version: 99"
   assert_file_contains "${GH_BODY}" "${SNAPSHOT_SHA}"
   assert_file_contains "${GH_BODY}" "#L"
 }
@@ -85,6 +86,25 @@ setup() {
   [[ "$(grep -c '^comment$' "${GH_EVENTS}")" -eq 1 ]]
   [[ "$(grep -c '^close$' "${GH_EVENTS}")" -eq 1 ]]
   assert_file_contains "${GH_BODY}" "resolved automatically"
+  assert_file_contains "${GH_LOG}" "--limit 100"
+  [[ ! -s "${GH_STATE}" ]]
+}
+
+@test "resolution retry does not duplicate its marked comment after close failure" {
+  GH_SCENARIO="match-existing"
+  GH_CLOSE_FAIL_ONCE="true"
+  export GH_SCENARIO GH_CLOSE_FAIL_ONCE
+  set_existing_alert
+
+  run_jdk_watch
+  [[ "$status" -ne 0 ]]
+  [[ "$(grep -c '^comment$' "${GH_EVENTS}")" -eq 1 ]]
+  [[ "$(cat "${GH_STATE}")" == "73" ]]
+
+  run_jdk_watch
+  assert_success
+  [[ "$(grep -c '^comment$' "${GH_EVENTS}")" -eq 1 ]]
+  [[ "$(grep -c '^close$' "${GH_EVENTS}")" -eq 1 ]]
   [[ ! -s "${GH_STATE}" ]]
 }
 

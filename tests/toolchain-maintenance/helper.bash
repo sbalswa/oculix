@@ -14,6 +14,8 @@ setup_toolchain_fixture() {
   GH_BODY="${BATS_TEST_TMPDIR}/gh.body"
   GH_TITLE="${BATS_TEST_TMPDIR}/gh.title"
   GH_STATE="${BATS_TEST_TMPDIR}/gh.state"
+  GH_COMMENTS="${BATS_TEST_TMPDIR}/gh.comments"
+  GH_CLOSE_ATTEMPT="${BATS_TEST_TMPDIR}/gh.close-attempt"
 
   mkdir -p "${TEST_REPOSITORY_ROOT}/mise" "${TEST_BIN}"
   cp "${BATS_TEST_DIRNAME}/fixtures/gh" "${TEST_BIN}/gh"
@@ -22,10 +24,13 @@ setup_toolchain_fixture() {
     >"${TEST_REPOSITORY_ROOT}/mise/config.oculix.toml"
   : >"${GH_LOG}"
   : >"${GH_EVENTS}"
+  : >"${GH_COMMENTS}"
+  : >"${GH_CLOSE_ATTEMPT}"
 
   export GITHUB_REPOSITORY="sbalswa/oculix"
   export GH_SCENARIO="match"
-  export GH_LOG GH_EVENTS GH_BODY GH_TITLE GH_STATE SNAPSHOT_SHA
+  export GH_LOG GH_EVENTS GH_BODY GH_TITLE GH_STATE GH_COMMENTS
+  export GH_CLOSE_ATTEMPT SNAPSHOT_SHA
   export PATH="${TEST_BIN}:${PATH}"
 }
 

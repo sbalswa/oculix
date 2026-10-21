@@ -118,6 +118,9 @@ workflow_content() {
       # `${{ matrix.java }}` is literal GitHub Actions fixture syntax.
       # shellcheck disable=SC2016
       printf '%s\n' \
+        "run: |" \
+        "  printf 'java-version: 99 is shell text'" \
+        "  java-version: 99" \
         'java-version: ${{ matrix.java }}' \
         "java-version: '17-21'"
       ;;
@@ -291,13 +294,30 @@ case "$command" in
         ;;
       comment)
         record_issue_mutation comment "$@"
+        option_value --body "$@" >>"${GH_COMMENTS:?}"
+        printf '\n' >>"${GH_COMMENTS:?}"
         ;;
       close)
+        if [[ "${GH_CLOSE_FAIL_ONCE:-false}" == "true" &&
+              ! -s "${GH_CLOSE_ATTEMPT:?}" ]]; then
+          printf 'attempted\n' >"${GH_CLOSE_ATTEMPT:?}"
+          printf 'mock close failure\n' >&2
+          exit 1
+        fi
         record_issue_mutation close "$@"
         : >"$GH_STATE"
         ;;
       edit)
         record_issue_mutation edit "$@"
+        ;;
+      view)
+        if has_argument --jq "$@"; then
+          cat "${GH_COMMENTS:?}"
+        else
+          jq -n \
+            --rawfile comments "${GH_COMMENTS:?}" \
+            '{comments: [{body: $comments}]}'
+        fi
         ;;
       *)
         printf 'Unexpected gh issue command: %s\n' "$subcommand" >&2
