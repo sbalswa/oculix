@@ -22,4 +22,7 @@ test("calculates 7 × 34", async ({ page }) => {
 
   await expect(display).toBeVisible();
   await expect(display).toHaveText("238");
+  await page.screenshot({
+    path: "test-results/web-calculator-result.png",
+  });
 });

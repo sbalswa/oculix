@@ -8,8 +8,8 @@ import { assertCypressPlatformSupported } from "./platform.mjs";
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = resolve(HARNESS_DIRECTORY, "cypress.config.mjs");
 const DIAGNOSTICS_DIRECTORY = resolve(HARNESS_DIRECTORY, "diagnostics");
-// Electron is the approved Phase-1 matrix cell, not a spec-level assumption.
-const DEFAULT_BROWSER = "electron";
+// Chrome is the approved Phase-1 matrix cell, not a spec-level assumption.
+const DEFAULT_BROWSER = "chrome";
 const SUPPORTED_BROWSERS = new Set([
   "chrome",
   "chromium",
