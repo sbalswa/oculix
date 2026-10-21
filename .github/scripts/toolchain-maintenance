@@ -2,9 +2,10 @@
 
 set -Eeuo pipefail
 
-readonly repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+readonly repository="${GITHUB_REPOSITORY:-}"
 readonly branch_prefix="automation/toolchain/"
-readonly issue_title="Toolchain maintenance needs triage"
+readonly maintenance_issue_title="Toolchain maintenance needs triage"
+readonly jdk_drift_issue_title="Oculix JDK major drift detected"
 readonly minimum_age_days="${TOOLCHAIN_MIN_AGE_DAYS:-7}"
 readonly dry_run="${TOOLCHAIN_DRY_RUN:-false}"
 readonly mise_config_path="mise/config.toml"
@@ -14,14 +15,16 @@ readonly oculix_lock_path="mise/mise.oculix.lock"
 readonly oculix_release_repository="oculix-org/Oculix"
 readonly oculix_lock_platforms="linux-x64,linux-arm64,macos-arm64,windows-x64"
 
-default_branch="$(gh api "repos/${repository}" --jq '.default_branch')"
-readonly default_branch
-
+default_branch=""
 created_pr=""
 tool_updates=""
 extras_oculix_summary=""
 extras_oculix_candidate=""
 extras_java_candidate=""
+oculix_ci_default_branch=""
+oculix_ci_commit_sha=""
+oculix_ci_declarations=""
+oculix_ci_ignored=""
 
 set_output() {
   local name="$1"
@@ -513,7 +516,7 @@ plan() {
         <<<"$open_prs"
     )"
     if [[ -n "$held_prs" ]]; then
-      ensure_issue "Toolchain maintenance is paused by an update that was not made ready:
+      ensure_issue "$maintenance_issue_title" "Toolchain maintenance is paused by an update that was not made ready:
 
 ${held_prs}"
     fi
@@ -622,6 +625,291 @@ current_java_lock_version() {
     return 1
   fi
   printf '%s' "$version"
+}
+
+configured_java_major() {
+  local config_path="${1:-${oculix_config_path}}"
+  local specifier
+
+  specifier="$(
+    sed -n 's/^java = "\([^"]*\)"$/\1/p' "$config_path" |
+      head -n 1
+  )"
+  if [[ ! "$specifier" =~ ^temurin-([0-9]+)([.][0-9]+)*$ ]]; then
+    printf 'Failed to read one Temurin major from %s.\n' "$config_path" >&2
+    return 1
+  fi
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+dominant_major() {
+  awk '
+    /^[0-9]+$/ {
+      counts[$1] += 1
+      total += 1
+    }
+    END {
+      if (total == 0) {
+        exit
+      }
+      top = 0
+      winner = ""
+      tied = 0
+      for (major in counts) {
+        if (counts[major] > top) {
+          top = counts[major]
+          winner = major
+          tied = 0
+        } else if (counts[major] == top) {
+          tied = 1
+        }
+      }
+      if (!tied) {
+        print winner
+      }
+    }
+  '
+}
+
+extract_java_version_evidence() {
+  local path="$1"
+  local line line_number=0 raw normalized major
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    if [[ ! "$line" =~ ^[[:space:]]*java-version[[:space:]]*:[[:space:]]*(.*)$ ]]; then
+      continue
+    fi
+
+    raw="${BASH_REMATCH[1]}"
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    normalized=""
+    if [[ "$raw" =~ ^\"([0-9]+([.][0-9]+)*)\"[[:space:]]*(#.*)?$ ]]; then
+      normalized="${BASH_REMATCH[1]}"
+    elif [[ "$raw" =~ ^\'([0-9]+([.][0-9]+)*)\'[[:space:]]*(#.*)?$ ]]; then
+      normalized="${BASH_REMATCH[1]}"
+    elif [[ "$raw" =~ ^([0-9]+([.][0-9]+)*)[[:space:]]*(#.*)?$ ]]; then
+      normalized="${BASH_REMATCH[1]}"
+    fi
+
+    raw="${raw//$'\t'/ }"
+    if [[ -n "$normalized" ]]; then
+      major="${normalized%%.*}"
+      printf 'literal\t%s\t%s\t%s\t%s\n' \
+        "$path" "$line_number" "$raw" "$major"
+    else
+      printf 'ignored\t%s\t%s\t%s\tnon-literal or non-scalar value\n' \
+        "$path" "$line_number" "$raw"
+    fi
+  done
+}
+
+collect_oculix_ci_java_evidence() {
+  local metadata entries paths path encoded content record kind
+
+  oculix_ci_default_branch=""
+  oculix_ci_commit_sha=""
+  oculix_ci_declarations=""
+  oculix_ci_ignored=""
+
+  if ! metadata="$(
+    gh api \
+      --method GET \
+      "repos/${oculix_release_repository}"
+  )"; then
+    printf 'Failed to read Oculix repository metadata.\n' >&2
+    return 1
+  fi
+  oculix_ci_default_branch="$(jq -r '.default_branch // empty' <<<"$metadata")"
+  if [[ -z "$oculix_ci_default_branch" ]]; then
+    printf 'Oculix repository metadata did not include a default branch.\n' >&2
+    return 1
+  fi
+
+  if ! oculix_ci_commit_sha="$(
+    gh api \
+      --method GET \
+      "repos/${oculix_release_repository}/commits/${oculix_ci_default_branch}" \
+      --jq '.sha'
+  )"; then
+    printf 'Failed to resolve the Oculix default branch.\n' >&2
+    return 1
+  fi
+  if [[ ! "$oculix_ci_commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Oculix default branch did not resolve to a commit SHA.\n' >&2
+    return 1
+  fi
+
+  if ! entries="$(
+    gh api \
+      --method GET \
+      "repos/${oculix_release_repository}/contents/.github/workflows" \
+      -f ref="$oculix_ci_commit_sha"
+  )"; then
+    printf 'Failed to list Oculix CI workflows.\n' >&2
+    return 1
+  fi
+  if ! paths="$(
+    jq -r '
+      .[] |
+      select(
+        .type == "file" and
+        (.path | test("[.]ya?ml$"))
+      ) |
+      .path
+    ' <<<"$entries"
+  )"; then
+    printf 'Failed to parse the Oculix workflow listing.\n' >&2
+    return 1
+  fi
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    encoded="${path//\//%2F}"
+    if ! content="$(
+      gh api \
+        --method GET \
+        "repos/${oculix_release_repository}/contents/${encoded}" \
+        -f ref="$oculix_ci_commit_sha" |
+        jq -r '.content | gsub("\n"; "") | @base64d'
+    )"; then
+      printf 'Failed to read Oculix workflow %s.\n' "$path" >&2
+      return 1
+    fi
+
+    while IFS= read -r record; do
+      [[ -n "$record" ]] || continue
+      kind="${record%%$'\t'*}"
+      case "$kind" in
+        literal)
+          oculix_ci_declarations+="${record#*$'\t'}"$'\n'
+          ;;
+        ignored)
+          oculix_ci_ignored+="${record#*$'\t'}"$'\n'
+          ;;
+      esac
+    done < <(extract_java_version_evidence "$path" <<<"$content")
+  done <<<"$paths"
+
+  oculix_ci_declarations="${oculix_ci_declarations%$'\n'}"
+  oculix_ci_ignored="${oculix_ci_ignored%$'\n'}"
+}
+
+oculix_ci_dominant_major() {
+  local majors
+
+  majors="$(
+    if [[ -n "$oculix_ci_declarations" ]]; then
+      cut -f 4 <<<"$oculix_ci_declarations"
+    fi
+  )"
+  dominant_major <<<"$majors"
+}
+
+format_oculix_java_counts() {
+  if [[ -z "$oculix_ci_declarations" ]]; then
+    printf '%s' "- No literal numeric declarations found."
+    return
+  fi
+
+  cut -f 4 <<<"$oculix_ci_declarations" |
+    sort -n |
+    uniq -c |
+    awk '{ printf "- Java %s: %s declaration%s\n", $2, $1, ($1 == 1 ? "" : "s") }'
+}
+
+format_oculix_java_declarations() {
+  local path line raw major link
+
+  if [[ -z "$oculix_ci_declarations" ]]; then
+    printf '%s' "- None."
+    return
+  fi
+
+  while IFS=$'\t' read -r path line raw major; do
+    link="https://github.com/${oculix_release_repository}/blob/${oculix_ci_commit_sha}/${path}#L${line}"
+    printf -- "- \`%s:%s\` — \`%s\` → Java %s ([source](%s))\n" \
+      "$path" "$line" "$raw" "$major" "$link"
+  done <<<"$oculix_ci_declarations"
+}
+
+format_oculix_java_ignored() {
+  local path line raw reason link
+
+  if [[ -z "$oculix_ci_ignored" ]]; then
+    printf '%s' "- None."
+    return
+  fi
+
+  while IFS=$'\t' read -r path line raw reason; do
+    link="https://github.com/${oculix_release_repository}/blob/${oculix_ci_commit_sha}/${path}#L${line}"
+    printf -- "- \`%s:%s\` — \`%s\` (%s; [source](%s))\n" \
+      "$path" "$line" "$raw" "$reason" "$link"
+  done <<<"$oculix_ci_ignored"
+}
+
+watch_oculix_jdk() {
+  local configured dominant disposition counts declarations ignored body
+  local snapshot_url resolution
+
+  configured="$(configured_java_major)"
+  if ! collect_oculix_ci_java_evidence; then
+    printf 'Skipping Oculix JDK drift issue changes because upstream evidence is unavailable.\n' >&2
+    return
+  fi
+  dominant="$(oculix_ci_dominant_major)"
+  counts="$(format_oculix_java_counts)"
+  declarations="$(format_oculix_java_declarations)"
+  ignored="$(format_oculix_java_ignored)"
+  snapshot_url="https://github.com/${oculix_release_repository}/tree/${oculix_ci_commit_sha}/.github/workflows"
+
+  if [[ -n "$dominant" && "$dominant" == "$configured" ]]; then
+    resolution="JDK major drift resolved automatically: the configured Temurin major (${configured}) matches the unique dominant Oculix CI major (${dominant}) again.
+
+Evidence snapshot: ${snapshot_url}"
+    resolve_issue "$jdk_drift_issue_title" "$resolution"
+    printf 'No Oculix JDK major drift: configured %s matches dominant %s.\n' \
+      "$configured" "$dominant"
+    return
+  fi
+
+  if [[ -z "$dominant" ]]; then
+    disposition="No unique dominant Java major could be established. Human review is required; no target major is proposed."
+  else
+    disposition="The unique dominant Oculix CI major is ${dominant}, which differs from configured Temurin ${configured}."
+  fi
+
+  body="Oculix CI JDK-major evidence no longer supports an automatic \"no drift\" result.
+
+- Configured policy: \`temurin-${configured}\` in \`${oculix_config_path}\`
+- Oculix default branch: \`${oculix_ci_default_branch}\`
+- Immutable evidence commit: [\`${oculix_ci_commit_sha}\`](${snapshot_url})
+- Result: ${disposition}
+
+## Observed counts
+
+${counts}
+
+## Literal declarations
+
+${declarations}
+
+## Ignored declarations
+
+${ignored}
+
+## Manual remediation
+
+1. Review the linked Oculix workflows and relevant release notes.
+2. Decide whether this repository should adopt another Java major.
+3. Intentionally update \`${oculix_config_path}\`.
+4. Refresh \`${oculix_lock_path}\` for every supported platform: \`${oculix_lock_platforms}\`.
+5. Run the complete policy and Oculix matrix before merging.
+
+This automation never changes the configured Java major and never creates a pull request."
+
+  sync_issue "$jdk_drift_issue_title" "$body"
 }
 
 update_oculix_pin() {
@@ -940,7 +1228,7 @@ Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
   if [[ -n "$details" ]]; then
     body+=$'\n\nDetails:\n'"${details}"
   fi
-  upsert_issue "$body"
+  upsert_issue "$maintenance_issue_title" "$body"
   return 1
 }
 
@@ -1046,53 +1334,97 @@ mark_ready() {
 }
 
 triage_issue_number() {
+  local title="$1"
+
   gh issue list \
     --repo "$repository" \
     --state open \
-    --search "\"${issue_title}\" in:title" \
+    --search "\"${title}\" in:title" \
     --json number,title \
-    --jq ".[] |
-      select(.title == \"${issue_title}\") |
-      .number" |
-    head -n 1
+    --jq '.[] | [.number, .title] | @tsv' |
+    awk -F '\t' -v title="$title" '$2 == title { print $1; exit }'
 }
 
 ensure_issue() {
-  local body="$1"
+  local title="$1"
+  local body="$2"
   local existing
 
   if [[ "$dry_run" == "true" ]]; then
-    printf 'Would ensure maintenance problem is reported:\n%s\n' "$body"
+    printf 'Would ensure issue exists: %s\n%s\n' "$title" "$body"
     return
   fi
 
-  existing="$(triage_issue_number)"
+  existing="$(triage_issue_number "$title")"
   if [[ -z "$existing" ]]; then
     gh issue create \
       --repo "$repository" \
-      --title "$issue_title" \
+      --title "$title" \
       --body "$body"
   fi
 }
 
 upsert_issue() {
-  local body="$1"
+  local title="$1"
+  local body="$2"
   local existing
 
   if [[ "$dry_run" == "true" ]]; then
-    printf 'Would report maintenance problems:\n%s\n' "$body"
+    printf 'Would report issue update: %s\n%s\n' "$title" "$body"
     return
   fi
 
-  existing="$(triage_issue_number)"
+  existing="$(triage_issue_number "$title")"
   if [[ -n "$existing" ]]; then
     gh issue comment "$existing" --repo "$repository" --body "$body"
   else
     gh issue create \
       --repo "$repository" \
-      --title "$issue_title" \
+      --title "$title" \
       --body "$body"
   fi
+}
+
+sync_issue() {
+  local title="$1"
+  local body="$2"
+  local existing
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would synchronize generated issue: %s\n%s\n' "$title" "$body"
+    return
+  fi
+
+  existing="$(triage_issue_number "$title")"
+  if [[ -n "$existing" ]]; then
+    gh issue edit "$existing" \
+      --repo "$repository" \
+      --title "$title" \
+      --body "$body"
+  else
+    gh issue create \
+      --repo "$repository" \
+      --title "$title" \
+      --body "$body"
+  fi
+}
+
+resolve_issue() {
+  local title="$1"
+  local body="$2"
+  local existing
+
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'Would resolve generated issue if open: %s\n%s\n' "$title" "$body"
+    return
+  fi
+
+  existing="$(triage_issue_number "$title")"
+  if [[ -z "$existing" ]]; then
+    return
+  fi
+  gh issue comment "$existing" --repo "$repository" --body "$body"
+  gh issue close "$existing" --repo "$repository" --reason completed
 }
 
 report_run() {
@@ -1108,7 +1440,7 @@ report_run() {
     body="Failed to inspect jobs for run ${GITHUB_RUN_ID}.
 
 Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
-    upsert_issue "$body"
+    upsert_issue "$maintenance_issue_title" "$body"
     return 1
   fi
   if ! failures="$(
@@ -1145,7 +1477,7 @@ Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
       body="Failed to inspect annotations for run ${GITHUB_RUN_ID}.
 
 Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
-      upsert_issue "$body"
+      upsert_issue "$maintenance_issue_title" "$body"
       return 1
     fi
     if ! found="$(
@@ -1175,7 +1507,7 @@ Run: ${GITHUB_SERVER_URL}/${repository}/actions/runs/${GITHUB_RUN_ID}"
   if [[ -n "$warning_lines" ]]; then
     body+=$'\n\nWarnings:\n'"${warning_lines}"
   fi
-  upsert_issue "$body"
+  upsert_issue "$maintenance_issue_title" "$body"
   return 1
 }
 
@@ -1211,31 +1543,54 @@ checked() {
   fi
 }
 
-case "${1:-}" in
-  checked)
-    shift
-    checked "$@"
-    ;;
-  plan)
-    plan
-    ;;
-  prepare-mise)
-    prepare_mise
-    ;;
-  prepare-tools)
-    prepare_tools
-    ;;
-  prepare-extras-oculix)
-    prepare_extras_oculix
-    ;;
-  ready)
-    mark_ready
-    ;;
-  report-run)
-    report_run
-    ;;
-  *)
-    printf 'Unknown toolchain maintenance command: %s\n' "${1:-}" >&2
-    exit 2
-    ;;
-esac
+load_default_branch() {
+  default_branch="$(gh api "repos/${repository}" --jq '.default_branch')"
+  if [[ -z "$default_branch" ]]; then
+    printf 'Failed to read the repository default branch.\n' >&2
+    return 1
+  fi
+}
+
+main() {
+  if [[ -z "$repository" ]]; then
+    printf 'GITHUB_REPOSITORY is required.\n' >&2
+    return 2
+  fi
+
+  case "${1:-}" in
+    checked)
+      shift
+      checked "$@"
+      ;;
+    plan)
+      plan
+      ;;
+    prepare-mise)
+      load_default_branch
+      prepare_mise
+      ;;
+    prepare-tools)
+      prepare_tools
+      ;;
+    prepare-extras-oculix)
+      prepare_extras_oculix
+      ;;
+    watch-oculix-jdk)
+      watch_oculix_jdk
+      ;;
+    ready)
+      mark_ready
+      ;;
+    report-run)
+      report_run
+      ;;
+    *)
+      printf 'Unknown toolchain maintenance command: %s\n' "${1:-}" >&2
+      return 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

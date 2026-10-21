@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+printf '%q ' "$@" >>"${GH_LOG:?}"
+printf '\n' >>"${GH_LOG}"
+
+scenario="${GH_SCENARIO:-match}"
+snapshot_sha="${SNAPSHOT_SHA:?}"
+
+option_value() {
+  local option="$1"
+  shift
+  while (($#)); do
+    if [[ "$1" == "$option" && $# -ge 2 ]]; then
+      printf '%s' "$2"
+      return
+    fi
+    shift
+  done
+}
+
+has_argument() {
+  local expected="$1"
+  shift
+  local argument
+  for argument in "$@"; do
+    [[ "$argument" == "$expected" ]] && return 0
+  done
+  return 1
+}
+
+field_value() {
+  local field="$1"
+  shift
+  while (($#)); do
+    if [[ "$1" == "-f" && $# -ge 2 && "$2" == "${field}="* ]]; then
+      printf '%s' "${2#*=}"
+      return
+    fi
+    shift
+  done
+}
+
+record_issue_mutation() {
+  local event="$1"
+  shift
+  local title body
+
+  printf '%s\n' "$event" >>"${GH_EVENTS:?}"
+  title="$(option_value --title "$@")"
+  body="$(option_value --body "$@")"
+  if [[ -n "$title" ]]; then
+    printf '%s' "$title" >"${GH_TITLE:?}"
+  fi
+  if [[ -n "$body" ]]; then
+    printf '%s' "$body" >"${GH_BODY:?}"
+  fi
+}
+
+workflow_names() {
+  case "$scenario" in
+    no-declarations)
+      printf '%s\n' \
+        ".github/workflows/no-java.yml" \
+        ".github/workflows/ignored.yml"
+      ;;
+    tie)
+      printf '%s\n' \
+        ".github/workflows/java-17-a.yml" \
+        ".github/workflows/java-17-b.yml" \
+        ".github/workflows/java-21-a.yml" \
+        ".github/workflows/java-21-b.yml"
+      ;;
+    *)
+      printf '%s\n' \
+        ".github/workflows/unquoted.yml" \
+        ".github/workflows/double-quoted.yml" \
+        ".github/workflows/single-quoted.yml" \
+        ".github/workflows/outlier.yml" \
+        ".github/workflows/ignored.yml"
+      ;;
+  esac
+}
+
+workflow_content() {
+  local path="$1"
+  case "$path" in
+    */unquoted.yml)
+      if [[ "$scenario" == "match" || "$scenario" == "match-existing" ]]; then
+        printf '%s\n' "jobs:" "  test:" "    java-version: 17"
+      else
+        printf '%s\n' "jobs:" "  test:" "    java-version: 21"
+      fi
+      ;;
+    */double-quoted.yml)
+      if [[ "$scenario" == "match" || "$scenario" == "match-existing" ]]; then
+        printf '%s\n' "java-version: \"17.0.12\""
+      else
+        printf '%s\n' "java-version: \"21.0.4\""
+      fi
+      ;;
+    */single-quoted.yml)
+      if [[ "$scenario" == "match" || "$scenario" == "match-existing" ]]; then
+        printf '%s\n' "java-version: '17'"
+      else
+        printf '%s\n' "java-version: '21'"
+      fi
+      ;;
+    */outlier.yml)
+      if [[ "$scenario" == "match" || "$scenario" == "match-existing" ]]; then
+        printf '%s\n' "java-version: 21"
+      else
+        printf '%s\n' "java-version: 17"
+      fi
+      ;;
+    */ignored.yml)
+      # `${{ matrix.java }}` is literal GitHub Actions fixture syntax.
+      # shellcheck disable=SC2016
+      printf '%s\n' \
+        'java-version: ${{ matrix.java }}' \
+        "java-version: '17-21'"
+      ;;
+    */no-java.yml)
+      printf '%s\n' "name: no java declaration"
+      ;;
+    */java-17-a.yml | */java-17-b.yml)
+      printf '%s\n' "java-version: 17"
+      ;;
+    */java-21-a.yml | */java-21-b.yml)
+      printf '%s\n' "java-version: 21"
+      ;;
+    *)
+      printf 'Unexpected workflow path: %s\n' "$path" >&2
+      exit 91
+      ;;
+  esac
+}
+
+emit_workflow_listing() {
+  local names name first=true
+
+  names="$(workflow_names)"
+  if has_argument --jq "$@"; then
+    printf '%s\n' "$names"
+    return
+  fi
+
+  printf '['
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      printf ','
+    fi
+    printf '{"name":"%s","path":"%s","type":"file"}' \
+      "${name##*/}" "$name"
+  done <<<"$names"
+  printf ']\n'
+}
+
+emit_workflow_tree() {
+  local names name first=true
+
+  names="$(workflow_names)"
+  if has_argument --jq "$@"; then
+    printf '%s\n' "$names"
+    return
+  fi
+
+  printf '{"tree":['
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      printf ','
+    fi
+    printf '{"path":"%s","type":"blob"}' "$name"
+  done <<<"$names"
+  printf ']}\n'
+}
+
+emit_workflow_file() {
+  local endpoint="$1"
+  shift
+  local path content ref
+
+  if [[ "$scenario" == "content-failure" && "$endpoint" == *"outlier.yml"* ]]; then
+    printf 'mock workflow read failure\n' >&2
+    exit 1
+  fi
+  ref="$(field_value ref "$@")"
+  if [[ "$endpoint" != *"${snapshot_sha}"* && "$ref" != "$snapshot_sha" ]]; then
+    printf 'workflow fetch was not pinned to snapshot %s: %s\n' \
+      "$snapshot_sha" "$endpoint" >&2
+    exit 92
+  fi
+
+  path="${endpoint#*contents/}"
+  path="${path%%\\?*}"
+  path="${path%%?ref=*}"
+  path="${path//%2F//}"
+  content="$(workflow_content "$path")"
+  if has_argument --jq "$@"; then
+    printf '%s' "$content" | base64 | tr -d '\n'
+  elif has_argument application/vnd.github.raw+json "$@"; then
+    printf '%s\n' "$content"
+  else
+    printf '{"content":"'
+    printf '%s' "$content" | base64 | tr -d '\n'
+    printf '","encoding":"base64","path":"%s","sha":"fixture"}\n' "$path"
+  fi
+}
+
+command="${1:-}"
+shift || true
+
+case "$command" in
+  api)
+    endpoint=""
+    for argument in "$@"; do
+      if [[ "$argument" == repos/* || "$argument" == https://api.github.com/* ]]; then
+        endpoint="$argument"
+        break
+      fi
+    done
+    case "$endpoint" in
+      repos/oculix-org/Oculix)
+        if [[ "$scenario" == "default-branch-failure" ]]; then
+          exit 1
+        fi
+        if has_argument --jq "$@"; then
+          printf 'master\n'
+        else
+          printf '{"default_branch":"master"}\n'
+        fi
+        ;;
+      repos/oculix-org/Oculix/commits/master* | \
+        repos/oculix-org/Oculix/branches/master* | \
+        repos/oculix-org/Oculix/git/ref/heads/master*)
+        if [[ "$scenario" == "snapshot-failure" ]]; then
+          exit 1
+        fi
+        if has_argument --jq "$@"; then
+          printf '%s\n' "$snapshot_sha"
+        else
+          printf '{"sha":"%s","commit":{"sha":"%s"},"object":{"sha":"%s"}}\n' \
+            "$snapshot_sha" "$snapshot_sha" "$snapshot_sha"
+        fi
+        ;;
+      repos/oculix-org/Oculix/git/trees/*)
+        if [[ "$scenario" == "workflow-list-failure" ]]; then
+          exit 1
+        fi
+        [[ "$endpoint" == *"$snapshot_sha"* ]] || exit 92
+        emit_workflow_tree "$@"
+        ;;
+      repos/oculix-org/Oculix/contents/.github/workflows)
+        if [[ "$scenario" == "workflow-list-failure" ]]; then
+          exit 1
+        fi
+        [[ "$endpoint" == *"$snapshot_sha"* ||
+          "$(field_value ref "$@")" == "$snapshot_sha" ]] || exit 92
+        emit_workflow_listing "$@"
+        ;;
+      repos/oculix-org/Oculix/contents/*)
+        emit_workflow_file "$endpoint" "$@"
+        ;;
+      *)
+        printf 'Unexpected gh api endpoint: %s\n' "$endpoint" >&2
+        exit 93
+        ;;
+    esac
+    ;;
+  issue)
+    subcommand="${1:-}"
+    shift || true
+    case "$subcommand" in
+      list)
+        if [[ -s "${GH_STATE:?}" ]]; then
+          printf '%s\t%s\n' "$(cat "$GH_STATE")" \
+            "Oculix JDK major drift detected"
+        fi
+        ;;
+      create)
+        record_issue_mutation create "$@"
+        printf '73\n' >"$GH_STATE"
+        printf 'https://github.com/sbalswa/oculix/issues/73\n'
+        ;;
+      comment)
+        record_issue_mutation comment "$@"
+        ;;
+      close)
+        record_issue_mutation close "$@"
+        : >"$GH_STATE"
+        ;;
+      edit)
+        record_issue_mutation edit "$@"
+        ;;
+      *)
+        printf 'Unexpected gh issue command: %s\n' "$subcommand" >&2
+        exit 94
+        ;;
+    esac
+    ;;
+  *)
+    printf 'Unexpected gh command: %s\n' "$command" >&2
+    exit 95
+    ;;
+esac
