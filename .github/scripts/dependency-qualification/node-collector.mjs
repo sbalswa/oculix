@@ -353,7 +353,10 @@ function parseLock(lock, requestedChannel, lockRepositoryPath) {
       );
     }
     const filename = parsedUrl.pathname.split("/").at(-1);
+    const canonicalUrl =
+      `https://nodejs.org/dist/v${version}/${filename}`;
     if (
+      url !== canonicalUrl ||
       parsedUrl.origin !== "https://nodejs.org" ||
       parsedUrl.username !== "" ||
       parsedUrl.password !== "" ||

@@ -389,40 +389,49 @@ test("platform headers accept comments but reject unsupported syntax and case",
     }
   });
 
-test("lock artifact URLs require the exact canonical Node pathname",
+test("lock artifact URLs require the exact original canonical Node URL",
   async (context) => {
     const directory = await mkdtemp(join(tmpdir(), "node-artifact-path-"));
     context.after(() => rm(directory, { force: true, recursive: true }));
-    await Promise.all([
-      writeFile(
-        join(directory, "config.toml"),
-        await fixture("config.web-e2e.toml"),
-      ),
-      writeFile(
-        join(directory, "noncanonical.lock"),
-        (await fixture("mise.web-e2e.lock")).replace(
-          "https://nodejs.org/dist/v24.22.0/" +
-            "node-v24.22.0-linux-arm64.tar.gz",
-          "https://nodejs.org/mirror/dist/v24.22.0/" +
-            "node-v24.22.0-linux-arm64.tar.gz",
-        ),
-      ),
-    ]);
-
-    await assert.rejects(
-      collectNodeObservation({
-        capabilityCatalogPath: CAPABILITY_PATH,
-        configPath: "config.toml",
-        generatedAt: GENERATED_AT,
-        lockPath: "noncanonical.lock",
-        releaseMetadata: releaseMetadata(
-          await fixture("releases.current.json"),
-        ),
-        repository: REPOSITORY,
-        repositoryRoot: directory,
-      }),
-      /URL does not bind Node 24\.22\.0/,
+    await writeFile(
+      join(directory, "config.toml"),
+      await fixture("config.web-e2e.toml"),
     );
+    const lock = await fixture("mise.web-e2e.lock");
+    const filename = "node-v24.22.0-linux-arm64.tar.gz";
+    const canonical =
+      `https://nodejs.org/dist/v24.22.0/${filename}`;
+    const aliases = [
+      `https://nodejs.org/mirror/dist/v24.22.0/${filename}`,
+      `https://nodejs.org:443/dist/v24.22.0/${filename}`,
+      `HTTPS://NODEJS.ORG/dist/v24.22.0/${filename}`,
+      `https://nodejs.org/dist/v24.22.0/./${filename}`,
+      `https://nodejs.org/dist/v24.22.0/%6eode-v24.22.0-linux-arm64.tar.gz`,
+      `${canonical}?download=1`,
+      `${canonical}#artifact`,
+    ];
+
+    for (const [index, alias] of aliases.entries()) {
+      const lockPath = `noncanonical-${index}.lock`;
+      await writeFile(
+        join(directory, lockPath),
+        lock.replace(canonical, alias),
+      );
+      await assert.rejects(
+        collectNodeObservation({
+          capabilityCatalogPath: CAPABILITY_PATH,
+          configPath: "config.toml",
+          generatedAt: GENERATED_AT,
+          lockPath,
+          releaseMetadata: releaseMetadata(
+            await fixture("releases.current.json"),
+          ),
+          repository: REPOSITORY,
+          repositoryRoot: directory,
+        }),
+        /URL does not bind Node 24\.22\.0/,
+      );
+    }
   });
 
 test("duplicate or conflicting keys fail in tool and platform blocks",
