@@ -858,11 +858,52 @@ export async function readNpmMetadata(
   selector = "latest",
   { execute = execFileAsync } = {},
 ) {
+  let exactSelector = selector;
+  if (selector !== "latest") {
+    try {
+      exactSelector = parseExactSemver(
+        selector,
+        `${packageName} npm selector`,
+      ).value;
+    } catch {
+      const { stdout: versionsOutput } = await execute(
+        "npm",
+        ["view", `${packageName}@${selector}`, "version", "--json"],
+        {
+          encoding: "utf8",
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      const discovered = parseJson(
+        versionsOutput,
+        `npm versions for ${packageName}@${selector}`,
+      );
+      const versions = Array.isArray(discovered)
+        ? discovered
+        : [discovered];
+      if (
+        versions.length === 0 ||
+        versions.some(
+          (version) =>
+            parseExactSemver(
+              version,
+              `${packageName} discovered version`,
+            ).value !== version ||
+            !semverRangeSatisfies(version, selector),
+        )
+      ) {
+        throw new Error(
+          `npm returned invalid versions for ${packageName}@${selector}`,
+        );
+      }
+      exactSelector = sortedUnique(versions).sort(compareSemver).at(-1);
+    }
+  }
   const { stdout } = await execute(
     "npm",
     [
       "view",
-      `${packageName}@${selector}`,
+      `${packageName}@${exactSelector}`,
       "name",
       "version",
       "dist",
@@ -876,7 +917,17 @@ export async function readNpmMetadata(
       maxBuffer: 1024 * 1024,
     },
   );
-  return parseJson(stdout, `npm metadata for ${packageName}`);
+  const metadata = parseJson(stdout, `npm metadata for ${packageName}`);
+  if (
+    Array.isArray(metadata) ||
+    metadata?.version === undefined ||
+    (exactSelector !== "latest" && metadata.version !== exactSelector)
+  ) {
+    throw new Error(
+      `npm metadata for ${packageName} does not match exact selector ${exactSelector}`,
+    );
+  }
+  return metadata;
 }
 
 export async function collectSeleniumObservation({

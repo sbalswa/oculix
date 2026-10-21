@@ -23,6 +23,7 @@ import {
   normalizeSemverRange,
   parseExactSemver,
   qualifySeleniumCandidate,
+  readNpmMetadata,
   SELENIUM_MANAGED_PATHS,
   semverRangeSatisfies,
 } from "./selenium-collector.mjs";
@@ -660,6 +661,35 @@ test("collects a deterministic immutable candidate cohort", async () => {
   } finally {
     await repository.cleanup();
   }
+});
+
+test("npm range discovery selects and re-queries one exact highest version", async () => {
+  const calls = [];
+  const metadata = {
+    name: "axe-core",
+    version: "4.15.2",
+    dist: {
+      integrity: "sha512-ZXhhY3Q=",
+      tarball: "https://registry.npmjs.org/axe-core/-/axe-core-4.15.2.tgz",
+    },
+    engines: { node: ">=4.0.0" },
+  };
+  const result = await readNpmMetadata("axe-core", "~4.15.0", {
+    execute: async (_command, arguments_) => {
+      calls.push(arguments_);
+      return {
+        stdout: arguments_.length === 4
+          ? JSON.stringify(["4.15.0", "4.15.2", "4.15.1"])
+          : JSON.stringify(metadata),
+      };
+    },
+  });
+
+  assert.deepEqual(result, metadata);
+  assert.deepEqual(
+    calls.map((arguments_) => arguments_[1]),
+    ["axe-core@~4.15.0", "axe-core@4.15.2"],
+  );
 });
 
 test("emits machine-evaluable Node, browser-driver, and axe relations", async () => {
