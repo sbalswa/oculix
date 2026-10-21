@@ -145,6 +145,47 @@ async function packageState(repository) {
   );
 }
 
+async function writePassingArtifacts(packageRoot) {
+  for (const scenario of ["smoke", "web-calculator"]) {
+    const resultRoot = join(packageRoot, "test-results", scenario);
+    await mkdir(join(resultRoot, "html-report"), { recursive: true });
+    await mkdir(join(resultRoot, "artifacts"), { recursive: true });
+    await writeFile(join(resultRoot, "html-report/index.html"), "<html></html>\n");
+    await writeFile(join(resultRoot, "playwright-report.json"), "{}\n");
+    await writeFile(join(resultRoot, "artifacts/video.webm"), "video\n");
+    await writeFile(
+      join(resultRoot, "result.json"),
+      `${JSON.stringify({
+        capabilityId: "playwright-ubuntu-chromium",
+        scenario,
+        status: "passed",
+        assertion: { status: "passed" },
+        accessibility:
+          scenario === "web-calculator"
+            ? {
+                status: "passed",
+                counts: { violations: { rules: 0, nodes: 0 } },
+              }
+            : { status: "not-run", counts: null },
+      })}\n`,
+    );
+  }
+  const calculatorRoot = join(
+    packageRoot,
+    "test-results/web-calculator",
+  );
+  await writeFile(join(calculatorRoot, "accessibility.json"), "{}\n");
+  await writeFile(
+    join(calculatorRoot, "accessibility-summary.json"),
+    '{"status":"passed","counts":{"violations":{"rules":0,"nodes":0}}}\n',
+  );
+  await writeFile(
+    join(calculatorRoot, "accessibility-summary.md"),
+    "# Accessibility\n\nPassed.\n",
+  );
+  await writeFile(join(calculatorRoot, "final.png"), "png\n");
+}
+
 test("collection is deterministic and records the complete candidate cohort", async () => {
   const repository = await createRepository();
   try {
@@ -371,10 +412,10 @@ test("warning-free all-capability evidence independently qualifies", async () =>
       createWorkspace: candidateWorkspace,
       async runStep(step) {
         phases.push(step.phase);
+        if (step.scenario === "web-calculator") {
+          await writePassingArtifacts(step.cwd);
+        }
         return { exitCode: 0, warnings: [] };
-      },
-      async inspectCapability() {
-        return passingInspection();
       },
     });
     const after = await packageState(repository);
