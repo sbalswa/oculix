@@ -113,6 +113,9 @@ const MUTABLE_SEED_MANIFEST_KIND =
   "repository-mutable-seed-manifest";
 const TRUSTED_INPUT_MANIFEST_KIND =
   "repository-trusted-input-manifest";
+const EXECUTOR_CANDIDATE_CODE = "untrusted";
+const EXECUTOR_NETWORK =
+  "pinned-candidate-registry-plus-loopback-only";
 const SAFE_ENVIRONMENT_OVERRIDES = new Set([
   "NPM_CONFIG_STRICT_SSL",
 ]);
@@ -2566,6 +2569,7 @@ function executorPolicy({
     schema_version: 1,
     kind: "selenium-isolated-executor-policy",
     executor_id: executorId,
+    candidate_code: EXECUTOR_CANDIDATE_CODE,
     candidate_digest: plan.candidate_digest,
     repository_revision: plan.repository.revision,
     plan_digest: hash(plan),
@@ -2581,7 +2585,7 @@ function executorPolicy({
     isolation: {
       disposable: true,
       github_api_access: false,
-      network: "candidate-registry-only",
+      network: EXECUTOR_NETWORK,
       privileges: "unprivileged",
       repository_write_access: false,
       secrets: "none",
@@ -2732,7 +2736,9 @@ export function createSeleniumExecutorAttestation({
   );
   if (
     hash(policy) !== request.policy_digest ||
-    policy.executor_id !== request.executor_id
+    policy.executor_id !== request.executor_id ||
+    policy.candidate_code !== EXECUTOR_CANDIDATE_CODE ||
+    policy.isolation?.network !== EXECUTOR_NETWORK
   ) {
     throw new Error(
       "Selenium executor attestation policy does not bind its request",
@@ -2748,6 +2754,7 @@ export function createSeleniumExecutorAttestation({
     issued_at: request.issued_at,
     expires_at: request.expires_at,
     executor_id: request.executor_id,
+    candidate_code: policy.candidate_code,
     candidate_digest: request.candidate_digest,
     repository_revision: request.repository_revision,
     plan_digest: request.plan_digest,
@@ -2846,6 +2853,7 @@ function validateExecutorAttestation(
 ) {
   const keys = new Set([
     "authority_digest",
+    "candidate_code",
     "candidate_digest",
     "challenge",
     "expires_at",
@@ -2900,6 +2908,7 @@ function validateExecutorAttestation(
     issued_at: request.issued_at,
     expires_at: request.expires_at,
     executor_id: request.executor_id,
+    candidate_code: EXECUTOR_CANDIDATE_CODE,
     candidate_digest: request.candidate_digest,
     repository_revision: request.repository_revision,
     plan_digest: request.plan_digest,
@@ -2924,7 +2933,7 @@ function validateExecutorAttestation(
     isolation: {
       disposable: true,
       github_api_access: false,
-      network: "candidate-registry-only",
+      network: EXECUTOR_NETWORK,
       privileges: "unprivileged",
       repository_write_access: false,
       secrets: "none",
@@ -3883,6 +3892,7 @@ function validateArtifactPolicy(policy, plan, authority) {
     policy,
     new Set([
       "authority",
+      "candidate_code",
       "candidate_digest",
       "environment",
       "executor_id",
@@ -3965,7 +3975,7 @@ function validateArtifactPolicy(policy, plan, authority) {
   const expectedIsolation = {
     disposable: true,
     github_api_access: false,
-    network: "candidate-registry-only",
+    network: EXECUTOR_NETWORK,
     privileges: "unprivileged",
     repository_write_access: false,
     secrets: "none",
@@ -3989,6 +3999,7 @@ function validateArtifactPolicy(policy, plan, authority) {
     policy.kind !== "selenium-isolated-executor-policy" ||
     typeof policy.executor_id !== "string" ||
     !EXECUTOR_ID_PATTERN.test(policy.executor_id) ||
+    policy.candidate_code !== EXECUTOR_CANDIDATE_CODE ||
     policy.candidate_digest !== plan.candidate_digest ||
     policy.repository_revision !== plan.repository.revision ||
     policy.plan_digest !== hash(plan) ||
