@@ -196,60 +196,40 @@ function validationState(observation, validation, contractOptions) {
   }
 }
 
-function parseVersion(value) {
-  const match =
-    /^[v=]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u
-      .exec(value.trim());
+const NODE_MAJOR_RELATION =
+  "node-runtime major must equal node-release-channel";
+const VERSION_PART = "(?:0|[1-9][0-9]*)";
+const FULL_VERSION_PATTERN = new RegExp(
+  `^(${VERSION_PART})\\.(${VERSION_PART})\\.(${VERSION_PART})$`,
+  "u",
+);
+const PARTIAL_VERSION_PATTERN = new RegExp(
+  `^(${VERSION_PART})(?:\\.(${VERSION_PART}))?(?:\\.(${VERSION_PART}))?$`,
+  "u",
+);
+
+function parseVersion(value, { allowPartial = false } = {}) {
+  if (typeof value !== "string") {
+    throw new Error("semantic version must be a string");
+  }
+  const pattern = allowPartial
+    ? PARTIAL_VERSION_PATTERN
+    : FULL_VERSION_PATTERN;
+  const match = pattern.exec(value);
   if (match === null) {
-    throw new Error(`unsupported version ${value}`);
+    throw new Error(`unsupported semantic version ${value}`);
+  }
+  const parts = match.slice(1).map((part) =>
+    part === undefined ? 0 : Number(part),
+  );
+  if (parts.some((part) => !Number.isSafeInteger(part))) {
+    throw new Error(`unsupported semantic version ${value}`);
   }
   return {
-    major: Number(match[1]),
-    minor: match[2] === undefined ? 0 : Number(match[2]),
-    patch: match[3] === undefined ? 0 : Number(match[3]),
-    precision:
-      match[3] === undefined ? (match[2] === undefined ? 1 : 2) : 3,
-    prerelease:
-      match[4] === undefined ? [] : match[4].split("."),
+    major: parts[0],
+    minor: parts[1],
+    patch: parts[2],
   };
-}
-
-function comparePrerelease(left, right) {
-  if (left.length === 0 && right.length === 0) {
-    return 0;
-  }
-  if (left.length === 0) {
-    return 1;
-  }
-  if (right.length === 0) {
-    return -1;
-  }
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    if (left[index] === undefined) {
-      return -1;
-    }
-    if (right[index] === undefined) {
-      return 1;
-    }
-    const leftNumeric = /^\d+$/u.test(left[index]);
-    const rightNumeric = /^\d+$/u.test(right[index]);
-    if (leftNumeric && rightNumeric) {
-      const difference = Number(left[index]) - Number(right[index]);
-      if (difference !== 0) {
-        return Math.sign(difference);
-      }
-      continue;
-    }
-    if (leftNumeric !== rightNumeric) {
-      return leftNumeric ? -1 : 1;
-    }
-    const difference = compareStrings(left[index], right[index]);
-    if (difference !== 0) {
-      return difference;
-    }
-  }
-  return 0;
 }
 
 function compareVersions(left, right) {
@@ -259,24 +239,36 @@ function compareVersions(left, right) {
       return Math.sign(difference);
     }
   }
-  return comparePrerelease(left.prerelease, right.prerelease);
+  return 0;
 }
 
-function incrementForPrecision(version, precision) {
-  if (precision === 1) {
+function tildeUpperBound(version) {
+  return {
+    ...version,
+    minor: version.minor + 1,
+    patch: 0,
+  };
+}
+
+function caretUpperBound(version) {
+  if (version.major > 0) {
     return {
       ...version,
       major: version.major + 1,
       minor: 0,
       patch: 0,
-      prerelease: [],
+    };
+  }
+  if (version.minor > 0) {
+    return {
+      ...version,
+      minor: version.minor + 1,
+      patch: 0,
     };
   }
   return {
     ...version,
-    minor: version.minor + 1,
-    patch: 0,
-    prerelease: [],
+    patch: version.patch + 1,
   };
 }
 
@@ -292,64 +284,13 @@ function comparatorMatches(version, operator, expected) {
     case "<=":
       return comparison <= 0;
     case "=":
-      if (expected.precision === 1) {
-        return version.major === expected.major;
-      }
-      if (expected.precision === 2) {
-        return (
-          version.major === expected.major &&
-          version.minor === expected.minor
-        );
-      }
       return comparison === 0;
     default:
       throw new Error(`unsupported version comparator ${operator}`);
   }
 }
 
-function wildcardMatches(version, token) {
-  const parts = token.replace(/^v/u, "").split(".");
-  const values = [version.major, version.minor, version.patch];
-  for (const [index, part] of parts.entries()) {
-    if (part === "*" || part.toLowerCase() === "x") {
-      return true;
-    }
-    if (!/^\d+$/u.test(part) || values[index] !== Number(part)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function caretUpperBound(version) {
-  if (version.major > 0) {
-    return {
-      ...version,
-      major: version.major + 1,
-      minor: 0,
-      patch: 0,
-      prerelease: [],
-    };
-  }
-  if (version.minor > 0) {
-    return {
-      ...version,
-      minor: version.minor + 1,
-      patch: 0,
-      prerelease: [],
-    };
-  }
-  return {
-    ...version,
-    patch: version.patch + 1,
-    prerelease: [],
-  };
-}
-
 function tokenMatches(version, token) {
-  if (/[*xX]/u.test(token)) {
-    return wildcardMatches(version, token);
-  }
   if (token.startsWith("^")) {
     const expected = parseVersion(token.slice(1));
     return (
@@ -361,35 +302,34 @@ function tokenMatches(version, token) {
     const expected = parseVersion(token.slice(1));
     return (
       compareVersions(version, expected) >= 0 &&
-      compareVersions(
-        version,
-        incrementForPrecision(expected, expected.precision),
-      ) < 0
+      compareVersions(version, tildeUpperBound(expected)) < 0
     );
   }
-  const match = /^(>=|<=|>|<|=)?(.+)$/u.exec(token);
-  const operator = match[1] ?? "=";
-  return comparatorMatches(version, operator, parseVersion(match[2]));
+  const comparator = /^(>=|<=|>|<)(.+)$/u.exec(token);
+  if (comparator !== null) {
+    return comparatorMatches(
+      version,
+      comparator[1],
+      parseVersion(comparator[2], { allowPartial: true }),
+    );
+  }
+  const exact = token.startsWith("=") ? token.slice(1) : token;
+  return comparatorMatches(version, "=", parseVersion(exact));
 }
 
 function rangeClauseMatches(version, clause) {
-  const hyphen =
-    /^(\S+)\s+-\s+(\S+)$/u.exec(clause);
-  if (hyphen !== null) {
-    const lower = parseVersion(hyphen[1]);
-    const upper = parseVersion(hyphen[2]);
-    return (
-      compareVersions(version, lower) >= 0 &&
-      compareVersions(version, upper) <= 0
-    );
+  if (
+    clause.length === 0 ||
+    clause.includes(",") ||
+    /[*xX]/u.test(clause)
+  ) {
+    throw new Error(`unsupported semantic version range ${clause}`);
   }
-  const tokens = clause
-    .replaceAll(",", " ")
-    .split(/\s+/u)
-    .filter(Boolean);
-  if (tokens.length === 0) {
-    throw new Error("version constraint must not be empty");
-  }
+  const normalized = clause.replace(
+    /(>=|<=|>|<|=)\s+(?=[0-9])/gu,
+    "$1",
+  );
+  const tokens = normalized.split(/\s+/u);
   return tokens.every((token) => tokenMatches(version, token));
 }
 
@@ -398,10 +338,92 @@ export function versionSatisfies(versionValue, constraint) {
     throw new Error("version constraint must be a nonempty string");
   }
   const version = parseVersion(versionValue);
-  return constraint
-    .split("||")
-    .map((clause) => clause.trim())
-    .some((clause) => rangeClauseMatches(version, clause));
+  const clauses = constraint.split("||").map((clause) => clause.trim());
+  if (clauses.some((clause) => clause.length === 0)) {
+    throw new Error(`unsupported semantic version range ${constraint}`);
+  }
+  return clauses.some((clause) => rangeClauseMatches(version, clause));
+}
+
+function supported(satisfied) {
+  return {
+    satisfied,
+    supported: true,
+  };
+}
+
+function unsupported() {
+  return {
+    satisfied: false,
+    supported: false,
+  };
+}
+
+function evaluateVersionRange(version, constraint) {
+  try {
+    return supported(versionSatisfies(version, constraint));
+  } catch {
+    return unsupported();
+  }
+}
+
+function parseJsonObject(value) {
+  if (!value.trimStart().startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      return undefined;
+    }
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseKeyValueConstraint(value) {
+  const entries = new Map();
+  const parts = value.split(";");
+  for (const part of parts) {
+    const separator = part.indexOf("=");
+    if (separator < 1) {
+      return null;
+    }
+    const key = part.slice(0, separator);
+    const entryValue = part.slice(separator + 1);
+    if (
+      !/^[a-z][a-z0-9-]*$/u.test(key) ||
+      entryValue.length === 0 ||
+      entries.has(key)
+    ) {
+      return null;
+    }
+    entries.set(key, entryValue);
+  }
+  return entries;
+}
+
+function parseVersionObject(value) {
+  const parsed = parseJsonObject(value);
+  return parsed === undefined ? null : parsed;
+}
+
+function evaluateRanges(version, ranges) {
+  for (const range of ranges) {
+    const result = evaluateVersionRange(version, range);
+    if (!result.supported) {
+      return result;
+    }
+    if (!result.satisfied) {
+      return result;
+    }
+  }
+  return supported(true);
 }
 
 function componentSelection(component, providerState) {
@@ -417,6 +439,18 @@ function componentSelection(component, providerState) {
   };
 }
 
+function hasStateScopedRequiresConstraint(constraint) {
+  if (constraint === null) {
+    return false;
+  }
+  const entries = parseKeyValueConstraint(constraint);
+  return (
+    entries !== null &&
+    entries.has("current") &&
+    entries.has("candidate")
+  );
+}
+
 function relationIsActive(relation, from, to, providerStates) {
   const fromProviderState = providerStates.get(from.providerId);
   const toProviderState = providerStates.get(to.providerId);
@@ -427,9 +461,14 @@ function relationIsActive(relation, from, to, providerStates) {
         fromProviderState === "candidate" ||
         toProviderState === "candidate"
       );
+    case "requires":
+      return (
+        from.selection.state === "candidate" ||
+        (toProviderState === "candidate" &&
+          hasStateScopedRequiresConstraint(relation.constraint))
+      );
     case "bundles":
     case "must-match":
-    case "requires":
     case "uses-external":
       return from.selection.state === "candidate";
     default:
@@ -437,68 +476,309 @@ function relationIsActive(relation, from, to, providerStates) {
   }
 }
 
-function stateConstraintMatches(constraint, from, to) {
+function stateConstraintEvaluation(constraint, from, to) {
   switch (constraint) {
     case "candidate":
-      return to.selection.state === "candidate";
+      return supported(to.selection.state === "candidate");
     case "current":
-      return to.selection.state === "current";
+      return supported(to.selection.state === "current");
     case "same-state":
     case "lockstep":
-      return from.selection.state === to.selection.state;
+      return supported(from.selection.state === to.selection.state);
     default:
       return null;
   }
 }
 
-function relationMatches(relation, from, to) {
-  const stateMatch =
+function evaluateNodeMajorRelation(from, to) {
+  try {
+    const runtime = parseVersion(from.selection.version);
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(to.selection.version)) {
+      return unsupported();
+    }
+    const channel = Number(to.selection.version);
+    if (!Number.isSafeInteger(channel)) {
+      return unsupported();
+    }
+    return supported(runtime.major === channel);
+  } catch {
+    return unsupported();
+  }
+}
+
+function evaluateRequires(constraint, from, to) {
+  if (constraint === null) {
+    return supported(to.selection.state === "candidate");
+  }
+  if (constraint === NODE_MAJOR_RELATION) {
+    return evaluateNodeMajorRelation(from, to);
+  }
+
+  const json = parseJsonObject(constraint);
+  if (json !== null) {
+    if (
+      json === undefined ||
+      Object.keys(json).length === 0 ||
+      Object.values(json).some((value) => typeof value !== "string")
+    ) {
+      return unsupported();
+    }
+    return evaluateRanges(to.selection.version, Object.values(json));
+  }
+
+  const entries = parseKeyValueConstraint(constraint);
+  if (
+    entries !== null &&
+    [...entries.keys()].every((key) =>
+      ["candidate", "current", "root"].includes(key),
+    ) &&
+    entries.has("candidate") &&
+    entries.has("current")
+  ) {
+    const selectedRange = entries.get(from.selection.state);
+    if (selectedRange === "none") {
+      return unsupported();
+    }
+    const ranges = [
+      ...(entries.has("root") ? [entries.get("root")] : []),
+      selectedRange,
+    ];
+    return evaluateRanges(to.selection.version, ranges);
+  }
+
+  const cypress =
+    /^(.+); repository Node ((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)) \(configured ((?:0|[1-9][0-9]*))\)$/u
+      .exec(constraint);
+  if (cypress !== null) {
+    let repositoryVersion;
+    try {
+      repositoryVersion = parseVersion(cypress[2]);
+    } catch {
+      return unsupported();
+    }
+    if (repositoryVersion.major !== Number(cypress[3])) {
+      return supported(false);
+    }
+    return evaluateVersionRange(to.selection.version, cypress[1]);
+  }
+
+  return evaluateVersionRange(to.selection.version, constraint);
+}
+
+function evaluateMustMatch(constraint, from, to) {
+  if (constraint === null) {
+    return supported(from.selection.version === to.selection.version);
+  }
+  const json = parseJsonObject(constraint);
+  if (json !== null) {
+    const source = parseVersionObject(from.selection.version);
+    if (
+      json === undefined ||
+      source === null ||
+      Object.keys(json).length === 0 ||
+      Object.values(json).some((value) => typeof value !== "string")
+    ) {
+      return unsupported();
+    }
+    const values = Object.values(json);
+    return supported(
+      new Set(values).size === 1 &&
+      Object.entries(json).every(([key, value]) => source[key] === value),
+    );
+  }
+
+  const entries = parseKeyValueConstraint(constraint);
+  if (
+    entries !== null &&
+    entries.has("browser-key") &&
+    entries.has("driver-key")
+  ) {
+    return supported(
+      entries.get("browser-key") !== "missing" &&
+      entries.get("browser-key") === entries.get("driver-key"),
+    );
+  }
+
+  const cypress =
+    /^Cypress package ((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)) must match the downloaded Cypress binary$/u
+      .exec(constraint);
+  if (cypress !== null) {
+    return supported(
+      from.selection.version === cypress[1] &&
+      to.selection.version === cypress[1],
+    );
+  }
+
+  return evaluateVersionRange(to.selection.version, constraint);
+}
+
+function splitPackageReference(value) {
+  const separator = value.lastIndexOf("@");
+  if (separator < 1 || separator === value.length - 1) {
+    return null;
+  }
+  return {
+    name: value.slice(0, separator),
+    version: value.slice(separator + 1),
+  };
+}
+
+function evaluateBundles(constraint, from, to) {
+  if (to.selection.state !== "candidate") {
+    return supported(false);
+  }
+  if (constraint === null) {
+    return supported(true);
+  }
+  const json = parseJsonObject(constraint);
+  if (json !== null) {
+    const source = parseVersionObject(from.selection.version);
+    const target = parseVersionObject(to.selection.version);
+    const packageReference =
+      typeof json?.package === "string"
+        ? splitPackageReference(json.package)
+        : null;
+    if (
+      json === undefined ||
+      source === null ||
+      target === null ||
+      packageReference === null ||
+      typeof json.browser !== "string" ||
+      typeof json.revision !== "string"
+    ) {
+      return unsupported();
+    }
+    return supported(
+      source[packageReference.name] === packageReference.version &&
+      target.name === json.browser &&
+      target.revision === json.revision,
+    );
+  }
+  return evaluateVersionRange(to.selection.version, constraint);
+}
+
+function evaluateExternalBrowser(constraint, to) {
+  const targetEntries = to.selection.version.split(", ");
+  const requirements = constraint.split("; ");
+  if (requirements.length === 0) {
+    return unsupported();
+  }
+  for (const requirement of requirements) {
+    const match =
+      /^([a-z0-9]+(?:-[a-z0-9]+)*) requires ([a-z0-9-]+) on ([a-z0-9-]+) \(([^()]+)\)$/u
+        .exec(requirement);
+    if (match === null) {
+      return unsupported();
+    }
+    const [, , browser, runner, version] = match;
+    if (
+      !targetEntries.some(
+        (entry) =>
+          entry.startsWith(`${browser}@${version} on `) &&
+          entry.endsWith(`/${runner}`),
+      )
+    ) {
+      return supported(false);
+    }
+  }
+  return supported(true);
+}
+
+function evaluateUsesExternal(constraint, to) {
+  if (constraint === null) {
+    return supported(true);
+  }
+  if (constraint.includes(" requires ") && constraint.includes(" on ")) {
+    return evaluateExternalBrowser(constraint, to);
+  }
+  return evaluateVersionRange(to.selection.version, constraint);
+}
+
+function evaluatePolicyAlign(constraint, from, to) {
+  if (constraint === null) {
+    return supported(from.selection.version === to.selection.version);
+  }
+  const json = parseJsonObject(constraint);
+  if (json !== null) {
+    const source = parseVersionObject(from.selection.version);
+    const packageReference =
+      typeof json?.package === "string"
+        ? splitPackageReference(json.package)
+        : null;
+    const peerReference =
+      typeof json?.peer === "string"
+        ? splitPackageReference(json.peer)
+        : null;
+    if (
+      json === undefined ||
+      source === null ||
+      packageReference === null ||
+      peerReference === null
+    ) {
+      return unsupported();
+    }
+    if (
+      source[packageReference.name] !== packageReference.version ||
+      typeof source[peerReference.name] !== "string"
+    ) {
+      return supported(false);
+    }
+    return evaluateVersionRange(
+      source[peerReference.name],
+      peerReference.version,
+    );
+  }
+
+  const entries = parseKeyValueConstraint(constraint);
+  if (entries !== null) {
+    const peerRange = entries.get(
+      `${from.selection.state}-selenium-peer`,
+    );
+    if (peerRange === undefined || peerRange === "none") {
+      return unsupported();
+    }
+    return evaluateVersionRange(to.selection.version, peerRange);
+  }
+
+  const cypress =
+    /^axe-core ((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)) remains an independently tested accessibility advisory$/u
+      .exec(constraint);
+  if (cypress !== null) {
+    return supported(to.selection.version === cypress[1]);
+  }
+  return evaluateVersionRange(to.selection.version, constraint);
+}
+
+function relationEvaluation(relation, from, to) {
+  const stateEvaluation =
     relation.constraint === null
       ? null
-      : stateConstraintMatches(relation.constraint, from, to);
-  if (stateMatch !== null) {
-    return stateMatch;
+      : stateConstraintEvaluation(relation.constraint, from, to);
+  if (stateEvaluation !== null) {
+    return stateEvaluation;
   }
 
   switch (relation.type) {
     case "requires":
-      if (relation.constraint === null) {
-        return to.selection.state === "candidate";
-      }
-      return versionSatisfies(
-        to.selection.version,
-        relation.constraint,
-      );
+      return evaluateRequires(relation.constraint, from, to);
     case "bundles":
-      if (to.selection.state !== "candidate") {
-        return false;
-      }
-      return (
-        relation.constraint === null ||
-        versionSatisfies(to.selection.version, relation.constraint)
-      );
+      return evaluateBundles(relation.constraint, from, to);
     case "must-match":
-      if (relation.constraint === null) {
-        return from.selection.version === to.selection.version;
-      }
-      return versionSatisfies(
-        to.selection.version,
-        relation.constraint,
-      );
+      return evaluateMustMatch(relation.constraint, from, to);
     case "shares-runtime":
-    case "policy-align":
       if (relation.constraint === null) {
-        return from.selection.version === to.selection.version;
+        return supported(
+          from.selection.version === to.selection.version,
+        );
       }
-      return versionSatisfies(
+      return evaluateVersionRange(
         to.selection.version,
         relation.constraint,
       );
     case "uses-external":
-      return (
-        relation.constraint === null ||
-        versionSatisfies(to.selection.version, relation.constraint)
-      );
+      return evaluateUsesExternal(relation.constraint, to);
+    case "policy-align":
+      return evaluatePolicyAlign(relation.constraint, from, to);
     default:
       throw new Error(`unsupported relation type ${relation.type}`);
   }
@@ -583,7 +863,8 @@ function evaluateAssignment({
     if (!relationIsActive(relation, from, to, providerStates)) {
       continue;
     }
-    if (!relationMatches(relation, from, to)) {
+    const evaluation = relationEvaluation(relation, from, to);
+    if (!evaluation.supported || !evaluation.satisfied) {
       (relation.hard ? hardViolations : advisoryViolations)
         .push(relation.id);
     }
@@ -669,6 +950,22 @@ function closestFailure(evaluations) {
     )[0];
 }
 
+function candidateFailureBlockers(candidate, evaluations) {
+  const closest = [...evaluations]
+    .filter(
+      (evaluation) =>
+        evaluation.selectedProviders.has(candidate.providerId) &&
+        !evaluation.compatible,
+    )
+    .sort(
+      (left, right) =>
+        left.hardViolations.length - right.hardViolations.length ||
+        right.selectedCount - left.selectedCount ||
+        compareStrings(left.assignment.id, right.assignment.id),
+    )[0];
+  return closest?.hardViolations ?? [candidate.providerId];
+}
+
 function reasonCodeForAdvisory(relationId) {
   return `ADVISORY_${relationId.toUpperCase().replaceAll("-", "_")}`;
 }
@@ -730,6 +1027,27 @@ function dispositionFor({
   }
 
   if (maximal.length > 0) {
+    const viableProviders = new Set(
+      maximal.flatMap((evaluation) =>
+        [...evaluation.selectedProviders],
+      ),
+    );
+    const intrinsic = candidateRecords.filter(
+      (candidate) =>
+        candidate.eligibility === "eligible" &&
+        !viableProviders.has(candidate.providerId),
+    );
+    if (intrinsic.length > 0) {
+      return {
+        blockers: sortedUnique(
+          intrinsic.flatMap((candidate) =>
+            candidateFailureBlockers(candidate, evaluations),
+          ),
+        ),
+        reasonCodes: ["INTRINSIC_CANDIDATE_INCOMPATIBLE"],
+        state: "incompatible",
+      };
+    }
     return {
       blockers: fullEvaluation.hardViolations,
       reasonCodes: ["CANDIDATES_MUTUALLY_EXCLUSIVE"],
@@ -811,17 +1129,44 @@ export function solveTrafficControl(providerSetOrInput, options = {}) {
   const candidateRecords = [];
   for (const observation of providers) {
     const capabilities = candidateCapabilities(observation);
+    const validation = validationsByProvider.get(
+      observation.provider_id,
+    );
+    if (
+      observation.disposition.state === "unknown" ||
+      observation.disposition.state === "unavailable"
+    ) {
+      if (capabilities.length === 0 && validation !== undefined) {
+        throw new Error(
+          `validation ${observation.provider_id} has no candidate observation`,
+        );
+      }
+      const status = validationState(
+        observation,
+        validation,
+        contractOptions,
+      );
+      candidateRecords.push({
+        ...status,
+        capabilities,
+        digest:
+          capabilities.length === 0
+            ? null
+            : subjectDigest(observation),
+        observation,
+        providerId: observation.provider_id,
+        validation,
+      });
+      continue;
+    }
     if (capabilities.length === 0) {
-      if (validationsByProvider.has(observation.provider_id)) {
+      if (validation !== undefined) {
         throw new Error(
           `validation ${observation.provider_id} has no candidate observation`,
         );
       }
       continue;
     }
-    const validation = validationsByProvider.get(
-      observation.provider_id,
-    );
     const status = validationState(
       observation,
       validation,
