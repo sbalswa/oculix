@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -32,6 +32,7 @@ import {
   validateIndependentQualification,
   validateProviderSet,
 } from "./contract.mjs";
+import { createScenarioReporter } from "../../../tests/e2e/selenium/reporting.mjs";
 
 const FIXTURE_ROOT = new URL(
   "../../../tests/dependency-qualification/fixtures/selenium/",
@@ -170,8 +171,9 @@ function relation(observation, id) {
 
 function deterministicClock() {
   let second = 0;
+  const start = Date.parse("2026-10-21T18:10:00Z");
   return () => {
-    const value = new Date(`2026-10-21T18:10:${String(second).padStart(2, "0")}Z`);
+    const value = new Date(start + second * 1000);
     second += 1;
     return value;
   };
@@ -187,12 +189,12 @@ function rawResult({ stdout = "", stderr = "", exitCode = 0 } = {}) {
 }
 
 async function executeRaw(step, context) {
-  const packageCommand = new Set([
-    "cache-selenium-axe-tarball",
-    "cache-selenium-webdriver-tarball",
-    "apply-selenium-tarballs",
-    "install-selenium-candidate",
-  ]).has(step.id);
+  const packageCommand =
+    step.id.startsWith("cache-selenium-") ||
+    new Set([
+      "apply-selenium-tarballs",
+      "install-selenium-candidate",
+    ]).has(step.id);
   try {
     const { stdout, stderr } = await execFileAsync(
       step.command,
@@ -269,6 +271,7 @@ async function localNpmCandidates() {
     name: "axe-core",
     version: "4.15.0",
     type: "module",
+    engines: { node: ">=4.0.0" },
   };
   const axeCore = await packLocalCandidate(root, axeCorePackage);
   const axe = await packLocalCandidate(root, {
@@ -336,6 +339,13 @@ async function localNpmCandidates() {
       engines: { node: ">=24.0.0" },
       peerDependencies: { "selenium-webdriver": ">=4.40.0" },
     },
+    "axe-core": {
+      ...axeCorePackage,
+      dist: {
+        tarball: `https://127.0.0.1:${port}/${axeCore.filename}`,
+        integrity: `sha512-${createHash("sha512").update(axeCore.content).digest("base64")}`,
+      },
+    },
     "selenium-webdriver": {
       name: "selenium-webdriver",
       version: "4.52.0",
@@ -371,13 +381,7 @@ async function localNpmCandidates() {
     name: "axe-core",
     "dist-tags": { latest: "4.15.0" },
     versions: {
-      "4.15.0": {
-        ...axeCorePackage,
-        dist: {
-          tarball: `https://127.0.0.1:${port}/${axeCore.filename}`,
-          integrity: `sha512-${createHash("sha512").update(axeCore.content).digest("base64")}`,
-        },
-      },
+      "4.15.0": metadata["axe-core"],
     },
   });
   return {
@@ -395,6 +399,7 @@ async function localNpmCandidates() {
 async function materializeInstalledPackages(packageRoot) {
   for (const [name, version] of [
     ["@axe-core/webdriverjs", "4.15.0"],
+    ["axe-core", "4.15.0"],
     ["selenium-webdriver", "4.52.0"],
   ]) {
     const directory = join(packageRoot, "node_modules", ...name.split("/"));
@@ -411,27 +416,89 @@ async function writeCapabilityArtifacts(
   workspaceRoot,
   capabilityId,
   reportPaths,
+  runner = {
+    browser: {
+      digest: digest("#!/bin/sh\nprintf 'Chromium 141.0.7390.54\\n'\n"),
+      realpath: "/usr/bin/chromium",
+      version: "141.0.7390.54",
+    },
+    driver: {
+      digest: digest("#!/bin/sh\nprintf 'ChromeDriver 141.0.7390.54\\n'\n"),
+      realpath: "/usr/bin/chromedriver",
+      version: "141.0.7390.54",
+    },
+  },
 ) {
   for (const reportPath of reportPaths) {
     const scenario = reportPath.split("/").at(-2);
-    const directory = dirname(join(workspaceRoot, reportPath));
-    await mkdir(directory, { recursive: true });
-    await writeFile(join(directory, "result.png"), "png\n", "utf8");
-    await writeFile(
-      join(directory, "result.json"),
-      `${JSON.stringify({
-        schemaVersion: 1,
-        capability: { id: capabilityId },
-        scenario,
-        status: "passed",
-        assertion: { status: "passed" },
-        accessibility:
-          scenario === "web-calculator"
-            ? { status: "passed", counts: { violations: 0 } }
-            : { status: "not-run", counts: null },
-      })}\n`,
-      "utf8",
+    const diagnosticsDirectory = join(
+      workspaceRoot,
+      "tests",
+      "e2e",
+      "selenium",
+      "diagnostics",
     );
+    const assertion =
+      scenario === "smoke"
+        ? {
+            actual: "clicked",
+            expected: "clicked",
+            name: "selenium smoke button state",
+          }
+        : {
+            actual: "238",
+            expected: "238",
+            name: "web-calculator final display",
+          };
+    const reporter = await createScenarioReporter({
+      assertion,
+      diagnosticsDirectory,
+      repositoryDirectory: workspaceRoot,
+      scenario,
+      versions: {
+        axeCore: "4.15.0",
+        axeWebdriver: "4.15.0",
+        selenium: "4.52.0",
+      },
+    });
+    reporter.recordMetadata({
+      browser: "chromium",
+      browserExecutable: runner.browser,
+      browserName: "chrome",
+      browserVersion: "141.0.7390.54",
+      driverExecutable: runner.driver,
+      driverVersion: "141.0.7390.54",
+      hostDistribution: "ubuntu",
+      hostPlatform: "linux",
+      nodeVersion: "v24.0.0",
+      os: capabilityId.split("-")[1],
+      platformName: "linux",
+    });
+    reporter.recordAssertion({
+      actual: assertion.actual,
+      status: "passed",
+    });
+    await mkdir(reporter.directory, { recursive: true });
+    await writeFile(reporter.paths.screenshot, "png\n", "utf8");
+    if (scenario === "web-calculator") {
+      const accessibility = {
+        incomplete: [],
+        inapplicable: [],
+        passes: [],
+        testEngine: { version: "4.15.0" },
+        violations: [],
+      };
+      await writeFile(
+        reporter.paths.accessibility,
+        `${JSON.stringify(accessibility)}\n`,
+      );
+      await writeFile(
+        reporter.paths.accessibilitySummary,
+        "# Selenium accessibility\n",
+      );
+      reporter.recordAccessibility(accessibility);
+    }
+    await reporter.write({ status: "passed" });
   }
 }
 
@@ -449,7 +516,11 @@ async function materializeCandidateLock(packageRoot) {
   const metadata = await fixture("npm-candidates.json");
   lock.packages[""].dependencies["@axe-core/webdriverjs"] = "4.15.0";
   lock.packages[""].dependencies["selenium-webdriver"] = "4.52.0";
-  for (const name of ["@axe-core/webdriverjs", "selenium-webdriver"]) {
+  for (const name of [
+    "@axe-core/webdriverjs",
+    "axe-core",
+    "selenium-webdriver",
+  ]) {
     lock.packages[`node_modules/${name}`] = {
       version: metadata[name].version,
       resolved: metadata[name].dist.tarball,
@@ -476,23 +547,46 @@ function passingRunner(observed, overrides = {}) {
     if (step.id === "install-selenium-candidate") {
       await materializeInstalledPackages(context.packageRoot);
     }
-    if (step.id === "verify-runner-browser") {
+    if (step.kind === "browser-identity") {
       return rawResult({
         stdout: "Chromium 141.0.7390.54\n",
         ...overrides.browser,
       });
     }
-    if (step.id === "verify-runner-driver") {
+    if (step.kind === "driver-identity") {
       return rawResult({
         stdout: "ChromeDriver 141.0.7390.54\n",
         ...overrides.driver,
       });
     }
-    if (step.id.endsWith("-artifact-contracts")) {
+    if (
+      overrides.artifacts !== false &&
+      step.kind === "command" &&
+      step.scenario !== null
+    ) {
       await writeCapabilityArtifacts(
         context.workspaceRoot,
         step.capability_id,
-        JSON.parse(step.environment.E2E_RESULT_REPORTS),
+        [
+          `tests/e2e/selenium/diagnostics/${step.scenario}/result.json`,
+        ],
+        {
+          browser: {
+            digest:
+              context.environment.E2E_BROWSER_EXECUTABLE_DIGEST,
+            realpath:
+              context.environment.E2E_BROWSER_EXECUTABLE_REALPATH,
+            version:
+              context.environment.E2E_BROWSER_EXECUTABLE_VERSION,
+          },
+          driver: {
+            digest: context.environment.E2E_DRIVER_EXECUTABLE_DIGEST,
+            realpath:
+              context.environment.E2E_DRIVER_EXECUTABLE_REALPATH,
+            version:
+              context.environment.E2E_DRIVER_EXECUTABLE_VERSION,
+          },
+        },
       );
     }
     return rawResult(
@@ -888,7 +982,7 @@ test("qualification plan installs immutable tarballs and binds executables", asy
       mutation_boundary: "tests/e2e/selenium",
       managed_paths: SELENIUM_MANAGED_PATHS,
     });
-    assert.equal(cacheSteps.length, 2);
+    assert.equal(cacheSteps.length, 3);
     assert.ok(
       cacheSteps.every(
         ({ arguments: arguments_ }) =>
@@ -902,6 +996,12 @@ test("qualification plan installs immutable tarballs and binds executables", asy
       cacheSteps.some(({ arguments: arguments_ }) =>
         arguments_.includes(
           "https://registry.npmjs.org/@axe-core/webdriverjs/-/webdriverjs-4.15.0.tgz",
+        )),
+    );
+    assert.ok(
+      cacheSteps.some(({ arguments: arguments_ }) =>
+        arguments_.includes(
+          "https://registry.npmjs.org/axe-core/-/axe-core-4.15.0.tgz",
         )),
     );
     assert.ok(
@@ -1046,6 +1146,76 @@ test("qualification requires the exact clean source checkout", async () => {
   }
 });
 
+test("source and materialized workspace symlinks cannot escape their roots", async () => {
+  for (const mode of ["absolute", "relative"]) {
+    const repository = await createRepository();
+    try {
+      const outside = join(
+        dirname(repository.root),
+        `selenium-source-outside-${mode}-${Date.now()}`,
+      );
+      await writeFile(outside, "outside\n");
+      const link = join(repository.root, `source-${mode}-escape`);
+      await symlink(
+        mode === "absolute" ? outside : relative(repository.root, outside),
+        link,
+      );
+      await execFileAsync("git", ["add", "--all"], { cwd: repository.root });
+      await execFileAsync(
+        "git",
+        ["commit", "--quiet", "-m", `source ${mode} escape`],
+        { cwd: repository.root },
+      );
+      const observation = await collectQualificationCandidate(repository);
+      await assert.rejects(
+        qualify(repository, observation),
+        /Source repository symlink .* escapes its root/u,
+      );
+      await rm(outside, { force: true });
+    } finally {
+      await repository.cleanup();
+    }
+  }
+
+  for (const mode of ["absolute", "relative"]) {
+    const repository = await createRepository();
+    let outside;
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      await assert.rejects(
+        qualify(repository, observation, {
+          materializeWorkspace: async (source, destination) => {
+            await cp(source, destination, {
+              recursive: true,
+              filter: (path) =>
+                !relative(source, path)
+                  .split("/")
+                  .includes(".git"),
+            });
+            outside = join(
+              dirname(destination),
+              `workspace-outside-${mode}`,
+            );
+            await writeFile(outside, "outside\n");
+            await symlink(
+              mode === "absolute"
+                ? outside
+                : relative(destination, outside),
+              join(destination, `workspace-${mode}-escape`),
+            );
+          },
+        }),
+        /Ephemeral workspace symlink .* escapes its root/u,
+      );
+    } finally {
+      if (outside !== undefined) {
+        await rm(outside, { force: true });
+      }
+      await repository.cleanup();
+    }
+  }
+});
+
 test("controlled ephemeral execution independently qualifies all capabilities", async () => {
   const repository = await createRepository();
   let temporaryRoot;
@@ -1162,14 +1332,9 @@ test("real npm creates and installs the candidate manifest and lock", async () =
       runCommand: async (step, context) => {
         observed.push({ step, context });
         if (
-          [
-            "cache-selenium-axe-tarball",
-            "cache-selenium-webdriver-tarball",
-            "apply-selenium-tarballs",
-            "install-selenium-candidate",
-            "verify-runner-browser",
-            "verify-runner-driver",
-          ].includes(step.id)
+          step.id.startsWith("cache-selenium-") ||
+          step.id === "apply-selenium-tarballs" ||
+          step.id === "install-selenium-candidate"
         ) {
           const raw = await executeRaw(step, context);
           if (step.id === "apply-selenium-tarballs") {
@@ -1185,11 +1350,39 @@ test("real npm creates and installs the candidate manifest and lock", async () =
           }
           return raw;
         }
-        if (step.id.endsWith("-artifact-contracts")) {
+        if (step.kind === "browser-identity") {
+          return rawResult({ stdout: "Chromium 141.0.7390.54\n" });
+        }
+        if (step.kind === "driver-identity") {
+          return rawResult({
+            stdout: "ChromeDriver 141.0.7390.54\n",
+          });
+        }
+        if (step.kind === "command" && step.scenario !== null) {
           await writeCapabilityArtifacts(
             context.workspaceRoot,
             step.capability_id,
-            JSON.parse(step.environment.E2E_RESULT_REPORTS),
+            [
+              `tests/e2e/selenium/diagnostics/${step.scenario}/result.json`,
+            ],
+            {
+              browser: {
+                digest:
+                  context.environment.E2E_BROWSER_EXECUTABLE_DIGEST,
+                realpath:
+                  context.environment.E2E_BROWSER_EXECUTABLE_REALPATH,
+                version:
+                  context.environment.E2E_BROWSER_EXECUTABLE_VERSION,
+              },
+              driver: {
+                digest:
+                  context.environment.E2E_DRIVER_EXECUTABLE_DIGEST,
+                realpath:
+                  context.environment.E2E_DRIVER_EXECUTABLE_REALPATH,
+                version:
+                  context.environment.E2E_DRIVER_EXECUTABLE_VERSION,
+              },
+            },
           );
         }
         return rawResult();
@@ -1207,10 +1400,12 @@ test("real npm creates and installs the candidate manifest and lock", async () =
     });
     for (const [name, metadata] of Object.entries(localRegistry.metadata)) {
       const locked = generatedLock.packages[`node_modules/${name}`];
-      assert.equal(
-        generatedLock.packages[""].dependencies[name],
-        metadata.version,
-      );
+      if (name !== "axe-core") {
+        assert.equal(
+          generatedLock.packages[""].dependencies[name],
+          metadata.version,
+        );
+      }
       assert.equal(locked.version, metadata.version);
       assert.equal(locked.resolved, metadata.dist.tarball);
       assert.equal(locked.integrity, metadata.dist.integrity);
@@ -1272,7 +1467,7 @@ test("wrong lock integrity cannot pass preparation", async () => {
   try {
     const observation = await collectQualificationCandidate(repository);
     const observed = [];
-    const runner = passingRunner(observed);
+    const runner = passingRunner(observed, { artifacts: false });
     const result = await qualify(repository, observation, {
       runCommand: async (step, context) => {
         const raw = await runner(step, context);
@@ -1387,6 +1582,110 @@ test("runner executable realpath and digest are checked independently", async ()
   }
 });
 
+test("runner replacement after package tests or during a scenario cannot qualify", async () => {
+  for (const replacementPoint of ["package-tests", "scenario"]) {
+    for (const kind of ["browser", "driver"]) {
+      const repository = await createRepository();
+      try {
+        const observation = await collectQualificationCandidate(repository);
+        const runner = passingRunner([]);
+        let replaced = false;
+        const result = await qualify(repository, observation, {
+          runCommand: async (step, context) => {
+            const raw = await runner(step, context);
+            const replaceNow =
+              (replacementPoint === "package-tests" &&
+                step.id === "test-selenium-package") ||
+              (replacementPoint === "scenario" &&
+                step.kind === "command" &&
+                step.scenario === "smoke");
+            if (replaceNow && !replaced) {
+              replaced = true;
+              await writeFile(
+                repository.runnerEvidence[kind].realpath,
+                `#!/bin/sh\nprintf '${kind === "browser" ? "Chromium" : "ChromeDriver"} 141.0.7390.54\\n'\n# replaced\n`,
+                { mode: 0o755 },
+              );
+            }
+            return raw;
+          },
+        });
+
+        assert.equal(replaced, true);
+        assert.ok(
+          result.validation.disposition.reason_codes.some((code) =>
+            [
+              "RUNNER_EXECUTABLE_IDENTITY_MISMATCH",
+              "CAPABILITY_EXECUTION_FAILED",
+            ].includes(code)),
+          `${replacementPoint}/${kind}`,
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    }
+  }
+});
+
+test("axe-core lock and installed identities are exact and immutable", async () => {
+  for (const mutation of ["lock-version", "lock-integrity", "installed"]) {
+    const repository = await createRepository();
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      const runner = passingRunner([]);
+      const result = await qualify(repository, observation, {
+        runCommand: async (step, context) => {
+          const raw = await runner(step, context);
+          if (
+            step.id === "apply-selenium-tarballs" &&
+            mutation.startsWith("lock-")
+          ) {
+            const lockPath = join(context.packageRoot, "package-lock.json");
+            const lock = JSON.parse(await readFile(lockPath, "utf8"));
+            const axeCore = lock.packages["node_modules/axe-core"];
+            if (mutation === "lock-version") {
+              axeCore.version = "4.14.0";
+            } else {
+              axeCore.integrity = "sha512-Zm9yZ2Vk";
+            }
+            await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+          }
+          if (
+            step.id === "install-selenium-candidate" &&
+            mutation === "installed"
+          ) {
+            const installedPath = join(
+              context.packageRoot,
+              "node_modules",
+              "axe-core",
+              "package.json",
+            );
+            await writeFile(
+              installedPath,
+              `${JSON.stringify({
+                name: "axe-core",
+                version: "4.14.0",
+              })}\n`,
+            );
+          }
+          return raw;
+        },
+      });
+
+      assert.deepEqual(result.validation.disposition, {
+        state: "blocked",
+        reason_codes: [
+          mutation === "installed"
+            ? "INSTALLED_PACKAGE_MISMATCH"
+            : "LOCK_VERIFICATION_FAILED",
+        ],
+      });
+    } finally {
+      await repository.cleanup();
+    }
+  }
+});
+
 test("captured warnings prevent independent admission", async () => {
   const repository = await createRepository();
   try {
@@ -1429,7 +1728,7 @@ test("missing artifacts prevent independent admission", async () => {
   try {
     const observation = await collectQualificationCandidate(repository);
     const observed = [];
-    const runner = passingRunner(observed);
+    const runner = passingRunner(observed, { artifacts: false });
     const result = await qualify(repository, observation, {
       runCommand: async (step, context) => {
         if (step.id.endsWith("-artifact-contracts")) {
@@ -1553,6 +1852,79 @@ test("reports must bijectively cover the selected scenario set", async () => {
     );
   } finally {
     await repository.cleanup();
+  }
+});
+
+test("reports reject forged or missing package and runner identities", async () => {
+  const mutations = [
+    ["tool.version", (report, missing) => {
+      if (missing) delete report.tool.version;
+      else report.tool.version = "4.51.0";
+    }],
+    ["tool.accessibility.integrationVersion", (report, missing) => {
+      if (missing) delete report.tool.accessibility.integrationVersion;
+      else report.tool.accessibility.integrationVersion = "4.14.0";
+    }],
+    ["tool.accessibility.engineVersion", (report, missing) => {
+      if (missing) delete report.tool.accessibility.engineVersion;
+      else report.tool.accessibility.engineVersion = "4.14.0";
+    }],
+    ["environment.browserVersion", (report, missing) => {
+      if (missing) delete report.environment.browserVersion;
+      else report.environment.browserVersion = "140.0.0.0";
+    }],
+    ["environment.driverVersion", (report, missing) => {
+      if (missing) delete report.environment.driverVersion;
+      else report.environment.driverVersion = "140.0.0.0";
+    }],
+    ["environment.browserExecutable", (report, missing) => {
+      if (missing) delete report.environment.browserExecutable;
+      else report.environment.browserExecutable.digest = `sha256:${"0".repeat(64)}`;
+    }],
+    ["environment.driverExecutable", (report, missing) => {
+      if (missing) delete report.environment.driverExecutable;
+      else report.environment.driverExecutable.realpath = "/tmp/forged-driver";
+    }],
+  ];
+
+  for (const [field, mutate] of mutations) {
+    for (const missing of [false, true]) {
+      const repository = await createRepository();
+      try {
+        const observation = await collectQualificationCandidate(repository);
+        const runner = passingRunner([]);
+        const result = await qualify(repository, observation, {
+          runCommand: async (step, context) => {
+            const raw = await runner(step, context);
+            if (
+              step.id ===
+              "selenium-linux-chromium-artifact-contracts"
+            ) {
+              const reportPath = join(
+                context.workspaceRoot,
+                "tests/e2e/selenium/diagnostics/smoke/result.json",
+              );
+              const report = JSON.parse(await readFile(reportPath, "utf8"));
+              mutate(report, missing);
+              await writeFile(
+                reportPath,
+                `${JSON.stringify(report, null, 2)}\n`,
+              );
+            }
+            return raw;
+          },
+        });
+
+        assert.ok(
+          result.validation.disposition.reason_codes.includes(
+            "ARTIFACT_VALIDATION_FAILED",
+          ),
+          `${missing ? "missing" : "forged"} ${field}`,
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    }
   }
 });
 

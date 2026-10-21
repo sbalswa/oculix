@@ -45,8 +45,17 @@ const CATALOG_PATH = "tests/e2e/capabilities.json";
 const BROWSER_POLICY_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/configuration.mjs`;
 const DRIVER_POLICY_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/setup.mjs`;
 const AXE_PACKAGE = "@axe-core/webdriverjs";
+const AXE_CORE_PACKAGE = "axe-core";
 const SELENIUM_PACKAGE = "selenium-webdriver";
-const PACKAGE_NAMES = Object.freeze([AXE_PACKAGE, SELENIUM_PACKAGE]);
+const DIRECT_PACKAGE_NAMES = Object.freeze([
+  AXE_PACKAGE,
+  SELENIUM_PACKAGE,
+]);
+const PACKAGE_NAMES = Object.freeze([
+  AXE_PACKAGE,
+  AXE_CORE_PACKAGE,
+  SELENIUM_PACKAGE,
+]);
 const AXE_COMPONENT = "selenium-axe-webdriverjs";
 const SELENIUM_COMPONENT = "selenium-webdriver";
 const BROWSER_COMPONENT = "selenium-runner-browser";
@@ -491,9 +500,13 @@ function immutableNpmRecord(packageName, raw) {
   return record;
 }
 
-function npmEvidence(record, observedAt) {
+function npmEvidence(
+  record,
+  observedAt,
+  type = "npm-package-metadata",
+) {
   return {
-    type: "npm-package-metadata",
+    type,
     locator: record.dist.tarball,
     revision: stableJson(record),
     digest: hash(record),
@@ -614,11 +627,17 @@ function readCurrentPackages(packageJson, packageLock) {
   }
   const packages = {};
   for (const name of PACKAGE_NAMES) {
-    const version = parseExactSemver(
-      dependencies[name],
-      `package.json.dependencies.${name}`,
-    ).value;
-    if (lockedDependencies[name] !== version) {
+    const direct = DIRECT_PACKAGE_NAMES.includes(name);
+    const version = direct
+      ? parseExactSemver(
+          dependencies[name],
+          `package.json.dependencies.${name}`,
+        ).value
+      : parseExactSemver(
+          packageLock.packages[`node_modules/${name}`]?.version,
+          `${name} lock version`,
+        ).value;
+    if (direct && lockedDependencies[name] !== version) {
       throw new Error(
         `package-lock root dependency ${name} must match package.json`,
       );
@@ -836,13 +855,14 @@ function relationsFor({
 
 export async function readNpmMetadata(
   packageName,
+  selector = "latest",
   { execute = execFileAsync } = {},
 ) {
   const { stdout } = await execute(
     "npm",
     [
       "view",
-      `${packageName}@latest`,
+      `${packageName}@${selector}`,
       "name",
       "version",
       "dist",
@@ -908,14 +928,35 @@ export async function collectSeleniumObservation({
   let candidate = null;
   let npmProblem = null;
   try {
-    candidate = Object.fromEntries(
-      await Promise.all(
-        PACKAGE_NAMES.map(async (name) => [
-          name,
-          immutableNpmRecord(name, await npm(name)),
-        ]),
-      ),
+    const axeWebdriver = immutableNpmRecord(
+      AXE_PACKAGE,
+      await npm(AXE_PACKAGE),
     );
+    candidate = {
+      [AXE_PACKAGE]: axeWebdriver,
+      [AXE_CORE_PACKAGE]: immutableNpmRecord(
+        AXE_CORE_PACKAGE,
+        await npm(
+          AXE_CORE_PACKAGE,
+          axeWebdriver.dependencies[AXE_CORE_PACKAGE],
+        ),
+      ),
+      [SELENIUM_PACKAGE]: immutableNpmRecord(
+        SELENIUM_PACKAGE,
+        await npm(SELENIUM_PACKAGE),
+      ),
+    };
+    if (
+      !semverRangeSatisfies(
+        candidate[AXE_CORE_PACKAGE].version,
+        candidate[AXE_PACKAGE].dependencies[AXE_CORE_PACKAGE],
+      )
+    ) {
+      throw new MetadataError(
+        "NPM_METADATA_INCOMPATIBLE",
+        "axe-core candidate does not satisfy @axe-core/webdriverjs",
+      );
+    }
     if (
       PACKAGE_NAMES.some(
         (name) =>
@@ -988,6 +1029,11 @@ export async function collectSeleniumObservation({
           ? null
           : packageRecord(candidateCohort[AXE_PACKAGE], [
               npmEvidence(candidateCohort[AXE_PACKAGE], observedAt),
+              npmEvidence(
+                candidateCohort[AXE_CORE_PACKAGE],
+                observedAt,
+                "npm-transitive-package-metadata",
+              ),
             ]),
       current: packageRecord(
         current.packages[AXE_PACKAGE],
@@ -1192,6 +1238,14 @@ function decodedCandidate(observation) {
       SELENIUM_COMPONENT,
     ),
   );
+  const axeCore = immutableNpmRecord(
+    AXE_CORE_PACKAGE,
+    decodeEvidenceRecord(
+      candidateComponent(observation, AXE_COMPONENT),
+      "npm-transitive-package-metadata",
+      `${AXE_COMPONENT} transitive axe-core`,
+    ),
+  );
   const browser = immutableRunnerIdentity(
     "browser",
     decodeEvidenceRecord(
@@ -1235,6 +1289,7 @@ function decodedCandidate(observation) {
   return {
     packages: {
       [AXE_PACKAGE]: axe,
+      [AXE_CORE_PACKAGE]: axeCore,
       [SELENIUM_PACKAGE]: selenium,
     },
     packageBoundary,
@@ -1307,7 +1362,19 @@ function capabilityEnvironment(capability, candidate) {
   return {
     E2E_BROWSER: capability.browser,
     E2E_BROWSER_BINARY: candidate.runner.browser.realpath,
+    E2E_BROWSER_EXECUTABLE_DIGEST:
+      candidate.runner.browser.executable_digest,
+    E2E_BROWSER_EXECUTABLE_REALPATH:
+      candidate.runner.browser.realpath,
+    E2E_BROWSER_EXECUTABLE_VERSION:
+      candidate.runner.browser.version,
     E2E_DRIVER_BINARY: candidate.runner.driver.realpath,
+    E2E_DRIVER_EXECUTABLE_DIGEST:
+      candidate.runner.driver.executable_digest,
+    E2E_DRIVER_EXECUTABLE_REALPATH:
+      candidate.runner.driver.realpath,
+    E2E_DRIVER_EXECUTABLE_VERSION:
+      candidate.runner.driver.version,
     E2E_OS: capability.os,
     E2E_SELENIUM_ALLOW_DOWNLOADS: "false",
     MISE_ENV: capability.environment,
@@ -1342,6 +1409,21 @@ function capabilitySteps(capability, candidate) {
     }),
   ];
   for (const scenario of capability.scenarios) {
+    for (const kind of ["browser", "driver"]) {
+      const identity = candidate.runner[kind];
+      steps.push(
+        relativeStep({
+          id: `${capability.id}-${scenario}-verify-${kind}-before`,
+          kind: `${kind}-identity`,
+          phase: "capability",
+          capabilityId: capability.id,
+          command: identity.realpath,
+          arguments: ["--version"],
+          environment,
+          scenario,
+        }),
+      );
+    }
     if (scenario === "smoke") {
       steps.push(
         relativeStep({
@@ -1391,6 +1473,21 @@ function capabilitySteps(capability, candidate) {
     } else {
       throw new Error(
         `Unsupported Selenium qualification scenario ${scenario}`,
+      );
+    }
+    for (const kind of ["browser", "driver"]) {
+      const identity = candidate.runner[kind];
+      steps.push(
+        relativeStep({
+          id: `${capability.id}-${scenario}-verify-${kind}-after`,
+          kind: `${kind}-identity`,
+          phase: "capability",
+          capabilityId: capability.id,
+          command: identity.realpath,
+          arguments: ["--version"],
+          environment,
+          scenario,
+        }),
       );
     }
   }
@@ -1514,10 +1611,11 @@ export function createSeleniumQualificationPlan({
   const steps = [
     ...PACKAGE_NAMES.map((name) =>
       relativeStep({
-        id:
-          name === AXE_PACKAGE
-            ? "cache-selenium-axe-tarball"
-            : "cache-selenium-webdriver-tarball",
+        id: {
+          [AXE_PACKAGE]: "cache-selenium-axe-webdriver-tarball",
+          [AXE_CORE_PACKAGE]: "cache-selenium-axe-core-tarball",
+          [SELENIUM_PACKAGE]: "cache-selenium-webdriver-tarball",
+        }[name],
         kind: "command",
         phase: "prepare",
         command: "npm",
@@ -1546,7 +1644,7 @@ export function createSeleniumQualificationPlan({
         "--prefer-offline",
         "--registry",
         registryOrigin,
-        ...PACKAGE_NAMES.map(
+        ...DIRECT_PACKAGE_NAMES.map(
           (name) => `${name}@${candidate.packages[name].version}`,
         ),
       ],
@@ -1591,6 +1689,20 @@ export function createSeleniumQualificationPlan({
         "test",
       ],
     }),
+    relativeStep({
+      id: "verify-runner-browser-after-package-tests",
+      kind: "browser-identity",
+      phase: "package-test",
+      command: candidate.runner.browser.realpath,
+      arguments: ["--version"],
+    }),
+    relativeStep({
+      id: "verify-runner-driver-after-package-tests",
+      kind: "driver-identity",
+      phase: "package-test",
+      command: candidate.runner.driver.realpath,
+      arguments: ["--version"],
+    }),
     ...selectedCapabilities.flatMap((capability) =>
       capabilitySteps(capability, candidate)),
   ];
@@ -1626,6 +1738,7 @@ function isWithin(root, path) {
 async function copyRepository(source, destination) {
   await cp(source, destination, {
     recursive: true,
+    verbatimSymlinks: true,
     filter(path) {
       const repositoryPath = relative(source, path);
       if (repositoryPath === "") {
@@ -1636,6 +1749,41 @@ async function copyRepository(source, destination) {
           .includes(part));
     },
   });
+}
+
+async function validateContainedSymlinks(root, label) {
+  const absoluteRoot = resolve(root);
+  const canonicalRoot = await realpath(absoluteRoot);
+  const rootMetadata = await lstat(absoluteRoot);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+    throw new Error(`${label} root must be a real directory`);
+  }
+  const entries = await treeEntries(absoluteRoot, absoluteRoot, {
+    excludeRootNames: new Set([".git"]),
+  });
+  for (const [path, entry] of entries) {
+    if (entry.type !== "symlink") {
+      continue;
+    }
+    const linkPath = resolve(absoluteRoot, path);
+    const lexicalTarget = isAbsolute(entry.target)
+      ? resolve(entry.target)
+      : resolve(dirname(linkPath), entry.target);
+    if (!isWithin(absoluteRoot, lexicalTarget)) {
+      throw new Error(`${label} symlink ${path} escapes its root`);
+    }
+    let canonicalTarget;
+    try {
+      canonicalTarget = await realpath(linkPath);
+    } catch (error) {
+      throw new Error(`${label} symlink ${path} is unresolved`, {
+        cause: error,
+      });
+    }
+    if (!isWithin(canonicalRoot, canonicalTarget)) {
+      throw new Error(`${label} symlink ${path} resolves outside its root`);
+    }
+  }
 }
 
 async function defaultCreateWorkspace() {
@@ -1672,8 +1820,7 @@ async function runRawCommand(step, { environment, workspaceRoot }) {
   return new Promise((resolvePromise) => {
     const child = spawn(step.command, step.arguments, {
       cwd:
-        step.id === "cache-selenium-axe-tarball" ||
-        step.id === "cache-selenium-webdriver-tarball" ||
+        step.id.startsWith("cache-selenium-") ||
         step.id === "apply-selenium-tarballs" ||
         step.id === "install-selenium-candidate"
           ? resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY)
@@ -1923,9 +2070,11 @@ async function verifyAppliedLock(plan, workspaceRoot) {
     'candidate package-lock packages[""]',
   );
   for (const expected of plan.packages) {
+    const direct = DIRECT_PACKAGE_NAMES.includes(expected.name);
     if (
-      manifest.dependencies?.[expected.name] !== expected.version ||
-      root.dependencies?.[expected.name] !== expected.version
+      direct &&
+      (manifest.dependencies?.[expected.name] !== expected.version ||
+        root.dependencies?.[expected.name] !== expected.version)
     ) {
       throw new Error(
         `Candidate manifest and lock must pin ${expected.name}@${expected.version}`,
@@ -1972,6 +2121,22 @@ async function verifyAppliedLock(plan, workspaceRoot) {
         );
       }
     }
+  }
+  const axeWebdriver = plan.packages.find(
+    ({ name }) => name === AXE_PACKAGE,
+  );
+  const axeCore = plan.packages.find(
+    ({ name }) => name === AXE_CORE_PACKAGE,
+  );
+  if (
+    !semverRangeSatisfies(
+      axeCore.version,
+      axeWebdriver.dependencies[AXE_CORE_PACKAGE],
+    )
+  ) {
+    throw new Error(
+      "Candidate axe-core does not satisfy @axe-core/webdriverjs",
+    );
   }
 }
 
@@ -2109,7 +2274,7 @@ function reportCapabilityId(report) {
   return report.capabilityId ?? report.capability?.id ?? null;
 }
 
-async function inspectCapabilityArtifacts(capability, workspaceRoot) {
+async function inspectCapabilityArtifacts(capability, workspaceRoot, plan) {
   const paths = new Set();
   for (const pattern of capability.required_files) {
     const matches = await filesForPattern(pattern, workspaceRoot);
@@ -2138,6 +2303,21 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     );
   }
   const observedScenarios = new Set();
+  const packageVersions = Object.fromEntries(
+    plan.packages.map(({ name, version }) => [name, version]),
+  );
+  const expectedExecutableIdentities = {
+    browser: {
+      digest: plan.runner.browser.executable_digest,
+      realpath: plan.runner.browser.realpath,
+      version: plan.runner.browser.version,
+    },
+    driver: {
+      digest: plan.runner.driver.executable_digest,
+      realpath: plan.runner.driver.realpath,
+      version: plan.runner.driver.version,
+    },
+  };
   for (const [index, reportPath] of capability.result_reports.entries()) {
     const expectedScenario = capability.scenarios[index];
     const expectedPath =
@@ -2160,6 +2340,47 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     ) {
       throw new Error(
         `Result report ${reportPath} did not pass for ${capability.id}`,
+      );
+    }
+    if (
+      report.tool?.name !== "selenium" ||
+      report.tool?.version !== packageVersions[SELENIUM_PACKAGE] ||
+      report.tool?.accessibility?.integration !== AXE_PACKAGE ||
+      report.tool?.accessibility?.integrationVersion !==
+        packageVersions[AXE_PACKAGE] ||
+      report.tool?.accessibility?.engine !== AXE_CORE_PACKAGE ||
+      report.tool?.accessibility?.engineVersion !==
+        packageVersions[AXE_CORE_PACKAGE] ||
+      report.environment?.browserVersion !== plan.runner.browser.version ||
+      report.environment?.driverVersion !== plan.runner.driver.version ||
+      stableJson(report.environment?.browserExecutable) !==
+        stableJson(expectedExecutableIdentities.browser) ||
+      stableJson(report.environment?.driverExecutable) !==
+        stableJson(expectedExecutableIdentities.driver)
+    ) {
+      throw new Error(
+        `Result report ${reportPath} does not bind exact package and runner identities`,
+      );
+    }
+    const expectedAssertion =
+      expectedScenario === "smoke"
+        ? {
+            actual: "clicked",
+            expected: "clicked",
+            name: "selenium smoke button state",
+          }
+        : {
+            actual: "238",
+            expected: "238",
+            name: "web-calculator final display",
+          };
+    if (
+      Object.entries(expectedAssertion).some(
+        ([key, value]) => report.assertion?.[key] !== value,
+      )
+    ) {
+      throw new Error(
+        `Result report ${reportPath} does not bind its scenario assertion`,
       );
     }
     if (observedScenarios.has(report.scenario)) {
@@ -2326,6 +2547,7 @@ export async function qualifySeleniumCandidate(
       "Source checkout must be clean across tracked, untracked, and ignored files",
     );
   }
+  await validateContainedSymlinks(root, "Source repository");
   const sourceBefore = await sourceState(root);
   await verifySourcePackageBinding(observation, root);
   const temporaryRoot = resolve(await createWorkspace());
@@ -2337,6 +2559,7 @@ export async function qualifySeleniumCandidate(
   let workError;
   try {
     await materializeWorkspace(root, workspaceRoot);
+    await validateContainedSymlinks(workspaceRoot, "Ephemeral workspace");
     const plan = createSeleniumQualificationPlan({
       observation,
       catalog: catalogDocument,
@@ -2348,7 +2571,8 @@ export async function qualifySeleniumCandidate(
     const checks = [];
     const failures = [];
     for (const id of [
-      "cache-selenium-axe-tarball",
+      "cache-selenium-axe-webdriver-tarball",
+      "cache-selenium-axe-core-tarball",
       "cache-selenium-webdriver-tarball",
       "apply-selenium-tarballs",
     ]) {
@@ -2445,6 +2669,25 @@ export async function qualifySeleniumCandidate(
       }
     }
 
+    if (failures.length === 0) {
+      for (const id of [
+        "verify-runner-browser-after-package-tests",
+        "verify-runner-driver-after-package-tests",
+      ]) {
+        const step = plan.steps.find((entry) => entry.id === id);
+        const result = await executeControlledStep(step, plan, {
+          environment,
+          now,
+          runCommand,
+          workspaceRoot,
+        });
+        checks.push(result);
+        if (result.status !== "pass") {
+          failures.push("RUNNER_EXECUTABLE_IDENTITY_MISMATCH");
+        }
+      }
+    }
+
     const capabilityChecks = new Map(
       plan.selected_capabilities.map(({ id }) => [id, []]),
     );
@@ -2476,6 +2719,7 @@ export async function qualifySeleniumCandidate(
             const files = await inspectCapabilityArtifacts(
               capability,
               workspaceRoot,
+              plan,
             );
             const completedAt = timestamp(now());
             capabilityChecks.get(capability.id).push({
