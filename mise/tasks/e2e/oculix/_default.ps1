@@ -1,5 +1,7 @@
 # PowerShell sibling of mise/tasks/e2e/oculix/_default.
-#MISE description="Run all Oculix E2E scenarios in order"
+# Phase 1 web-calculator is Ubuntu-only. Matrix CI calls its parameterized
+# leaf directly, so the Windows aggregate retains smoke and native-calculator.
+#MISE description="Run supported Oculix E2E scenarios in order"
 $ErrorActionPreference = "Stop"
 
 & mise run e2e:oculix:smoke
