@@ -313,6 +313,7 @@ test("the observation composes with the Node provider without path collisions", 
 test("missing candidate browser metadata is unknown and cannot qualify", async () => {
   const repository = await createRepository();
   try {
+    const before = await packageState(repository);
     const observation = await collect(repository, {
       missingBrowserVersion: "1.65.0",
     });
@@ -335,6 +336,7 @@ test("missing candidate browser metadata is unknown and cannot qualify", async (
     assert.equal(workspaceCreated, false);
     assert.equal(validation.disposition.state, "unknown");
     assert.equal(validation.results[0].status, "unknown");
+    assert.deepEqual(await packageState(repository), before);
     const options = await contractOptions(repository);
     assert.throws(
       () =>
