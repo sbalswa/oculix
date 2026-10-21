@@ -18,7 +18,11 @@ hash, browser, operating-system label, platform, and architecture so a matrix
 cell cannot silently reuse an incompatible installation. Versioned Ubuntu
 labels must also match `/etc/os-release`'s `VERSION_ID`.
 
-On Windows, the process runner samples the child tree while commands execute
-and force-cleans tracked descendants after success, failure, cancellation, or
-timeout. Cleanup utilities, direct-child waits, and POSIX process-group
-termination all have bounded graceful and forced deadlines.
+Phase 1 supports Ubuntu/Chromium and generic local POSIX hosts. Windows is
+intentionally unsupported until #15 adds a native hosted capability row. The
+PowerShell tasks and the Node process runner reject Windows before invoking
+mise, npm, Playwright, a browser, or any other child process.
+
+POSIX process groups are terminated on success, failure, cancellation, and
+timeout. Direct-child waits and graceful/forced group cleanup have bounded
+deadlines and explicit errors.

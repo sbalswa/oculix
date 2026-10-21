@@ -1,16 +1,4 @@
-# PowerShell sibling of mise/tasks/e2e/playwright/_default.
-#MISE description="Run all Playwright E2E scenarios in order"
+#MISE description="Reject Playwright E2E on Windows pending #15 validation"
 $ErrorActionPreference = "Stop"
 
-& mise run e2e:playwright:setup @args
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-& mise run e2e:playwright:smoke @args
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-& mise run e2e:playwright:web-calculator @args
-exit $LASTEXITCODE
+throw "Playwright E2E is unsupported on Windows until #15 adds native hosted validation; no child process was started."

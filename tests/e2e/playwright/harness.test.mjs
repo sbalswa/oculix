@@ -1,11 +1,23 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { test } from "node:test";
+import { WINDOWS_UNSUPPORTED_MESSAGE } from "./process-runner.mjs";
 import {
   playwrightTestArguments,
   validateOperatingSystem,
   validatePreparationRecord,
 } from "./harness.mjs";
 
+const REPOSITORY_ROOT = resolve(import.meta.dirname, "../../..");
+const POWERSHELL_TASKS = [
+  "_default.ps1",
+  "setup.ps1",
+  "smoke.ps1",
+  "web-calculator.ps1",
+].map((name) =>
+  resolve(REPOSITORY_ROOT, "mise/tasks/e2e/playwright", name),
+);
 const expected = {
   arch: "x64",
   lockHash: "expected-lock-hash",
@@ -112,4 +124,24 @@ test("constructs scenario npm execution in offline mode", () => {
       "--project=chromium",
     ],
   );
+});
+
+test("rejects Windows as unsupported until native hosted validation", () => {
+  assert.throws(
+    () =>
+      validateOperatingSystem("windows-latest", {
+        arch: "x64",
+        platform: "win32",
+      }),
+    (error) => error.message === WINDOWS_UNSUPPORTED_MESSAGE,
+  );
+});
+
+test("PowerShell tasks fail closed before invoking a child command", async () => {
+  for (const path of POWERSHELL_TASKS) {
+    const contents = await readFile(path, "utf8");
+    assert.match(contents, new RegExp(WINDOWS_UNSUPPORTED_MESSAGE));
+    assert.doesNotMatch(contents, /(^|\s)&\s*(mise|node)\b/m);
+    assert.doesNotMatch(contents, /\b(Start-Process|Set-Location)\b/);
+  }
 });

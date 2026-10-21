@@ -5,6 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  assertSupportedPlatform,
   npmInvocation,
   ProcessStoppedError,
   runProcess,
@@ -37,13 +38,6 @@ const OPERATING_SYSTEMS = new Map([
     {
       aliases: ["macos", "macos-latest"],
       pattern: /^macos-\d+$/,
-    },
-  ],
-  [
-    "win32",
-    {
-      aliases: ["windows", "windows-latest"],
-      pattern: /^windows-\d{4}$/,
     },
   ],
 ]);
@@ -98,6 +92,7 @@ export function validateOperatingSystem(
     platform = process.platform,
   } = {},
 ) {
+  assertSupportedPlatform(platform);
   const family = OPERATING_SYSTEMS.get(platform);
   if (family === undefined) {
     fail(`Unsupported host platform "${platform}".`);
