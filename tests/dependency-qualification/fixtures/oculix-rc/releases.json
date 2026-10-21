@@ -1,0 +1,87 @@
+[
+  {
+    "id": 410,
+    "tag_name": "v4.1.0-rc10",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.1.0-rc10",
+    "assets": [
+      {
+        "id": 4103,
+        "name": "oculixide-4.1.0-rc10-windows.jar",
+        "size": 300,
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "browser_download_url": "https://github.com/oculix-org/Oculix/releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-windows.jar"
+      },
+      {
+        "id": 4101,
+        "name": "oculixide-4.1.0-rc10-linux.jar",
+        "size": 100,
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "browser_download_url": "https://github.com/oculix-org/Oculix/releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-linux.jar"
+      },
+      {
+        "id": 4102,
+        "name": "oculixide-4.1.0-rc10-macos.jar",
+        "size": 200,
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "browser_download_url": "https://github.com/oculix-org/Oculix/releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-macos.jar"
+      }
+    ]
+  },
+  {
+    "id": 409,
+    "tag_name": "v4.1.0-rc9",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-01-01T00:00:00Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.1.0-rc9",
+    "assets": []
+  },
+  {
+    "id": 500,
+    "tag_name": "v5.0.0-rc99",
+    "draft": true,
+    "prerelease": true,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v5.0.0-rc99",
+    "assets": []
+  },
+  {
+    "id": 420,
+    "tag_name": "v4.2.0",
+    "draft": false,
+    "prerelease": false,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.2.0",
+    "assets": []
+  },
+  {
+    "id": 419,
+    "tag_name": "v4.2.0-beta1",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.2.0-beta1",
+    "assets": []
+  },
+  {
+    "id": 418,
+    "tag_name": "v4.2.0-rc01",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.2.0-rc01",
+    "assets": []
+  },
+  {
+    "id": 400,
+    "tag_name": "v4.0.0-rc99",
+    "draft": false,
+    "prerelease": true,
+    "published_at": "2026-10-21T15:59:59Z",
+    "html_url": "https://github.com/oculix-org/Oculix/releases/tag/v4.0.0-rc99",
+    "assets": []
+  }
+]
