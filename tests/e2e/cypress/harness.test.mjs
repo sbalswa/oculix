@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   resolveBrowserSelection,
   resolveOperatingSystemSelection,
+  runHarness,
 } from "./harness.mjs";
+import { WINDOWS_UNSUPPORTED_MESSAGE } from "./platform.mjs";
 
 test("defaults local runs to Electron", () => {
   assert.deepEqual(
@@ -155,4 +157,20 @@ test("rejects unknown and host-incompatible operating systems", () => {
       }),
     /requires Ubuntu, but the current Linux distribution is "amzn"/,
   );
+});
+
+test("direct harness invocation rejects Windows before importing Cypress", async () => {
+  let imported = false;
+
+  await assert.rejects(
+    runHarness({
+      importCypress: async () => {
+        imported = true;
+        return { default: {} };
+      },
+      platform: "win32",
+    }),
+    (error) => error.message === WINDOWS_UNSUPPORTED_MESSAGE,
+  );
+  assert.equal(imported, false);
 });

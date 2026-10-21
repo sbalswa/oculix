@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "smoke": "node harness.mjs smoke",
+    "smoke": "node task.mjs smoke",
     "test": "node --test harness.test.mjs task.test.mjs",
-    "web-calculator": "node harness.mjs web-calculator"
+    "web-calculator": "node task.mjs web-calculator"
   },
   "dependencies": {
     "cypress": "16.2.0"

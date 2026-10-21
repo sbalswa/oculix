@@ -1,10 +1,4 @@
-# PowerShell sibling of mise/tasks/e2e/cypress/smoke.
-#MISE description="Run the Cypress calculator-independent browser smoke"
+#MISE description="Reject Cypress smoke on Windows pending #15 validation"
 $ErrorActionPreference = "Stop"
 
-if (-not $env:MISE_PROJECT_ROOT) {
-    throw "MISE_PROJECT_ROOT is required"
-}
-Set-Location -LiteralPath $env:MISE_PROJECT_ROOT
-& mise -E web-e2e exec -- node tests/e2e/cypress/task.mjs smoke @args
-exit $LASTEXITCODE
+throw "Cypress E2E is unsupported on Windows until #15 adds native hosted validation; no child process was started."

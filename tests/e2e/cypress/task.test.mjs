@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -12,11 +18,17 @@ import {
   ProcessStoppedError,
   runCommand,
 } from "./task.mjs";
+import { WINDOWS_UNSUPPORTED_MESSAGE } from "./platform.mjs";
 
 const PROCESS_TREE_FIXTURE = resolve(
   import.meta.dirname,
   "process-tree-fixture.mjs",
 );
+const POWERSHELL_TASK_DIRECTORY = resolve(
+  import.meta.dirname,
+  "../../../mise/tasks/e2e/cypress",
+);
+const PACKAGE_JSON = resolve(import.meta.dirname, "package.json");
 
 async function waitForReadyFile(path) {
   const deadline = Date.now() + 5_000;
@@ -91,7 +103,7 @@ test("fails closed on Windows before spawning a Cypress task process", async () 
   );
   assert.throws(
     () => assertCypressTaskPlatformSupported({ platform: "win32" }),
-    /disabled until a hosted Windows row proves process-tree ownership/,
+    (error) => error.message === WINDOWS_UNSUPPORTED_MESSAGE,
   );
   await assert.rejects(
     runCommand("example.exe", [], {
@@ -100,9 +112,36 @@ test("fails closed on Windows before spawning a Cypress task process", async () 
         spawned = true;
       },
     }),
-    /disabled until a hosted Windows row proves process-tree ownership/,
+    (error) => error.message === WINDOWS_UNSUPPORTED_MESSAGE,
   );
   assert.equal(spawned, false);
+});
+
+test("PowerShell tasks fail closed before invoking a child command", async () => {
+  const taskNames = (await readdir(POWERSHELL_TASK_DIRECTORY))
+    .filter((name) => name.endsWith(".ps1"))
+    .sort();
+
+  assert.ok(taskNames.length > 0, "expected Cypress PowerShell task entries");
+  for (const taskName of taskNames) {
+    const contents = await readFile(
+      resolve(POWERSHELL_TASK_DIRECTORY, taskName),
+      "utf8",
+    );
+    assert.ok(contents.includes(WINDOWS_UNSUPPORTED_MESSAGE));
+    assert.doesNotMatch(contents, /(^|\s)&\s*(mise|node)\b/m);
+    assert.doesNotMatch(contents, /\b(Start-Process|Set-Location)\b/);
+  }
+});
+
+test("advertised npm scenarios route through the guarded task runner", async () => {
+  const packageJson = JSON.parse(await readFile(PACKAGE_JSON, "utf8"));
+
+  assert.equal(packageJson.scripts.smoke, "node task.mjs smoke");
+  assert.equal(
+    packageJson.scripts["web-calculator"],
+    "node task.mjs web-calculator",
+  );
 });
 
 test("readiness parsing retries a partially visible JSON write", async () => {

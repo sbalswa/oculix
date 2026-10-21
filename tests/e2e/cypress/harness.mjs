@@ -3,7 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import cypress from "cypress";
+import { assertCypressPlatformSupported } from "./platform.mjs";
 
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = resolve(HARNESS_DIRECTORY, "cypress.config.mjs");
@@ -205,10 +205,15 @@ function failureMessage(selection, result) {
   );
 }
 
-async function run() {
+export async function runHarness({
+  importCypress = () => import("cypress"),
+  platform = process.platform,
+} = {}) {
+  assertCypressPlatformSupported({ platform });
+  const { default: cypress } = await importCypress();
   const selection = {
     ...resolveBrowserSelection(),
-    ...resolveOperatingSystemSelection(),
+    ...resolveOperatingSystemSelection({ platform }),
   };
   const baseUrl =
     selection.scenario === "web-calculator"
@@ -260,7 +265,7 @@ const isCli =
   resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isCli) {
-  run().catch((error) => {
+  runHarness().catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

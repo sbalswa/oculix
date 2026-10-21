@@ -4,6 +4,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { assertCypressPlatformSupported } from "./platform.mjs";
+
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(HARNESS_DIRECTORY, "../../..");
 const FIXTURE_LIFECYCLE = resolve(
@@ -189,12 +191,7 @@ export class ProcessStoppedError extends Error {
 export function assertCypressTaskPlatformSupported({
   platform = process.platform,
 } = {}) {
-  if (platform === "win32") {
-    throw new Error(
-      "Cypress task execution on Windows is disabled until a hosted " +
-        "Windows row proves process-tree ownership and cleanup",
-    );
-  }
+  assertCypressPlatformSupported({ platform });
 }
 
 async function stopPosixProcessTree(child, signal, graceMilliseconds) {
