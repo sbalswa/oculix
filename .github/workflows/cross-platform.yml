@@ -139,6 +139,7 @@ jobs:
       MISE_LOCKED: "1"
       OCULIX_CHROMIUM_DISABLE_SANDBOX: >-
         ${{ matrix.oculix_chromium_disable_sandbox || '' }}
+      E2E_USE_XVFB: ${{ matrix.use_xvfb || false }}
 
     strategy:
       fail-fast: false
@@ -186,6 +187,7 @@ jobs:
             task: e2e:oculix:web-calculator
             diagnostics: oculix-web-calculator-diagnostics/
             oculix_chromium_disable_sandbox: "1"
+            use_xvfb: true
 
     steps:
       - name: Check out repository
@@ -200,15 +202,21 @@ jobs:
           version: ${{ needs.configuration.outputs.mise-version }}
           install_args: --locked
 
-      - name: Run selected E2E task on Unix
+      - name: Run mise task ${{ matrix.task }} on Unix
         id: run-unix
         if: ${{ runner.os != 'Windows' }}
         shell: bash
         env:
           E2E_TASK: ${{ matrix.task }}
-        run: mise run "$E2E_TASK"
+        run: |
+          if [[ "$E2E_USE_XVFB" == "true" ]]; then
+            xvfb-run -a -s '-screen 0 1280x1024x24' \
+              mise run "$E2E_TASK"
+          else
+            mise run "$E2E_TASK"
+          fi
 
-      - name: Run selected E2E task on Windows
+      - name: Run mise task ${{ matrix.task }} on Windows
         id: run-windows
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
