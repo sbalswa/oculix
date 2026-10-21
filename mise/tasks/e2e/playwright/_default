@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Run all Playwright E2E scenarios in order"
+set -euo pipefail
+
+mise run e2e:playwright:setup "$@"
+mise run e2e:playwright:smoke "$@"
+mise run e2e:playwright:web-calculator "$@"
