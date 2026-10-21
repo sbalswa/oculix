@@ -26,3 +26,16 @@ mise, npm, Playwright, a browser, or any other child process.
 POSIX process groups are terminated on success, failure, cancellation, and
 timeout. Direct-child waits and graceful/forced group cleanup have bounded
 deadlines and explicit errors.
+
+Each scenario writes isolated native Playwright output under
+`test-results/<scenario>/`, including line output, an HTML report, a JSON
+report, video, and retained failure traces/screenshots. A schema-versioned
+`result.json` records the environment, assertions, policy, counts, and
+repository-relative artifact paths.
+
+The web-calculator scenario audits the final rendered `238` state with the
+pinned official `@axe-core/playwright` integration. WCAG 2.0, 2.1, and 2.2
+Level A/AA violations block only after raw JSON, summaries, the final
+screenshot, and native-report attachments are written. Incomplete findings
+remain visible for manual review but are initially nonblocking. Automated
+auditing supplements rather than replaces manual accessibility review.

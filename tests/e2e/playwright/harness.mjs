@@ -11,6 +11,10 @@ import {
   runProcess,
   signalExitCode,
 } from "./process-runner.mjs";
+import {
+  scenarioPaths,
+  writeHarnessFailureResult,
+} from "./reporting.mjs";
 
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(HARNESS_DIRECTORY, "../../..");
@@ -23,7 +27,6 @@ const INSTALL_STAMP = resolve(
   HARNESS_DIRECTORY,
   "node_modules/.oculix-package-lock.sha256",
 );
-const RESULTS_DIRECTORY = resolve(HARNESS_DIRECTORY, "test-results");
 const PROJECTS = new Set(["chromium", "firefox", "webkit"]);
 const OPERATING_SYSTEMS = new Map([
   [
@@ -284,6 +287,7 @@ async function runTest(scenario, project, operatingSystem) {
     E2E_BROWSER: project,
     E2E_OS: operatingSystem,
     PLAYWRIGHT_PROJECT: project,
+    PLAYWRIGHT_SCENARIO: scenario,
   };
   await runNpm(
     playwrightTestArguments(specification, project),
@@ -307,12 +311,12 @@ export function playwrightTestArguments(specification, project) {
 }
 
 async function writeDiagnostics(scenario, project, operatingSystem, error) {
-  await mkdir(RESULTS_DIRECTORY, {
+  const paths = scenarioPaths(scenario);
+  await mkdir(paths.directory, {
     recursive: true,
   });
-  const path = resolve(RESULTS_DIRECTORY, "harness-diagnostics.json");
   await writeFile(
-    path,
+    paths.harnessDiagnostics,
     `${JSON.stringify(
       {
         arch: process.arch,
@@ -327,7 +331,14 @@ async function writeDiagnostics(scenario, project, operatingSystem, error) {
       2,
     )}\n`,
   );
-  process.stderr.write(`Playwright harness diagnostics: ${path}\n`);
+  await writeHarnessFailureResult(scenario, {
+    browser: project,
+    error,
+    operatingSystem,
+  });
+  process.stderr.write(
+    `Playwright harness diagnostics: ${paths.harnessDiagnostics}\n`,
+  );
 }
 
 async function runScenario(scenario, project, operatingSystem) {
