@@ -12,7 +12,7 @@
       ],
       "selections": [
         {
-          "candidate_digest": "12294daccf1cdabbf2fce06f9d4bfb197be9dbe1b202aa7df8e6fefbfae9307b",
+          "candidate_digest": "3cb670938c3ff751c7832bb99be8bbc5cf1e3cf8df792a2f38e493b9509d756a",
           "provider_id": "cypress",
           "state": "candidate"
         },
@@ -45,7 +45,7 @@
       ],
       "selections": [
         {
-          "candidate_digest": "378e114820110d329fcd6dbf7a993a5d6969d679d61249981863866f559b4d69",
+          "candidate_digest": "c489427ed0747ec5633d3b8e4c6b72da9303ada2c9037fecf060d4b43aa35478",
           "provider_id": "selenium",
           "state": "candidate"
         },

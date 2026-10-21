@@ -330,7 +330,9 @@ function rangeClauseMatches(version, clause) {
     "$1",
   );
   const tokens = normalized.split(/\s+/u);
-  return tokens.every((token) => tokenMatches(version, token));
+  return tokens
+    .map((token) => tokenMatches(version, token))
+    .every(Boolean);
 }
 
 export function versionSatisfies(versionValue, constraint) {
@@ -342,7 +344,9 @@ export function versionSatisfies(versionValue, constraint) {
   if (clauses.some((clause) => clause.length === 0)) {
     throw new Error(`unsupported semantic version range ${constraint}`);
   }
-  return clauses.some((clause) => rangeClauseMatches(version, clause));
+  return clauses
+    .map((clause) => rangeClauseMatches(version, clause))
+    .some(Boolean);
 }
 
 function supported(satisfied) {
@@ -413,6 +417,22 @@ function parseVersionObject(value) {
   return parsed === undefined ? null : parsed;
 }
 
+function hasExactObjectKeys(value, expected) {
+  return (
+    value !== null &&
+    value !== undefined &&
+    JSON.stringify(Object.keys(value).sort(compareStrings)) ===
+      JSON.stringify([...expected].sort(compareStrings))
+  );
+}
+
+function hasExactMapKeys(value, expected) {
+  return (
+    JSON.stringify([...value.keys()].sort(compareStrings)) ===
+    JSON.stringify([...expected].sort(compareStrings))
+  );
+}
+
 function evaluateRanges(version, ranges) {
   for (const range of ranges) {
     const result = evaluateVersionRange(version, range);
@@ -439,18 +459,6 @@ function componentSelection(component, providerState) {
   };
 }
 
-function hasStateScopedRequiresConstraint(constraint) {
-  if (constraint === null) {
-    return false;
-  }
-  const entries = parseKeyValueConstraint(constraint);
-  return (
-    entries !== null &&
-    entries.has("current") &&
-    entries.has("candidate")
-  );
-}
-
 function relationIsActive(relation, from, to, providerStates) {
   const fromProviderState = providerStates.get(from.providerId);
   const toProviderState = providerStates.get(to.providerId);
@@ -463,9 +471,8 @@ function relationIsActive(relation, from, to, providerStates) {
       );
     case "requires":
       return (
-        from.selection.state === "candidate" ||
-        (toProviderState === "candidate" &&
-          hasStateScopedRequiresConstraint(relation.constraint))
+        fromProviderState === "candidate" ||
+        toProviderState === "candidate"
       );
     case "bundles":
     case "must-match":
@@ -575,7 +582,11 @@ function evaluateMustMatch(constraint, from, to) {
     if (
       json === undefined ||
       source === null ||
-      Object.keys(json).length === 0 ||
+      !hasExactObjectKeys(json, [
+        "@playwright/test",
+        "playwright",
+        "playwright-core",
+      ]) ||
       Object.values(json).some((value) => typeof value !== "string")
     ) {
       return unsupported();
@@ -590,8 +601,13 @@ function evaluateMustMatch(constraint, from, to) {
   const entries = parseKeyValueConstraint(constraint);
   if (
     entries !== null &&
-    entries.has("browser-key") &&
-    entries.has("driver-key")
+    hasExactMapKeys(entries, [
+      "browser",
+      "browser-key",
+      "driver",
+      "driver-key",
+      "runner",
+    ])
   ) {
     return supported(
       entries.get("browser-key") !== "missing" &&
@@ -642,6 +658,12 @@ function evaluateBundles(constraint, from, to) {
       json === undefined ||
       source === null ||
       target === null ||
+      !hasExactObjectKeys(json, [
+        "browser",
+        "package",
+        "revision",
+      ]) ||
+      !hasExactObjectKeys(target, ["name", "revision"]) ||
       packageReference === null ||
       typeof json.browser !== "string" ||
       typeof json.revision !== "string"

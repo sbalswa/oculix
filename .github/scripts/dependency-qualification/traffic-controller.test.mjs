@@ -256,7 +256,8 @@ function mutuallyExclusiveScenario() {
     id: "selenium",
     relations: [
       relation({
-        constraint: "candidate",
+        constraint:
+          "current=>=24;candidate=>=26.0.0",
         from: "selenium",
         id: "selenium-requires-node-candidate",
         to: "node",
@@ -270,7 +271,8 @@ function mutuallyExclusiveScenario() {
     id: "cypress",
     relations: [
       relation({
-        constraint: "current",
+        constraint:
+          "current=>=26.0.0;candidate=<26",
         from: "cypress",
         id: "cypress-requires-node-current",
         to: "node",
@@ -457,6 +459,39 @@ test("a Node runtime collision names the one unsatisfied framework relation", ()
   assert.deepEqual(plan.minimal_blockers, ["selenium-node-range"]);
 });
 
+test("a target-only Node upgrade evaluates current framework requirements", () => {
+  const node = observation({
+    capabilities: ["playwright-ubuntu-chromium"],
+    candidateVersion: "26.0.0",
+    currentVersion: "24.0.0",
+    id: "node",
+  });
+  const selenium = observation({
+    capabilities: ["selenium-ubuntu-chromium"],
+    candidateVersion: null,
+    currentVersion: "4.0.0",
+    id: "selenium",
+    relations: [
+      relation({
+        constraint: "<26",
+        from: "selenium",
+        id: "selenium-current-requires-node-below-26",
+        to: "node",
+      }),
+    ],
+  });
+
+  const plan = solve([selenium, node], [validation(node)]);
+
+  assert.deepEqual(plan.disposition, {
+    state: "incompatible",
+    reason_codes: ["HARD_RELATION_INCOMPATIBLE"],
+  });
+  assert.deepEqual(plan.minimal_blockers, [
+    "selenium-current-requires-node-below-26",
+  ]);
+});
+
 test("the Node collector descriptive major relation is supported", () => {
   const node = observation({
     capabilities: ["playwright-ubuntu-chromium"],
@@ -626,6 +661,129 @@ test("Playwright canonical JSON relations evaluate deterministically", () => {
   assert.deepEqual(plan.minimal_blockers, []);
 });
 
+test("structured must-match and bundle schemas reject missing or unknown members", () => {
+  const cases = [
+    {
+      constraint: JSON.stringify({
+        "@playwright/test": "1.65.0",
+        playwright: "1.65.0",
+      }),
+      id: "lockstep-missing-member",
+      sourceVersion: JSON.stringify({
+        "@playwright/test": "1.65.0",
+        playwright: "1.65.0",
+      }),
+      targetVersion: JSON.stringify({
+        name: "chromium",
+        revision: "1200",
+      }),
+      type: "must-match",
+    },
+    {
+      constraint: JSON.stringify({
+        "@playwright/test": "1.65.0",
+        playwright: "1.65.0",
+        "playwright-core": "1.65.0",
+        unexpected: "1.65.0",
+      }),
+      id: "lockstep-unknown-member",
+      sourceVersion: JSON.stringify({
+        "@playwright/test": "1.65.0",
+        playwright: "1.65.0",
+        "playwright-core": "1.65.0",
+        unexpected: "1.65.0",
+      }),
+      targetVersion: JSON.stringify({
+        name: "chromium",
+        revision: "1200",
+      }),
+      type: "must-match",
+    },
+    {
+      constraint: JSON.stringify({
+        package: "playwright-core@1.65.0",
+        browser: "chromium",
+      }),
+      id: "bundle-missing-member",
+      sourceVersion: JSON.stringify({
+        "playwright-core": "1.65.0",
+      }),
+      targetVersion: JSON.stringify({
+        name: "chromium",
+        revision: "1200",
+      }),
+      type: "bundles",
+    },
+    {
+      constraint: JSON.stringify({
+        package: "playwright-core@1.65.0",
+        browser: "chromium",
+        revision: "1200",
+        unexpected: "accepted-before-audit",
+      }),
+      id: "bundle-unknown-member",
+      sourceVersion: JSON.stringify({
+        "playwright-core": "1.65.0",
+      }),
+      targetVersion: JSON.stringify({
+        name: "chromium",
+        revision: "1200",
+      }),
+      type: "bundles",
+    },
+    {
+      constraint:
+        "browser=chrome@141;driver=chromedriver@141;" +
+        "browser-key=141;driver-key=141",
+      id: "runner-missing-member",
+      sourceVersion: "5.0.0",
+      targetVersion: "5.0.0",
+      type: "must-match",
+    },
+    {
+      constraint:
+        "runner=ubuntu-latest;browser=chrome@141;" +
+        "driver=chromedriver@141;browser-key=141;" +
+        "driver-key=141;unexpected=accepted-before-audit",
+      id: "runner-unknown-member",
+      sourceVersion: "5.0.0",
+      targetVersion: "5.0.0",
+      type: "must-match",
+    },
+  ];
+
+  for (const scenario of cases) {
+    const provider = observation({
+      capabilities: ["playwright-ubuntu-chromium"],
+      candidateVersion: scenario.sourceVersion,
+      currentVersion: scenario.sourceVersion,
+      id: "playwright",
+    });
+    provider.components[0].id = "structured-source";
+    addComponent(provider, {
+      candidateVersion: scenario.targetVersion,
+      currentVersion: scenario.targetVersion,
+      ecosystem: "playwright",
+      id: "structured-target",
+    });
+    provider.relations = [
+      {
+        id: scenario.id,
+        type: scenario.type,
+        from: "structured-source",
+        to: "structured-target",
+        hard: true,
+        constraint: scenario.constraint,
+      },
+    ];
+
+    const plan = solve([provider], [validation(provider)]);
+
+    assert.equal(plan.disposition.state, "incompatible", scenario.id);
+    assert.deepEqual(plan.minimal_blockers, [scenario.id], scenario.id);
+  }
+});
+
 test("Cypress descriptive collector relations evaluate deterministically", () => {
   const node = observation({
     capabilities: ["cypress-ubuntu-chrome"],
@@ -725,7 +883,7 @@ test("an intrinsic candidate failure is not mislabeled mutual exclusion", () => 
     id: "selenium",
     relations: [
       relation({
-        constraint: "node must wear a hat",
+        constraint: ">=20 || latest",
         from: "selenium",
         id: "selenium-unsupported-node-constraint",
         to: "node",
@@ -1037,6 +1195,7 @@ test("combination and maximal-assignment limits fail rather than truncate", () =
               from: id,
               id: `${id}-excludes-${other}`,
               to: other,
+              type: "must-match",
             }),
           ),
       }),
@@ -1106,6 +1265,10 @@ test("supported version ranges are deterministic and fail closed", () => {
     ">=24, <26",
     "latest",
     ">=24 ||",
+    ">=20 || 24.x",
+    ">=20 || latest",
+    ">=20 || >=24.0.0-beta.1",
+    ">99 latest || >=20",
     "1.2.3-beta.1",
   ]) {
     assert.throws(
