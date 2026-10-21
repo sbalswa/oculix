@@ -28,13 +28,13 @@
   "binary": {
     "current": {
       "version": "16.2.0",
-      "locator": "https://download.cypress.io/desktop/16.2.0?platform=linux&arch=x64",
+      "locator": "/opt/oculix-evidence/cypress-16.2.0.zip",
       "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "warnings": []
     },
     "candidate": {
       "version": "16.3.0",
-      "locator": "https://download.cypress.io/desktop/16.3.0?platform=linux&arch=x64",
+      "locator": "/opt/oculix-evidence/cypress-16.3.0.zip",
       "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "warnings": []
     }
@@ -45,7 +45,7 @@
       "runner": "ubuntu-latest",
       "os": "ubuntu",
       "version": "141.0.7390.54",
-      "locator": "runner://ubuntu-latest/usr/bin/google-chrome",
+      "path": "/opt/oculix-evidence/google-chrome",
       "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "warnings": []
     }

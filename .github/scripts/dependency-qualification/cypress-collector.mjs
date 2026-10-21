@@ -2,8 +2,10 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   cp,
+  glob,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   rm,
   stat,
@@ -11,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
+  delimiter,
   dirname,
   isAbsolute,
   join,
@@ -48,7 +51,10 @@ const NODE_LOCK_PATH = "mise/mise.web-e2e.lock";
 const PROVIDER_ID = CYPRESS_PROVIDER_ID;
 const ELECTRON = "electron";
 const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
-const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u;
+const SEMVER_PATTERN =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u;
+const PARTIAL_VERSION_PATTERN =
+  /^(0|[1-9]\d*|[xX*])(?:\.(0|[1-9]\d*|[xX*]))?(?:\.(0|[1-9]\d*|[xX*]))?$/u;
 
 function hash(value) {
   const contents = ArrayBuffer.isView(value)
@@ -89,8 +95,237 @@ function assertNonemptyString(value, name) {
 
 function assertExactVersion(value, name) {
   assertNonemptyString(value, name);
-  if (!EXACT_VERSION_PATTERN.test(value)) {
-    throw new Error(`${name} must be an exact package version`);
+  parseSemver(value, name);
+}
+
+function parseSemver(value, name = "version") {
+  const match = SEMVER_PATTERN.exec(value);
+  if (match === null) {
+    throw new Error(`${name} must be a strict semantic version`);
+  }
+  const prerelease = match[4]?.split(".") ?? [];
+  if (
+    prerelease.some(
+      (identifier) =>
+        /^\d+$/u.test(identifier) &&
+        identifier.length > 1 &&
+        identifier.startsWith("0"),
+    )
+  ) {
+    throw new Error(
+      `${name} has a numeric prerelease identifier with a leading zero`,
+    );
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease,
+    version: value,
+  };
+}
+
+function comparePrerelease(left, right) {
+  if (left.length === 0 || right.length === 0) {
+    return left.length === right.length ? 0 : left.length === 0 ? 1 : -1;
+  }
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftIdentifier = left[index];
+    const rightIdentifier = right[index];
+    if (leftIdentifier === undefined || rightIdentifier === undefined) {
+      return leftIdentifier === rightIdentifier
+        ? 0
+        : leftIdentifier === undefined
+          ? -1
+          : 1;
+    }
+    if (leftIdentifier === rightIdentifier) {
+      continue;
+    }
+    const leftNumeric = /^\d+$/u.test(leftIdentifier);
+    const rightNumeric = /^\d+$/u.test(rightIdentifier);
+    if (leftNumeric && rightNumeric) {
+      return Number(leftIdentifier) - Number(rightIdentifier);
+    }
+    if (leftNumeric !== rightNumeric) {
+      return leftNumeric ? -1 : 1;
+    }
+    return leftIdentifier < rightIdentifier ? -1 : 1;
+  }
+  return 0;
+}
+
+function compareVersions(left, right) {
+  const leftVersion = parseSemver(left, "left version");
+  const rightVersion = parseSemver(right, "right version");
+  for (const key of ["major", "minor", "patch"]) {
+    if (leftVersion[key] !== rightVersion[key]) {
+      return leftVersion[key] - rightVersion[key];
+    }
+  }
+  return comparePrerelease(
+    leftVersion.prerelease,
+    rightVersion.prerelease,
+  );
+}
+
+function partialBounds(value) {
+  const match = PARTIAL_VERSION_PATTERN.exec(value);
+  if (match === null) {
+    return null;
+  }
+  const identifiers = match.slice(1, 4);
+  const wildcardIndex = identifiers.findIndex(
+    (identifier) =>
+      identifier === undefined || /^[xX*]$/u.test(identifier),
+  );
+  if (wildcardIndex === -1) {
+    return null;
+  }
+  if (
+    identifiers
+      .slice(wildcardIndex)
+      .some(
+        (identifier) =>
+          identifier !== undefined && !/^[xX*]$/u.test(identifier),
+      )
+  ) {
+    throw new Error(`Invalid partial semantic version ${value}`);
+  }
+  const numbers = identifiers.map((identifier) =>
+    identifier === undefined || /^[xX*]$/u.test(identifier)
+      ? 0
+      : Number(identifier),
+  );
+  const minimum = `${numbers[0]}.${numbers[1]}.${numbers[2]}`;
+  if (wildcardIndex === 0) {
+    return { minimum: null, maximum: null };
+  }
+  const maximum = [...numbers];
+  maximum[wildcardIndex - 1] += 1;
+  for (let index = wildcardIndex; index < maximum.length; index += 1) {
+    maximum[index] = 0;
+  }
+  return {
+    minimum,
+    maximum: maximum.join("."),
+  };
+}
+
+function comparatorMatches(version, token) {
+  const match = /^(<=|>=|<|>|=|~|\^)?(.+)$/u.exec(token);
+  if (match === null) {
+    throw new Error(`Invalid semantic-version comparator ${token}`);
+  }
+  const operator = match[1] ?? "";
+  const target = match[2];
+  const partial = partialBounds(target);
+  if (partial !== null) {
+    if (["", "="].includes(operator)) {
+      return (
+        (partial.minimum === null ||
+          compareVersions(version, partial.minimum) >= 0) &&
+        (partial.maximum === null ||
+          compareVersions(version, partial.maximum) < 0)
+      );
+    }
+    if (operator === ">=") {
+      return (
+        partial.minimum === null ||
+        compareVersions(version, partial.minimum) >= 0
+      );
+    }
+    if (operator === ">") {
+      return (
+        partial.maximum !== null &&
+        compareVersions(version, partial.maximum) >= 0
+      );
+    }
+    if (operator === "<") {
+      return (
+        partial.minimum !== null &&
+        compareVersions(version, partial.minimum) < 0
+      );
+    }
+    if (operator === "<=") {
+      return (
+        partial.maximum === null ||
+        compareVersions(version, partial.maximum) < 0
+      );
+    }
+    throw new Error(`Invalid partial semantic-version comparator ${token}`);
+  }
+  const parsed = parseSemver(target, `range comparator ${token}`);
+  const comparison = compareVersions(version, target);
+  if (operator === "") {
+    return comparison === 0;
+  }
+  if (operator === "=") {
+    return comparison === 0;
+  }
+  if (operator === ">") {
+    return comparison > 0;
+  }
+  if (operator === ">=") {
+    return comparison >= 0;
+  }
+  if (operator === "<") {
+    return comparison < 0;
+  }
+  if (operator === "<=") {
+    return comparison <= 0;
+  }
+  if (operator === "~") {
+    const upper = `${parsed.major}.${parsed.minor + 1}.0`;
+    return comparison >= 0 && compareVersions(version, upper) < 0;
+  }
+  const upper =
+    parsed.major > 0
+      ? `${parsed.major + 1}.0.0`
+      : parsed.minor > 0
+        ? `0.${parsed.minor + 1}.0`
+        : `0.0.${parsed.patch + 1}`;
+  return comparison >= 0 && compareVersions(version, upper) < 0;
+}
+
+function satisfiesRange(version, range, name = "Node range") {
+  parseSemver(version, "resolved Node version");
+  assertNonemptyString(range, name);
+  return range.split(/\s*\|\|\s*/u).some((alternative) => {
+    if (alternative.length === 0) {
+      throw new Error(`${name} contains an empty alternative`);
+    }
+    const hyphen = /^(\S+)\s+-\s+(\S+)$/u.exec(alternative);
+    if (hyphen !== null) {
+      parseSemver(hyphen[1], `${name} lower bound`);
+      parseSemver(hyphen[2], `${name} upper bound`);
+      return (
+        compareVersions(version, hyphen[1]) >= 0 &&
+        compareVersions(version, hyphen[2]) <= 0
+      );
+    }
+    const tokens = alternative.trim().split(/\s+/u);
+    return tokens.every((token) => comparatorMatches(version, token));
+  });
+}
+
+function assertSemverRange(value, name) {
+  satisfiesRange("24.0.0", value, name);
+  return value;
+}
+
+function normalizedNodeVersion(value, name) {
+  assertNonemptyString(value, name);
+  const normalized = value.startsWith("v") ? value.slice(1) : value;
+  parseSemver(normalized, name);
+  return normalized;
+}
+
+function assertAbsolutePath(value, name) {
+  assertNonemptyString(value, name);
+  if (!isAbsolute(value)) {
+    throw new Error(`${name} must be an absolute path`);
   }
 }
 
@@ -157,6 +392,7 @@ function npmMetadata(name, raw, generatedAt) {
   ) {
     throw new Error(`${name}.engines must be an object`);
   }
+  assertSemverRange(engines.node, `${name}.engines.node`);
   const immutable = {
     name,
     version: raw.version,
@@ -184,7 +420,7 @@ function binaryMetadata(raw, generatedAt, name) {
     return null;
   }
   assertExactVersion(raw.version, `${name}.version`);
-  assertNonemptyString(raw.locator, `${name}.locator`);
+  assertAbsolutePath(raw.locator, `${name}.locator`);
   assertDigest(raw.digest, `${name}.digest`);
   return {
     version: raw.version,
@@ -203,19 +439,22 @@ function browserMetadata(raw, capability, generatedAt) {
   if (raw === null || raw === undefined) {
     return null;
   }
-  for (const key of ["browser", "runner", "os", "version", "locator"]) {
+  for (const key of ["browser", "runner", "os", "version", "path"]) {
     assertNonemptyString(raw[key], `browser evidence ${key}`);
   }
+  assertAbsolutePath(raw.path, "browser evidence path");
   assertDigest(raw.digest, "browser evidence digest");
   return {
     browser: raw.browser.toLowerCase(),
     runner: raw.runner,
     os: raw.os,
     version: raw.version,
+    path: raw.path,
+    digest: raw.digest,
     warnings: normalizeWarnings(raw.warnings, "browser evidence"),
     evidence: {
       type: "external-browser",
-      locator: raw.locator,
+      locator: raw.path,
       revision: `${raw.browser.toLowerCase()}@${raw.version}`,
       digest: raw.digest,
       observed_at: generatedAt,
@@ -263,6 +502,16 @@ function validatePackageFiles(packageJson, lock) {
   if (root === undefined) {
     throw new Error("Cypress package-lock is missing its root package");
   }
+  const packageNodeRange = assertSemverRange(
+    packageJson.engines?.node,
+    "package.json engines.node",
+  );
+  if (root.engines?.node !== packageNodeRange) {
+    throw new Error(
+      "package-lock root engines.node must match package.json",
+    );
+  }
+  const packageNodeRanges = {};
   for (const name of ["cypress", "axe-core"]) {
     const directVersion = packageJson.dependencies?.[name];
     assertExactVersion(directVersion, `package.json dependencies.${name}`);
@@ -279,6 +528,10 @@ function validatePackageFiles(packageJson, lock) {
     }
     assertNonemptyString(installed.resolved, `${name} lock resolved`);
     assertNonemptyString(installed.integrity, `${name} lock integrity`);
+    packageNodeRanges[name] = assertSemverRange(
+      installed.engines?.node,
+      `${name} lock engines.node`,
+    );
   }
   const cypress = lockPackage(lock, "cypress");
   assertNonemptyString(cypress.engines?.node, "Cypress lock Node range");
@@ -288,7 +541,8 @@ function validatePackageFiles(packageJson, lock) {
   return {
     axeCore: packageJson.dependencies["axe-core"],
     cypress: packageJson.dependencies.cypress,
-    cypressNodeRange: cypress.engines.node,
+    packageNodeRange,
+    packageNodeRanges,
   };
 }
 
@@ -297,8 +551,15 @@ function parseNodeFiles(config, lock) {
   const locked =
     /^\s*\[\[tools\.node\]\][\s\S]*?^\s*version\s*=\s*"([^"]+)"\s*$/mu
       .exec(lock)?.[1];
-  assertNonemptyString(configured, "configured Node range");
+  if (typeof configured !== "string" || !/^[1-9]\d*$/u.test(configured)) {
+    throw new Error("configured Node range must be one numeric major");
+  }
   assertExactVersion(locked, "locked Node version");
+  if (String(parseSemver(locked).major) !== configured) {
+    throw new Error(
+      `locked Node ${locked} does not resolve configured major ${configured}`,
+    );
+  }
   return {
     configured,
     locked,
@@ -316,6 +577,13 @@ function selectCapabilities(catalog) {
     .sort((left, right) => left.id.localeCompare(right.id));
   if (capabilities.length === 0) {
     throw new Error("Capability catalog contains no stable Cypress cell");
+  }
+  for (const capability of capabilities) {
+    if (!capability.scenarios.includes("smoke")) {
+      throw new Error(
+        `${capability.id} must include the Cypress smoke scenario`,
+      );
+    }
   }
   return capabilities;
 }
@@ -375,40 +643,6 @@ function candidateVersion(currentVersion, upstream) {
     return null;
   }
   return upstream.version;
-}
-
-function compareVersions(left, right) {
-  const parse = (version) => {
-    const withoutBuild = version.split("+", 1)[0];
-    const separator = withoutBuild.indexOf("-");
-    const core =
-      separator === -1
-        ? withoutBuild
-        : withoutBuild.slice(0, separator);
-    const prerelease =
-      separator === -1 ? null : withoutBuild.slice(separator + 1);
-    return {
-      core: core.split(".").map(Number),
-      prerelease,
-    };
-  };
-  const leftVersion = parse(left);
-  const rightVersion = parse(right);
-  for (let index = 0; index < 3; index += 1) {
-    if (leftVersion.core[index] !== rightVersion.core[index]) {
-      return leftVersion.core[index] - rightVersion.core[index];
-    }
-  }
-  if (leftVersion.prerelease === rightVersion.prerelease) {
-    return 0;
-  }
-  if (leftVersion.prerelease === null) {
-    return 1;
-  }
-  if (rightVersion.prerelease === null) {
-    return -1;
-  }
-  return leftVersion.prerelease < rightVersion.prerelease ? -1 : 1;
 }
 
 function evidenceWarnings(evidenceResults) {
@@ -500,6 +734,7 @@ function expectedPackage(name, currentVersion, currentLock, upstream) {
       version: upstream.version,
       resolved: upstream.dist.tarball,
       integrity: upstream.dist.integrity,
+      engines: structuredClone(upstream.engines),
     };
   }
   const current = lockPackage(currentLock, name);
@@ -508,11 +743,27 @@ function expectedPackage(name, currentVersion, currentLock, upstream) {
     version: current.version,
     resolved: current.resolved,
     integrity: current.integrity,
+    engines: structuredClone(current.engines),
   };
 }
 
-function qualificationChecks(capabilities, cypressBinaryVersion) {
+function qualificationChecks({
+  capabilities,
+  cypressBinary,
+  node,
+}) {
   const checks = [
+    {
+      id: "cypress-binary-source",
+      kind: "file-evidence",
+      scope: "global",
+      cwd: ".",
+      path: cypressBinary.locator,
+      expected_digest: cypressBinary.digest,
+      expected_version: cypressBinary.version,
+      covers: ["package-binary", "immutable-binary-source"],
+      writes: [],
+    },
     {
       id: "cypress-candidate-lock",
       kind: "command",
@@ -528,6 +779,7 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
       cwd: PACKAGE_DIRECTORY,
       environment: {},
       covers: ["candidate-lock"],
+      writes: [PACKAGE_DIRECTORY],
     },
     {
       id: "cypress-lock-evidence",
@@ -535,6 +787,7 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
       scope: "global",
       cwd: PACKAGE_DIRECTORY,
       covers: ["direct-packages", "package-binary", "node-range"],
+      writes: [],
     },
     {
       id: "cypress-candidate-install",
@@ -543,8 +796,11 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
       command: "npm",
       arguments: ["ci", "--no-audit", "--no-fund"],
       cwd: PACKAGE_DIRECTORY,
-      environment: {},
+      environment: {
+        CYPRESS_INSTALL_BINARY: cypressBinary.locator,
+      },
       covers: ["candidate-install", "package-binary"],
+      writes: [PACKAGE_DIRECTORY],
     },
     {
       id: "cypress-installed-binary",
@@ -555,8 +811,23 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
       cwd: PACKAGE_DIRECTORY,
       environment: {},
       covers: ["package-binary"],
-      expected_package_version: cypressBinaryVersion,
-      expected_binary_version: cypressBinaryVersion,
+      expected_package_version: cypressBinary.version,
+      expected_binary_version: cypressBinary.version,
+      expected_source_digest: cypressBinary.digest,
+      expected_source_locator: cypressBinary.locator,
+      writes: [],
+    },
+    {
+      id: "cypress-node-runtime",
+      kind: "node-evidence",
+      scope: "global",
+      command: "node",
+      arguments: ["--version"],
+      cwd: PACKAGE_DIRECTORY,
+      environment: {},
+      expected_version: node.locked,
+      covers: ["node-runtime", "node-range"],
+      writes: [],
     },
     {
       id: "cypress-package-tests",
@@ -567,9 +838,25 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
       cwd: PACKAGE_DIRECTORY,
       environment: {},
       covers: ["package-tests"],
+      writes: [],
     },
   ];
   for (const capability of capabilities) {
+    checks.push({
+      id: `${capability.id}-external-browser`,
+      kind: "browser-evidence",
+      scope: capability.id,
+      command: capability.browser_evidence.path,
+      arguments: ["--version"],
+      cwd: ".",
+      environment: {},
+      expected_browser: capability.browser,
+      expected_digest: capability.browser_evidence.digest,
+      expected_path: capability.browser_evidence.path,
+      expected_version: capability.browser_evidence.version,
+      covers: ["external-browser"],
+      writes: [],
+    });
     for (const scenario of capability.scenarios) {
       checks.push({
         id: `${capability.id}-${scenario}`,
@@ -584,10 +871,14 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
         ],
         cwd: ".",
         environment: {
+          CHROME_BIN: capability.browser_evidence.path,
+          CYPRESS_BROWSER_PATH: capability.browser_evidence.path,
+          CYPRESS_INSTALL_BINARY: cypressBinary.locator,
           E2E_BROWSER: capability.browser,
           E2E_OS: capability.os,
         },
         covers: [scenario],
+        writes: [`${PACKAGE_DIRECTORY}/diagnostics`],
       });
     }
     checks.push({
@@ -607,9 +898,31 @@ function qualificationChecks(capabilities, cypressBinaryVersion) {
         E2E_RESULT_REPORTS: JSON.stringify(capability.result_reports),
       },
       covers: ["reports", "accessibility", "evidence"],
+      writes: [],
+    });
+    checks.push({
+      id: `${capability.id}-artifact-semantics`,
+      kind: "artifact-semantics",
+      scope: capability.id,
+      cwd: ".",
+      capability_id: capability.id,
+      covers: [
+        "scenarios",
+        "reports",
+        "accessibility",
+        "evidence",
+        "browser-identity",
+        "node-runtime",
+      ],
+      writes: [],
     });
   }
   return checks;
+}
+
+function qualificationPlanDigest(plan) {
+  const { plan_digest: ignored, ...prescription } = plan;
+  return metadataDigest(prescription);
 }
 
 function qualificationPlan({
@@ -618,8 +931,9 @@ function qualificationPlan({
   cypressMetadata,
   cypressBinary,
   currentLock,
-  nodeRange,
+  node,
   observation,
+  browserEvidence,
 }) {
   if (observation.disposition.state !== "candidate") {
     return null;
@@ -629,8 +943,41 @@ function qualificationPlan({
       lockPackage(currentLock, "cypress").version,
       cypressMetadata,
     ) ?? lockPackage(currentLock, "cypress").version;
-  return {
+  const binary = {
+    version: cypressBinaryVersion,
+    locator: cypressBinary.evidence.locator,
+    digest: cypressBinary.evidence.digest,
+    evidence: structuredClone(cypressBinary.evidence),
+  };
+  const selectedCapabilities = capabilities.map((capability) => {
+    const externalBrowser = browserEvidence.find(
+      ({ capabilityId }) => capabilityId === capability.id,
+    );
+    if (externalBrowser === undefined) {
+      throw new Error(
+        `Missing browser evidence for ${capability.id}`,
+      );
+    }
+    return {
+      id: capability.id,
+      browser: capability.browser,
+      os: capability.os,
+      runner: capability.runner,
+      scenarios: [...capability.scenarios],
+      evidence: capability.evidence,
+      required_files: [...capability.required_files],
+      result_reports: [...capability.result_reports],
+      require_accessibility: capability.require_accessibility,
+      browser_evidence: {
+        path: externalBrowser.path,
+        version: externalBrowser.version,
+        digest: externalBrowser.digest,
+      },
+    };
+  });
+  const plan = {
     schema_version: 1,
+    kind: "cypress-qualification-plan",
     provider_id: PROVIDER_ID,
     candidate_digest: subjectDigest(observation),
     repository: structuredClone(observation.repository),
@@ -654,22 +1001,19 @@ function qualificationPlan({
       ),
     ].sort((left, right) => left.name.localeCompare(right.name)),
     cypress_binary: {
-      version: cypressBinaryVersion,
-      evidence: structuredClone(cypressBinary.evidence),
+      ...binary,
     },
-    node_range: nodeRange,
-    selected_capabilities: capabilities.map((capability) => ({
-      id: capability.id,
-      browser: capability.browser,
-      os: capability.os,
-      runner: capability.runner,
-      scenarios: [...capability.scenarios],
-      evidence: capability.evidence,
-      required_files: [...capability.required_files],
-      result_reports: [...capability.result_reports],
-      require_accessibility: capability.require_accessibility,
-    })),
-    checks: qualificationChecks(capabilities, cypressBinaryVersion),
+    node: structuredClone(node),
+    selected_capabilities: selectedCapabilities,
+    checks: qualificationChecks({
+      capabilities: selectedCapabilities,
+      cypressBinary: binary,
+      node,
+    }),
+  };
+  return {
+    ...plan,
+    plan_digest: qualificationPlanDigest(plan),
   };
 }
 
@@ -882,8 +1226,22 @@ export async function collectCypressCohort({
     axeCandidate,
     binaryCandidate,
   ].filter((candidate) => candidate !== null).length;
-  const nodeRange =
-    cypressNpm.value?.engines.node ?? current.cypressNodeRange;
+  const nodeRanges = {
+    package: current.packageNodeRange,
+    cypress:
+      cypressNpm.value?.engines.node ??
+      current.packageNodeRanges.cypress,
+    axeCore:
+      axeNpm.value?.engines.node ??
+      current.packageNodeRanges["axe-core"],
+  };
+  if (
+    Object.values(nodeRanges).some(
+      (range) => !satisfiesRange(node.locked, range),
+    )
+  ) {
+    reasonCodes.push("NODE_RANGE_INCOMPATIBLE");
+  }
   const observation = {
     schema_version: 1,
     kind: "observation",
@@ -973,7 +1331,7 @@ export async function collectCypressCohort({
     relations: [
       relation({
         constraint:
-          `${nodeRange}; repository Node ${node.locked} ` +
+          `${nodeRanges.cypress}; repository Node ${node.locked} ` +
           `(configured ${node.configured})`,
         from: "cypress-package",
         hard: true,
@@ -1024,8 +1382,13 @@ export async function collectCypressCohort({
         candidateBinary.value ?? currentBinary.value,
       cypressMetadata: cypressNpm.value,
       currentLock: lock,
-      nodeRange,
+      node: {
+        configured: node.configured,
+        locked: node.locked,
+        ranges: nodeRanges,
+      },
       observation,
+      browserEvidence: browserValues,
     }),
     warnings,
   };
@@ -1044,7 +1407,237 @@ export function createCypressQualificationPlan(collection) {
   if (plan.candidate_digest !== subjectDigest(observation)) {
     throw new Error("Cypress qualification plan is stale");
   }
+  if (plan.plan_digest !== qualificationPlanDigest(plan)) {
+    throw new Error("Cypress qualification plan digest does not match");
+  }
   return structuredClone(plan);
+}
+
+function candidateComponent(observation, id) {
+  const component = observation.components.find(
+    (entry) => entry.id === id,
+  );
+  if (component === undefined) {
+    throw new Error(`Cypress observation is missing ${id}`);
+  }
+  return component;
+}
+
+function npmMetadataFromPlan({
+  component,
+  currentLock,
+  name,
+  plannedPackage,
+}) {
+  const expectedVersion =
+    component.candidate?.version ?? component.current.version;
+  if (
+    plannedPackage.name !== name ||
+    plannedPackage.version !== expectedVersion
+  ) {
+    throw new Error(
+      `Cypress qualification package ${name} does not match observation`,
+    );
+  }
+  assertSemverRange(
+    plannedPackage.engines?.node,
+    `planned ${name} engines.node`,
+  );
+  if (component.candidate === null) {
+    const locked = lockPackage(currentLock, name);
+    for (const [key, value] of [
+      ["version", locked.version],
+      ["resolved", locked.resolved],
+      ["integrity", locked.integrity],
+    ]) {
+      if (plannedPackage[key] !== value) {
+        throw new Error(
+          `Cypress qualification current ${name}.${key} was mutated`,
+        );
+      }
+    }
+    if (
+      JSON.stringify(stableValue(plannedPackage.engines)) !==
+      JSON.stringify(stableValue(locked.engines))
+    ) {
+      throw new Error(
+        `Cypress qualification current ${name}.engines was mutated`,
+      );
+    }
+    return null;
+  }
+  const evidence = component.candidate.evidence.find(
+    ({ type }) => type === "npm-registry",
+  );
+  if (evidence === undefined) {
+    throw new Error(
+      `Cypress observation lacks candidate npm evidence for ${name}`,
+    );
+  }
+  const metadata = {
+    name,
+    version: plannedPackage.version,
+    dist: {
+      integrity: plannedPackage.integrity,
+      tarball: plannedPackage.resolved,
+    },
+    engines: stableValue(plannedPackage.engines),
+  };
+  if (
+    evidence.locator !== plannedPackage.resolved ||
+    evidence.revision !== `${name}@${plannedPackage.version}` ||
+    evidence.digest !== metadataDigest(metadata)
+  ) {
+    throw new Error(
+      `Cypress qualification candidate ${name} metadata was mutated`,
+    );
+  }
+  return {
+    ...metadata,
+    evidence: structuredClone(evidence),
+    warnings: [],
+  };
+}
+
+function binaryMetadataFromPlan(observation, plan) {
+  const component = candidateComponent(
+    observation,
+    "cypress-package-binary",
+  );
+  const record = component.candidate ?? component.current;
+  const evidence = record.evidence.find(
+    ({ type }) => type === "cypress-binary",
+  );
+  if (
+    evidence === undefined ||
+    plan.cypress_binary.version !== record.version ||
+    plan.cypress_binary.locator !== evidence.locator ||
+    plan.cypress_binary.digest !== evidence.digest ||
+    JSON.stringify(stableValue(plan.cypress_binary.evidence)) !==
+      JSON.stringify(stableValue(evidence))
+  ) {
+    throw new Error("Cypress qualification binary metadata was mutated");
+  }
+  return {
+    version: record.version,
+    evidence: structuredClone(evidence),
+    warnings: [],
+  };
+}
+
+function browserMetadataFromPlan(observation, plan) {
+  const component = candidateComponent(
+    observation,
+    "cypress-external-browser",
+  );
+  return plan.selected_capabilities.map((capability) => {
+    const browser = capability.browser_evidence;
+    const evidence = component.current.evidence.find(
+      (item) =>
+        item.type === "external-browser" &&
+        item.revision === `${capability.browser}@${browser.version}`,
+    );
+    if (
+      evidence === undefined ||
+      evidence.locator !== browser.path ||
+      evidence.digest !== browser.digest
+    ) {
+      throw new Error(
+        `Cypress qualification browser metadata for ` +
+          `${capability.id} was mutated`,
+      );
+    }
+    return {
+      browser: capability.browser,
+      runner: capability.runner,
+      os: capability.os,
+      version: browser.version,
+      path: browser.path,
+      digest: browser.digest,
+      warnings: [],
+      evidence: structuredClone(evidence),
+      capabilityId: capability.id,
+    };
+  });
+}
+
+async function validateQualificationPrescription(
+  collection,
+  repositoryRoot,
+) {
+  const plan = createCypressQualificationPlan(collection);
+  const observation = collection.observation;
+  const [catalog, catalogBinding, packageJson, currentLock, nodeConfig, nodeLock] =
+    await Promise.all([
+      readJson(repositoryPath(repositoryRoot, CATALOG_PATH)),
+      readCapabilityCatalog(repositoryPath(repositoryRoot, CATALOG_PATH)),
+      readJson(repositoryPath(repositoryRoot, PACKAGE_PATH)),
+      readJson(repositoryPath(repositoryRoot, LOCK_PATH)),
+      readFile(repositoryPath(repositoryRoot, NODE_CONFIG_PATH), "utf8"),
+      readFile(repositoryPath(repositoryRoot, NODE_LOCK_PATH), "utf8"),
+    ]);
+  validateDocument(observation, {
+    capabilityIds: catalogBinding.ids,
+    capabilityCatalogDigest: catalogBinding.digest,
+  });
+  const current = validatePackageFiles(packageJson, currentLock);
+  const nodeFiles = parseNodeFiles(nodeConfig, nodeLock);
+  const packageByName = new Map(
+    plan.packages.map((entry) => [entry.name, entry]),
+  );
+  if (
+    packageByName.size !== 2 ||
+    !packageByName.has("cypress") ||
+    !packageByName.has("axe-core")
+  ) {
+    throw new Error("Cypress qualification package set was mutated");
+  }
+  const cypressMetadata = npmMetadataFromPlan({
+    component: candidateComponent(observation, "cypress-package"),
+    currentLock,
+    name: "cypress",
+    plannedPackage: packageByName.get("cypress"),
+  });
+  const axeMetadata = npmMetadataFromPlan({
+    component: candidateComponent(observation, "cypress-axe-core"),
+    currentLock,
+    name: "axe-core",
+    plannedPackage: packageByName.get("axe-core"),
+  });
+  const cypressBinary = binaryMetadataFromPlan(observation, plan);
+  const browserEvidence = browserMetadataFromPlan(observation, plan);
+  const node = {
+    configured: nodeFiles.configured,
+    locked: nodeFiles.locked,
+    ranges: {
+      package: current.packageNodeRange,
+      cypress:
+        cypressMetadata?.engines.node ??
+        current.packageNodeRanges.cypress,
+      axeCore:
+        axeMetadata?.engines.node ??
+        current.packageNodeRanges["axe-core"],
+    },
+  };
+  const expected = qualificationPlan({
+    axeMetadata,
+    browserEvidence,
+    capabilities: selectCapabilities(catalog),
+    cypressBinary,
+    cypressMetadata,
+    currentLock,
+    node,
+    observation,
+  });
+  if (
+    JSON.stringify(stableValue(plan)) !==
+    JSON.stringify(stableValue(expected))
+  ) {
+    throw new Error(
+      "Cypress qualification plan differs from the prescribed plan",
+    );
+  }
+  return plan;
 }
 
 function isWithin(root, path) {
@@ -1091,41 +1684,26 @@ async function applyCandidatePackages(plan, workspaceRoot) {
   await writeFile(path, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
 }
 
-async function fileState(path) {
-  try {
-    const metadata = await stat(path);
-    return metadata.isFile() ? hash(await readFile(path)) : null;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-async function sourceState(repositoryRoot, managedPaths) {
-  return Object.fromEntries(
-    await Promise.all(
-      managedPaths.map(async (path) => [
-        path,
-        await fileState(repositoryPath(repositoryRoot, path)),
-      ]),
-    ),
-  );
-}
-
 async function treeEntries(root, directory = root) {
   const entries = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     const repositoryRelative = relative(root, path).split(sep).join("/");
     if (entry.isDirectory()) {
+      entries.push([repositoryRelative, "directory"]);
       entries.push(...(await treeEntries(root, path)));
     } else if (entry.isFile()) {
       entries.push([
         repositoryRelative,
         hash(await readFile(path)),
       ]);
+    } else if (entry.isSymbolicLink()) {
+      entries.push([
+        repositoryRelative,
+        `symlink:${await readlink(path)}`,
+      ]);
+    } else {
+      entries.push([repositoryRelative, "unsupported"]);
     }
   }
   return entries;
@@ -1139,6 +1717,26 @@ async function outsideBoundaryDigest(workspaceRoot, boundary) {
     )
     .sort(([left], [right]) => left.localeCompare(right));
   return metadataDigest(entries);
+}
+
+function effectiveCheckEnvironment(
+  environment,
+  workspaceRoot,
+  checkEnvironment,
+) {
+  const packageRoot = repositoryPath(workspaceRoot, PACKAGE_DIRECTORY);
+  const effective = {
+    ...environment,
+    GITHUB_WORKSPACE: workspaceRoot,
+    CYPRESS_CACHE_FOLDER: join(packageRoot, ".cypress-cache"),
+    npm_config_cache: join(packageRoot, ".npm-cache"),
+    ...checkEnvironment,
+  };
+  if (effective.CHROME_BIN !== undefined) {
+    effective.PATH =
+      `${dirname(effective.CHROME_BIN)}${delimiter}${effective.PATH ?? ""}`;
+  }
+  return effective;
 }
 
 function verifyLock(plan, workspaceRoot) {
@@ -1162,7 +1760,7 @@ function verifyLock(plan, workspaceRoot) {
       }
     }
     const cypress = lockPackage(lock, "cypress");
-    if (cypress.engines?.node !== plan.node_range) {
+    if (cypress.engines?.node !== plan.node.ranges.cypress) {
       throw new Error(
         "Ephemeral Cypress Node range does not match npm evidence",
       );
@@ -1170,6 +1768,320 @@ function verifyLock(plan, workspaceRoot) {
     if (cypress.bin?.cypress !== "bin/cypress") {
       throw new Error("Ephemeral Cypress package binary is missing");
     }
+  });
+}
+
+function assertPackageArtifactPath(path, name, { allowGlob = false } = {}) {
+  assertNonemptyString(path, name);
+  const normalized = path.replaceAll("\\", "/");
+  if (
+    isAbsolute(normalized) ||
+    normalized.split("/").some((part) => part === ".." || part === ".") ||
+    !normalized.startsWith(`${PACKAGE_DIRECTORY}/`) ||
+    (!allowGlob && /[*?[\]{}]/u.test(normalized))
+  ) {
+    throw new Error(`${name} must stay inside ${PACKAGE_DIRECTORY}`);
+  }
+  return normalized;
+}
+
+async function readNonemptyWorkspaceFile(
+  workspaceRoot,
+  path,
+  name = path,
+) {
+  const normalized = assertPackageArtifactPath(path, name);
+  const absolute = repositoryPath(workspaceRoot, normalized);
+  if (!isWithin(workspaceRoot, absolute)) {
+    throw new Error(`${name} escapes the ephemeral workspace`);
+  }
+  const metadata = await stat(absolute);
+  if (!metadata.isFile() || metadata.size === 0) {
+    throw new Error(`${name} must be a nonempty file`);
+  }
+  return readFile(absolute);
+}
+
+async function readWorkspaceJson(workspaceRoot, path, name = path) {
+  const contents = await readNonemptyWorkspaceFile(
+    workspaceRoot,
+    path,
+    name,
+  );
+  try {
+    return JSON.parse(contents.toString("utf8"));
+  } catch (error) {
+    throw new Error(`${name} must contain valid JSON: ${error.message}`);
+  }
+}
+
+function nestedArtifactPaths(value, paths = []) {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (typeof entry === "string") {
+        paths.push(entry);
+      } else {
+        nestedArtifactPaths(entry, paths);
+      }
+    }
+    return paths;
+  }
+  if (value === null || typeof value !== "object") {
+    return paths;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (["contentType", "name"].includes(key)) {
+      continue;
+    }
+    if (typeof entry === "string") {
+      paths.push(entry);
+    } else {
+      nestedArtifactPaths(entry, paths);
+    }
+  }
+  return paths;
+}
+
+function violationRuleCount(report) {
+  const violations = report.accessibility?.counts?.violations;
+  return typeof violations === "number"
+    ? violations
+    : violations?.rules;
+}
+
+async function validateAccessibilityArtifact({
+  axeVersion,
+  path,
+  scenario,
+  workspaceRoot,
+}) {
+  const accessibility = await readWorkspaceJson(
+    workspaceRoot,
+    path,
+    `${scenario} accessibility JSON`,
+  );
+  if (
+    accessibility.schemaVersion !== 1 ||
+    accessibility.tool !== "cypress" ||
+    accessibility.scenario !== scenario ||
+    accessibility.axeCoreVersion !== axeVersion ||
+    !Array.isArray(accessibility.audits) ||
+    accessibility.audits.length === 0
+  ) {
+    throw new Error(
+      `${scenario} accessibility JSON does not match the candidate run`,
+    );
+  }
+}
+
+async function validateRequiredArtifacts(capability, workspaceRoot) {
+  const matched = new Set();
+  for (const rawPattern of capability.required_files) {
+    const pattern = assertPackageArtifactPath(
+      rawPattern,
+      "required artifact pattern",
+      { allowGlob: true },
+    );
+    const paths = [];
+    for await (const path of glob(pattern, {
+      cwd: workspaceRoot,
+      exclude: ["**/node_modules/**"],
+    })) {
+      paths.push(path.replaceAll("\\", "/"));
+    }
+    if (paths.length === 0) {
+      throw new Error(`Required artifact pattern matched nothing: ${pattern}`);
+    }
+    for (const path of paths) {
+      await readNonemptyWorkspaceFile(workspaceRoot, path);
+      matched.add(path);
+    }
+  }
+  return matched;
+}
+
+async function verifyArtifactSemantics(plan, check, workspaceRoot) {
+  const capability = plan.selected_capabilities.find(
+    ({ id }) => id === check.capability_id,
+  );
+  if (capability === undefined) {
+    throw new Error(
+      `Artifact check references unknown capability ${check.capability_id}`,
+    );
+  }
+  if (!capability.scenarios.includes("smoke")) {
+    throw new Error(`${capability.id} did not select Cypress smoke`);
+  }
+  const packageVersions = Object.fromEntries(
+    plan.packages.map(({ name, version }) => [name, version]),
+  );
+  const requiredArtifacts = await validateRequiredArtifacts(
+    capability,
+    workspaceRoot,
+  );
+  const validatorCheck = plan.checks.find(
+    ({ id }) => id === `${capability.id}-artifact-contracts`,
+  );
+  if (
+    validatorCheck?.environment?.E2E_EVIDENCE_FILE !==
+    capability.evidence
+  ) {
+    throw new Error(
+      "Artifact semantics must consume the prescribed E2E_EVIDENCE_FILE",
+    );
+  }
+  const evidencePath = assertPackageArtifactPath(
+    validatorCheck.environment.E2E_EVIDENCE_FILE,
+    "E2E_EVIDENCE_FILE",
+  );
+  await readNonemptyWorkspaceFile(
+    workspaceRoot,
+    evidencePath,
+    "E2E_EVIDENCE_FILE",
+  );
+  if (!requiredArtifacts.has(evidencePath)) {
+    throw new Error("E2E_EVIDENCE_FILE is not covered by required artifacts");
+  }
+  if (capability.result_reports.length !== capability.scenarios.length) {
+    throw new Error(
+      `${capability.id} must have one result report per scenario`,
+    );
+  }
+  const observedScenarios = new Set();
+  const allArtifacts = new Set();
+  const reportDigests = [];
+  for (const reportPath of capability.result_reports) {
+    if (!requiredArtifacts.has(reportPath)) {
+      throw new Error(`Required artifacts omit result report ${reportPath}`);
+    }
+    const report = await readWorkspaceJson(
+      workspaceRoot,
+      reportPath,
+      "Cypress result report",
+    );
+    if (
+      report.schemaVersion !== 1 ||
+      report.capabilityId !== capability.id ||
+      !capability.scenarios.includes(report.scenario) ||
+      observedScenarios.has(report.scenario) ||
+      report.status !== "passed" ||
+      report.assertion?.status !== "passed"
+    ) {
+      throw new Error(
+        `${reportPath} does not describe a unique passing selected scenario`,
+      );
+    }
+    observedScenarios.add(report.scenario);
+    if (
+      report.tool?.name !== "cypress" ||
+      report.tool?.version !== packageVersions.cypress ||
+      report.versions?.axeCore !== packageVersions["axe-core"] ||
+      normalizedNodeVersion(
+        report.versions?.node,
+        `${reportPath} Node version`,
+      ) !== plan.node.locked
+    ) {
+      throw new Error(
+        `${reportPath} dependency identity does not match the candidate`,
+      );
+    }
+    if (
+      report.browser?.requested !== capability.browser ||
+      report.browser?.name !== capability.browser ||
+      report.browser?.selectionSource !== "--browser" ||
+      report.browser?.version !== capability.browser_evidence.version ||
+      report.operatingSystem?.requested !== capability.os
+    ) {
+      throw new Error(
+        `${reportPath} browser identity does not match reviewed evidence`,
+      );
+    }
+    if (
+      capability.require_accessibility &&
+      (report.accessibility?.status !== "passed" ||
+        !Array.isArray(report.accessibility?.audits) ||
+        report.accessibility.audits.length === 0 ||
+        violationRuleCount(report) !== 0)
+    ) {
+      throw new Error(
+        `${reportPath} lacks passing accessibility evidence`,
+      );
+    }
+    const artifactPaths = nestedArtifactPaths(report.artifacts);
+    for (const artifactPath of artifactPaths) {
+      await readNonemptyWorkspaceFile(
+        workspaceRoot,
+        artifactPath,
+        `${reportPath} artifact`,
+      );
+      allArtifacts.add(artifactPath);
+    }
+    if (capability.require_accessibility) {
+      await validateAccessibilityArtifact({
+        axeVersion: packageVersions["axe-core"],
+        path: report.artifacts?.accessibilityJson,
+        scenario: report.scenario,
+        workspaceRoot,
+      });
+      await readNonemptyWorkspaceFile(
+        workspaceRoot,
+        report.artifacts?.accessibilityMarkdown,
+        `${report.scenario} accessibility Markdown`,
+      );
+    }
+    if (
+      !Array.isArray(report.artifacts?.screenshots) ||
+      report.artifacts.screenshots.length === 0 ||
+      !Array.isArray(report.artifacts?.videos) ||
+      report.artifacts.videos.length === 0
+    ) {
+      throw new Error(
+        `${reportPath} lacks required screenshot or video evidence`,
+      );
+    }
+    reportDigests.push({
+      path: reportPath,
+      digest: hash(await readFile(repositoryPath(workspaceRoot, reportPath))),
+    });
+  }
+  if (
+    JSON.stringify([...observedScenarios].sort()) !==
+    JSON.stringify([...capability.scenarios].sort())
+  ) {
+    throw new Error(`${capability.id} did not cover every selected scenario`);
+  }
+  if (!allArtifacts.has(evidencePath)) {
+    throw new Error(
+      "E2E_EVIDENCE_FILE is not referenced by a result report",
+    );
+  }
+  const summary = await readWorkspaceJson(
+    workspaceRoot,
+    `${PACKAGE_DIRECTORY}/diagnostics/summary.json`,
+    "Cypress summary",
+  );
+  if (
+    summary.schemaVersion !== 1 ||
+    summary.status !== "passed" ||
+    summary.capabilityId !== capability.id ||
+    !Array.isArray(summary.scenarios) ||
+    JSON.stringify(
+      summary.scenarios.map(({ scenario }) => scenario).sort(),
+    ) !== JSON.stringify([...capability.scenarios].sort())
+  ) {
+    throw new Error("Cypress summary does not cover the selected scenarios");
+  }
+  return JSON.stringify({
+    browser: capability.browser_evidence,
+    evidence: {
+      path: evidencePath,
+      digest: hash(
+        await readFile(repositoryPath(workspaceRoot, evidencePath)),
+      ),
+    },
+    reports: reportDigests.sort((left, right) =>
+      left.path.localeCompare(right.path)),
+    scenarios: [...observedScenarios].sort(),
   });
 }
 
@@ -1188,14 +2100,144 @@ function commandEvidence(check, revision, output, startedAt, completedAt) {
   };
 }
 
-function outputWarnings(output) {
-  return sortedUnique(
-    output
-      .split(/\r?\n/u)
-      .filter((line) => /\bwarn(?:ing)?\b/iu.test(line))
-      .map((line) => line.trim())
-      .filter(Boolean),
-  );
+export function detectCypressWarnings(output) {
+  const warnings = [];
+  for (const rawLine of output.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line.length === 0) {
+      continue;
+    }
+    if (
+      /\bwarn(?:ing)?s?\b/iu.test(line) ||
+      /\b(?:deprecation|experimental)warnings?\b/iu.test(line) ||
+      /^::warning(?:\s|::)/iu.test(line)
+    ) {
+      warnings.push(line);
+    }
+    try {
+      warnings.push(...structuredWarnings(JSON.parse(line)));
+    } catch {
+      // Text warning detection above covers non-JSON command output.
+    }
+  }
+  return sortedUnique(warnings);
+}
+
+function warningDescription(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value !== null && typeof value === "object") {
+    if (typeof value.message === "string") {
+      return value.message.trim();
+    }
+    if (typeof value.title === "string") {
+      return value.title.trim();
+    }
+    return JSON.stringify(stableValue(value));
+  }
+  return String(value);
+}
+
+function structuredWarnings(value, { warningContext = false } = {}) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) =>
+      structuredWarnings(entry, { warningContext }));
+  }
+  if (typeof value !== "object") {
+    return warningContext ? [warningDescription(value)] : [];
+  }
+  const warnings = [];
+  const level = value.level ?? value.severity ?? value.type;
+  if (
+    typeof level === "string" &&
+    /^(?:(?:deprecation|experimental)?warnings?)$/iu.test(level.trim())
+  ) {
+    warnings.push(warningDescription(value));
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (
+      /^(?:(?:deprecation|experimental)?warnings?)$/iu.test(key)
+    ) {
+      warnings.push(
+        ...structuredWarnings(entry, { warningContext: true }),
+      );
+    } else if (
+      ["annotations", "diagnostics", "messages"].includes(
+        key.toLowerCase(),
+      )
+    ) {
+      warnings.push(...structuredWarnings(entry));
+    }
+  }
+  return warnings.filter(Boolean);
+}
+
+function checkBinding(check, {
+  digest,
+  locator,
+  version,
+}) {
+  if (check.kind === "file-evidence") {
+    return {
+      digest,
+      locator,
+      version: check.expected_version,
+    };
+  }
+  if (check.kind === "browser-evidence") {
+    return {
+      digest,
+      locator,
+      version,
+    };
+  }
+  if (check.kind === "binary-evidence") {
+    return {
+      digest: check.expected_source_digest,
+      locator: check.expected_source_locator,
+      version,
+    };
+  }
+  if (check.kind === "node-evidence") {
+    return {
+      version,
+    };
+  }
+  return undefined;
+}
+
+function expectedCheckBinding(check) {
+  if (check.kind === "file-evidence") {
+    return {
+      digest: check.expected_digest,
+      locator: check.path,
+      version: check.expected_version,
+    };
+  }
+  if (check.kind === "browser-evidence") {
+    return {
+      digest: check.expected_digest,
+      locator: check.expected_path,
+      version: check.expected_version,
+    };
+  }
+  if (check.kind === "binary-evidence") {
+    return {
+      digest: check.expected_source_digest,
+      locator: check.expected_source_locator,
+      version: check.expected_binary_version,
+    };
+  }
+  if (check.kind === "node-evidence") {
+    return {
+      version: check.expected_version,
+    };
+  }
+  return undefined;
 }
 
 async function runCommandCheck(check, {
@@ -1204,7 +2246,39 @@ async function runCommandCheck(check, {
   workspaceRoot,
 }) {
   const startedAt = new Date().toISOString();
+  if (check.kind === "file-evidence") {
+    let actualDigest = null;
+    try {
+      actualDigest = hash(await readFile(check.path));
+    } catch {
+      // The failed binding below is recorded as qualification evidence.
+    }
+    const completedAt = new Date().toISOString();
+    const binding = checkBinding(check, {
+      digest: actualDigest,
+      locator: check.path,
+    });
+    return {
+      status:
+        actualDigest === check.expected_digest ? "pass" : "fail",
+      warnings: [],
+      binding,
+      evidence: [
+        commandEvidence(
+          check,
+          revision,
+          JSON.stringify(binding),
+          startedAt,
+          completedAt,
+        ),
+      ],
+    };
+  }
   try {
+    const executableDigest =
+      check.kind === "browser-evidence"
+        ? hash(await readFile(check.expected_path))
+        : null;
     const { stdout, stderr } = await execFileAsync(
       check.command,
       check.arguments,
@@ -1228,9 +2302,39 @@ async function runCommandCheck(check, {
         !output.includes(
           `Cypress binary version: ${check.expected_binary_version}`,
         ));
+    const outputVersion =
+      check.kind === "node-evidence"
+        ? normalizedNodeVersion(output.trim(), "executed Node version")
+        : check.kind === "browser-evidence"
+          ? check.expected_version
+          : check.kind === "binary-evidence"
+            ? check.expected_binary_version
+            : undefined;
+    const browserVersionMissing =
+      check.kind === "browser-evidence" &&
+      !output.includes(check.expected_version);
+    const nodeVersionMismatch =
+      check.kind === "node-evidence" &&
+      outputVersion !== check.expected_version;
+    const binding = checkBinding(check, {
+      digest: executableDigest,
+      locator:
+        check.kind === "browser-evidence"
+          ? check.expected_path
+          : check.expected_source_locator,
+      version: outputVersion,
+    });
     return {
-      status: binaryVersionMissing ? "fail" : "pass",
-      warnings: outputWarnings(output),
+      status:
+        binaryVersionMissing ||
+        browserVersionMissing ||
+        nodeVersionMismatch ||
+        (check.kind === "browser-evidence" &&
+          executableDigest !== check.expected_digest)
+          ? "fail"
+          : "pass",
+      warnings: detectCypressWarnings(output),
+      binding,
       evidence: [
         commandEvidence(
           check,
@@ -1246,7 +2350,7 @@ async function runCommandCheck(check, {
     const output = `${error.stdout ?? ""}${error.stderr ?? ""}${error.message}`;
     return {
       status: "fail",
-      warnings: outputWarnings(output),
+      warnings: detectCypressWarnings(output),
       evidence: [
         commandEvidence(
           check,
@@ -1293,10 +2397,18 @@ function normalizeCheckResult(check, raw, revision, now) {
       evidence: [fallbackEvidence],
     };
   }
+  const expectedBinding = expectedCheckBinding(check);
+  const bindingMatches =
+    expectedBinding === undefined ||
+    JSON.stringify(stableValue(raw.binding)) ===
+      JSON.stringify(stableValue(expectedBinding));
   return {
     ...check,
-    status,
+    status: bindingMatches ? status : "fail",
     warnings,
+    ...(expectedBinding === undefined
+      ? {}
+      : { binding: structuredClone(raw.binding) }),
     evidence: structuredClone(evidence),
   };
 }
@@ -1356,18 +2468,18 @@ export async function qualifyCypressCandidate(
   } = {},
 ) {
   const observation = collection?.observation;
-  const plan = collection?.qualification_plan;
-  if (observation?.disposition?.state !== "candidate" || plan === null) {
+  if (
+    observation?.disposition?.state !== "candidate" ||
+    collection?.qualification_plan === null
+  ) {
     throw new Error("Cypress qualification requires an available candidate");
   }
-  if (plan.candidate_digest !== subjectDigest(observation)) {
-    throw new Error("Cypress qualification plan is stale");
-  }
   const root = resolve(repositoryRoot);
-  const initialSource = await sourceState(
+  const plan = await validateQualificationPrescription(
+    collection,
     root,
-    plan.workspace.managed_paths,
   );
+  const initialSource = metadataDigest(await treeEntries(root));
   const temporaryRoot = resolve(await createWorkspace());
   if (isWithin(root, temporaryRoot) || isWithin(temporaryRoot, root)) {
     throw new Error("Ephemeral workspace must be outside the repository");
@@ -1419,18 +2531,62 @@ export async function qualifyCypressCandidate(
             ],
           };
         }
+      } else if (check.kind === "artifact-semantics") {
+        const startedAt = new Date().toISOString();
+        try {
+          const output = await verifyArtifactSemantics(
+            plan,
+            check,
+            workspaceRoot,
+          );
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "pass",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                output,
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        } catch (error) {
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "fail",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                error.message,
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        }
       } else if (executeCheck === undefined) {
         raw = await runCommandCheck(check, {
-          environment,
+          environment: effectiveCheckEnvironment(
+            environment,
+            workspaceRoot,
+            check.environment,
+          ),
           revision: observation.repository.revision,
           workspaceRoot,
         });
       } else {
+        const effectiveEnvironment = effectiveCheckEnvironment(
+          environment,
+          workspaceRoot,
+          check.environment,
+        );
         raw = await executeCheck(structuredClone(check), {
-          environment: {
-            ...environment,
-            ...check.environment,
-          },
+          environment: effectiveEnvironment,
           packageRoot: repositoryPath(workspaceRoot, PACKAGE_DIRECTORY),
           workspaceRoot,
         });
@@ -1507,8 +2663,8 @@ export async function qualifyCypressCandidate(
   } finally {
     await rm(temporaryRoot, { force: true, recursive: true });
   }
-  const finalSource = await sourceState(root, plan.workspace.managed_paths);
-  if (JSON.stringify(initialSource) !== JSON.stringify(finalSource)) {
+  const finalSource = metadataDigest(await treeEntries(root));
+  if (initialSource !== finalSource) {
     throw new Error("Cypress qualification mutated the source repository");
   }
   if (workError !== undefined) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   access,
   cp,
@@ -16,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import {
   collectCypressCohort,
   createCypressQualificationPlan,
+  detectCypressWarnings,
   qualifyCypressCandidate,
 } from "./cypress-collector.mjs";
 
@@ -32,6 +34,28 @@ const GENERATED_AT = "2026-10-21T17:00:00Z";
 
 async function fixture() {
   return JSON.parse(await readFile(FIXTURE_PATH, "utf8"));
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(stableValue);
+  }
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableValue(value[key])]),
+  );
+}
+
+function rebindPlanDigest(plan) {
+  const { plan_digest: ignored, ...prescription } = plan;
+  plan.plan_digest =
+    `sha256:${createHash("sha256")
+      .update(JSON.stringify(stableValue(prescription)))
+      .digest("hex")}`;
 }
 
 function evidenceProviders(evidence, overrides = {}) {
@@ -162,6 +186,10 @@ test("plans package tests before every catalog-selected Cypress check", async ()
   );
   assert.equal(plan.cypress_binary.version, "16.3.0");
   assert.equal(
+    plan.cypress_binary.locator,
+    "/opt/oculix-evidence/cypress-16.3.0.zip",
+  );
+  assert.equal(
     plan.cypress_binary.evidence.type,
     "cypress-binary",
   );
@@ -170,6 +198,16 @@ test("plans package tests before every catalog-selected Cypress check", async ()
   );
   assert.equal(binaryCheck.expected_package_version, "16.3.0");
   assert.equal(binaryCheck.expected_binary_version, "16.3.0");
+  assert.equal(
+    plan.checks.find(({ id }) => id === "cypress-candidate-install")
+      .environment.CYPRESS_INSTALL_BINARY,
+    plan.cypress_binary.locator,
+  );
+  assert.equal(
+    plan.selected_capabilities[0].browser_evidence.path,
+    "/opt/oculix-evidence/google-chrome",
+  );
+  assert.match(plan.plan_digest, /^sha256:[0-9a-f]{64}$/u);
   const clonedPlan = createCypressQualificationPlan(
     await collect(),
   );
@@ -199,19 +237,75 @@ test("plans package tests before every catalog-selected Cypress check", async ()
     "evidence",
   ]);
   for (const check of plan.checks.filter(
-    ({ scope }) => scope === "cypress-ubuntu-chrome",
+    ({ covers }) =>
+      covers.length === 1 &&
+      ["smoke", "web-calculator"].includes(covers[0]),
   )) {
-    if (check.covers.includes("reports")) {
-      assert.equal(
-        check.environment.E2E_BROWSER,
-        undefined,
-      );
-      continue;
-    }
     assert.deepEqual(check.arguments.slice(-2), ["--browser", "chrome"]);
     assert.equal(check.environment.E2E_BROWSER, "chrome");
+    assert.equal(
+      check.environment.CHROME_BIN,
+      plan.selected_capabilities[0].browser_evidence.path,
+    );
+    assert.equal(
+      check.environment.CYPRESS_INSTALL_BINARY,
+      plan.cypress_binary.locator,
+    );
     assert.ok(!check.arguments.includes("electron"));
   }
+});
+
+test("strictly binds the entire prescribed qualification plan", async () => {
+  const mutations = [
+    (plan) => {
+      plan.checks.find(
+        ({ id }) => id === "cypress-package-tests",
+      ).arguments.push("--forged");
+    },
+    (plan) => {
+      plan.checks.pop();
+    },
+    (plan) => {
+      plan.packages.find(
+        ({ name }) => name === "cypress",
+      ).integrity = "sha512-forged";
+    },
+    (plan) => {
+      plan.selected_capabilities[0].browser_evidence.version =
+        "999.0.0.0";
+    },
+    (plan) => {
+      plan.workspace.mutation_boundary = "tests/e2e";
+    },
+    (plan) => {
+      plan.cypress_binary.digest = `sha256:${"f".repeat(64)}`;
+    },
+    (plan) => {
+      plan.node.locked = "26.0.0";
+    },
+  ];
+  for (const mutate of mutations) {
+    const collection = await collect();
+    mutate(collection.qualification_plan);
+    rebindPlanDigest(collection.qualification_plan);
+    assert.doesNotThrow(() =>
+      createCypressQualificationPlan(collection),
+    );
+    await assert.rejects(
+      qualifyCypressCandidate(collection, {
+        materializeWorkspace: materializeQualificationInputs,
+        repositoryRoot: REPOSITORY_ROOT,
+      }),
+    );
+  }
+
+  const digestMutation = await collect();
+  digestMutation.qualification_plan.plan_digest =
+    `sha256:${"0".repeat(64)}`;
+  assert.throws(
+    () => createCypressQualificationPlan(digestMutation),
+    /plan digest does not match/u,
+  );
 });
 
 test("missing binary or browser evidence prevents qualification", async () => {
@@ -298,6 +392,92 @@ test("current metadata is a no-op and registry regressions are unavailable", asy
   assert.equal(regression.qualification_plan, null);
 });
 
+test("enforces Node ranges and strict prerelease SemVer ordering", async () => {
+  const incompatibleNode = await fixture();
+  incompatibleNode.npm.cypress.engines.node = ">=26.0.0";
+  const nodeResult = await collect({ evidence: incompatibleNode });
+  assert.equal(nodeResult.observation.disposition.state, "unavailable");
+  assert.ok(
+    nodeResult.observation.disposition.reason_codes.includes(
+      "NODE_RANGE_INCOMPATIBLE",
+    ),
+  );
+  assert.equal(nodeResult.qualification_plan, null);
+
+  const invalid = await fixture();
+  invalid.npm.cypress.version = "16.3.0-beta.01";
+  const invalidResult = await collect({ evidence: invalid });
+  assert.ok(
+    invalidResult.observation.disposition.reason_codes.includes(
+      "CYPRESS_NPM_EVIDENCE_UNAVAILABLE",
+    ),
+  );
+
+  const directory = await mkdtemp(join(tmpdir(), "cypress-semver-"));
+  try {
+    await copyCollectorInputs(REPOSITORY_ROOT, directory);
+    const packagePath = join(directory, PACKAGE_PATH);
+    const lockPath = join(directory, LOCK_PATH);
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
+    const lock = JSON.parse(await readFile(lockPath, "utf8"));
+    packageJson.dependencies.cypress = "16.3.0-beta.10";
+    lock.packages[""].dependencies.cypress = "16.3.0-beta.10";
+    Object.assign(lock.packages["node_modules/cypress"], {
+      version: "16.3.0-beta.10",
+      resolved:
+        "https://registry.npmjs.org/cypress/-/cypress-16.3.0-beta.10.tgz",
+      integrity: "sha512-current-prerelease",
+    });
+    await writeFile(
+      packagePath,
+      `${JSON.stringify(packageJson, null, 2)}\n`,
+    );
+    await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const evidence = await fixture();
+    evidence.npm.cypress.version = "16.3.0-beta.2";
+    evidence.npm.cypress.dist.tarball =
+      "https://registry.npmjs.org/cypress/-/cypress-16.3.0-beta.2.tgz";
+    evidence.binary.current.version = "16.3.0-beta.10";
+    const result = await collect({
+      evidence,
+      repositoryRoot: directory,
+    });
+    assert.ok(
+      result.observation.disposition.reason_codes.includes(
+        "CYPRESS_NPM_METADATA_REGRESSION",
+      ),
+    );
+    assert.equal(result.qualification_plan, null);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("detects compound, plural, case-insensitive, and structured warnings", () => {
+  const warnings = detectCypressWarnings([
+    "npm WARN deprecated package",
+    "DeprecationWarning: legacy API",
+    "ExperimentalWarning: unstable feature",
+    "MULTIPLE WARNINGS were emitted",
+    '{"severity":"WARNING","message":"structured warning"}',
+    '{"Diagnostics":[{"type":"ExperimentalWarning","message":"nested"}]}',
+  ].join("\n"));
+  assert.ok(warnings.length >= 6);
+  for (const expected of [
+    "WARN",
+    "DeprecationWarning",
+    "ExperimentalWarning",
+    "WARNINGS",
+    "structured warning",
+    "nested",
+  ]) {
+    assert.ok(
+      warnings.some((warning) => warning.includes(expected)),
+      `expected warning containing ${expected}`,
+    );
+  }
+});
+
 async function copyCollectorInputs(source, destination) {
   const paths = [
     PACKAGE_PATH,
@@ -367,8 +547,152 @@ async function updateEphemeralLock(plan, workspaceRoot) {
       expected,
     );
   }
-  lock.packages["node_modules/cypress"].engines.node = plan.node_range;
+  lock.packages["node_modules/cypress"].engines.node =
+    plan.node.ranges.cypress;
   await writeFile(path, `${JSON.stringify(lock, null, 2)}\n`, "utf8");
+}
+
+async function writeArtifact(path, contents = "evidence\n") {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, contents);
+}
+
+function accessibilityResult(plan, scenario) {
+  return {
+    schemaVersion: 1,
+    tool: "cypress",
+    scenario,
+    axeCoreVersion: plan.packages.find(
+      ({ name }) => name === "axe-core",
+    ).version,
+    audits: [
+      {
+        state: "final",
+        counts: {
+          violations: { rules: 0, nodes: 0 },
+        },
+      },
+    ],
+  };
+}
+
+function scenarioReport(plan, capability, scenario) {
+  const base = `tests/e2e/cypress/diagnostics/${scenario}`;
+  const spec = scenario === "smoke"
+    ? "smoke.cy.mjs"
+    : "web-calculator.cy.mjs";
+  const screenshot = `${base}/screenshots/${spec}/result.png`;
+  return {
+    schemaVersion: 1,
+    capabilityId: capability.id,
+    scenario,
+    status: "passed",
+    assertion: { status: "passed" },
+    accessibility: {
+      status: "passed",
+      audits: ["final"],
+      counts: {
+        violations: { rules: 0, nodes: 0 },
+        incomplete: { rules: 0, nodes: 0 },
+      },
+    },
+    artifacts: {
+      accessibilityJson: `${base}/accessibility.json`,
+      accessibilityMarkdown: `${base}/accessibility.md`,
+      assertion: `${base}/assertion.json`,
+      runJson: `${base}/run.json`,
+      screenshots: [screenshot],
+      videos: [`${base}/videos/${spec}.mp4`],
+    },
+    browser: {
+      name: capability.browser,
+      requested: capability.browser,
+      selectionSource: "--browser",
+      version: capability.browser_evidence.version,
+    },
+    operatingSystem: {
+      requested: capability.os,
+    },
+    tool: {
+      name: "cypress",
+      version: plan.packages.find(
+        ({ name }) => name === "cypress",
+      ).version,
+    },
+    versions: {
+      axeCore: plan.packages.find(
+        ({ name }) => name === "axe-core",
+      ).version,
+      node: `v${plan.node.locked}`,
+    },
+  };
+}
+
+async function writeMockArtifacts(
+  plan,
+  workspaceRoot,
+  mutateArtifacts,
+) {
+  const capability = plan.selected_capabilities[0];
+  const reports = Object.fromEntries(
+    capability.scenarios.map((scenario) => [
+      scenario,
+      scenarioReport(plan, capability, scenario),
+    ]),
+  );
+  await mutateArtifacts?.(reports, capability);
+  for (const [scenario, report] of Object.entries(reports)) {
+    const base = join(
+      workspaceRoot,
+      `tests/e2e/cypress/diagnostics/${scenario}`,
+    );
+    await writeArtifact(
+      join(base, "run.json"),
+      `${JSON.stringify(report, null, 2)}\n`,
+    );
+    await writeArtifact(
+      join(base, "accessibility.json"),
+      `${JSON.stringify(
+        accessibilityResult(plan, scenario),
+        null,
+        2,
+      )}\n`,
+    );
+    await writeArtifact(join(base, "accessibility.md"));
+    await writeArtifact(
+      join(base, "assertion.json"),
+      '{"status":"passed"}\n',
+    );
+    for (const path of [
+      ...report.artifacts.screenshots,
+      ...report.artifacts.videos,
+    ]) {
+      await writeArtifact(join(workspaceRoot, path));
+    }
+  }
+  const summary = {
+    schemaVersion: 1,
+    capabilityId: capability.id,
+    status: "passed",
+    scenarios: capability.scenarios.map((scenario) => ({
+      capabilityId: capability.id,
+      scenario,
+      status: "passed",
+    })),
+  };
+  await writeArtifact(
+    join(
+      workspaceRoot,
+      "tests/e2e/cypress/diagnostics/summary.json",
+    ),
+    `${JSON.stringify(summary, null, 2)}\n`,
+  );
+  await writeArtifact(
+    join(
+      workspaceRoot,
+      "tests/e2e/cypress/diagnostics/summary.md",
+    ),
+  );
 }
 
 function checkEvidence(check, sequence = 0) {
@@ -387,17 +711,46 @@ function passingExecutor(plan, observed, overrides = {}) {
   return async (check, context) => {
     observed.push({
       check,
+      environment: context.environment,
       packageRoot: context.packageRoot,
       workspaceRoot: context.workspaceRoot,
     });
     if (check.id === "cypress-candidate-lock") {
       await updateEphemeralLock(plan, context.workspaceRoot);
     }
+    if (check.id.endsWith("-web-calculator")) {
+      await writeMockArtifacts(
+        plan,
+        context.workspaceRoot,
+        overrides.mutateArtifacts,
+      );
+    }
     const currentSequence = sequence;
     sequence += 1;
+    const binding = {
+      "file-evidence": {
+        digest: check.expected_digest,
+        locator: check.path,
+        version: check.expected_version,
+      },
+      "browser-evidence": {
+        digest: check.expected_digest,
+        locator: check.expected_path,
+        version: check.expected_version,
+      },
+      "binary-evidence": {
+        digest: check.expected_source_digest,
+        locator: check.expected_source_locator,
+        version: check.expected_binary_version,
+      },
+      "node-evidence": {
+        version: check.expected_version,
+      },
+    }[check.kind];
     return {
       status: overrides.status?.(check) ?? "pass",
       warnings: overrides.warnings?.(check) ?? [],
+      binding: overrides.binding?.(check, binding) ?? binding,
       evidence:
         overrides.evidence?.(check) ??
         [checkEvidence(check, currentSequence)],
@@ -454,6 +807,18 @@ test("qualifies every check in an ephemeral workspace without mutation", async (
         packageRoot === join(workspaceRoot, "tests/e2e/cypress"),
     ),
   );
+  assert.ok(
+    observed.every(
+      ({ environment }) =>
+        environment.GITHUB_WORKSPACE === workspaceRoot &&
+        environment.CYPRESS_CACHE_FOLDER.startsWith(
+          join(workspaceRoot, "tests/e2e/cypress"),
+        ) &&
+        environment.npm_config_cache.startsWith(
+          join(workspaceRoot, "tests/e2e/cypress"),
+        ),
+    ),
+  );
   await assert.rejects(access(workspaceRoot));
   assert.equal(
     await readFile(join(REPOSITORY_ROOT, PACKAGE_PATH), "utf8"),
@@ -507,6 +872,113 @@ test("qualification warnings and missing evidence cannot become success", async 
   assert.deepEqual(missing.validation.disposition.reason_codes, [
     "QUALIFICATION_EVIDENCE_MISSING",
   ]);
+});
+
+test("binary and external Chrome execution must match reviewed evidence", async () => {
+  for (const checkId of [
+    "cypress-binary-source",
+    "cypress-installed-binary",
+    "cypress-ubuntu-chrome-external-browser",
+  ]) {
+    const collection = await collect();
+    const result = await qualifyCypressCandidate(collection, {
+      executeCheck: passingExecutor(
+        collection.qualification_plan,
+        [],
+        {
+          binding: (check, binding) =>
+            check.id === checkId
+              ? {
+                  ...binding,
+                  digest: `sha256:${"f".repeat(64)}`,
+                }
+              : binding,
+        },
+      ),
+      generatedAt: "2026-10-21T17:04:30Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    });
+    assert.equal(result.validation.disposition.state, "blocked");
+    assert.equal(
+      result.checks.find(({ id }) => id === checkId).status,
+      "fail",
+    );
+  }
+});
+
+test("artifact semantics require complete scenario, browser, Node, accessibility, and evidence identity", async () => {
+  const mutations = [
+    (reports) => {
+      delete reports.smoke;
+    },
+    (reports) => {
+      reports.smoke.accessibility.status = "failed";
+    },
+    (reports) => {
+      reports["web-calculator"].browser.version = "999.0.0.0";
+    },
+    (reports) => {
+      reports["web-calculator"].versions.node = "v26.0.0";
+    },
+    (reports) => {
+      reports["web-calculator"].artifacts.screenshots = [
+        "tests/e2e/cypress/diagnostics/web-calculator/screenshots/other.png",
+      ];
+    },
+  ];
+  for (const mutateArtifacts of mutations) {
+    const collection = await collect();
+    const result = await qualifyCypressCandidate(collection, {
+      executeCheck: passingExecutor(
+        collection.qualification_plan,
+        [],
+        { mutateArtifacts },
+      ),
+      generatedAt: "2026-10-21T17:04:45Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    });
+    assert.equal(result.validation.disposition.state, "blocked");
+    assert.equal(
+      result.checks.find(
+        ({ id }) => id === "cypress-ubuntu-chrome-artifact-semantics",
+      ).status,
+      "fail",
+    );
+  }
+});
+
+test("guards the entire source repository against qualification mutation", async () => {
+  const source = await mkdtemp(join(tmpdir(), "cypress-source-guard-"));
+  try {
+    await copyCollectorInputs(REPOSITORY_ROOT, source);
+    await writeFile(join(source, "README.md"), "source\n");
+    const collection = await collect({ repositoryRoot: source });
+    const executor = passingExecutor(
+      collection.qualification_plan,
+      [],
+    );
+    let mutated = false;
+    await assert.rejects(
+      qualifyCypressCandidate(collection, {
+        executeCheck: async (check, context) => {
+          const result = await executor(check, context);
+          if (!mutated && check.id === "cypress-package-tests") {
+            mutated = true;
+            await writeFile(join(source, "README.md"), "mutated\n");
+          }
+          return result;
+        },
+        generatedAt: "2026-10-21T17:04:50Z",
+        materializeWorkspace: materializeQualificationInputs,
+        repositoryRoot: source,
+      }),
+      /mutated the source repository/u,
+    );
+  } finally {
+    await rm(source, { force: true, recursive: true });
+  }
 });
 
 test("stale plans, in-repository workspaces, and boundary writes are rejected", async () => {
