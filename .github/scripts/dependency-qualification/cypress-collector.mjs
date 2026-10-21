@@ -986,15 +986,16 @@ function qualificationChecks({
         environment: {
           CHROME_BIN: capability.browser_evidence.realpath,
           CYPRESS_BROWSER_PATH: capability.browser_evidence.realpath,
-          CYPRESS_BROWSER_DIGEST: capability.browser_evidence.digest,
           CYPRESS_INSTALL_BINARY: cypressBinary.realpath,
           E2E_BROWSER: capability.browser,
           E2E_OS: capability.os,
         },
         browser_execution: {
-          digest: capability.browser_evidence.digest,
-          realpath: capability.browser_evidence.realpath,
-          version: capability.browser_evidence.version,
+          expected_digest: capability.browser_evidence.digest,
+          expected_realpath: capability.browser_evidence.realpath,
+          initial_check_id: `${capability.id}-external-browser`,
+          result_report:
+            `${PACKAGE_DIRECTORY}/diagnostics/${scenario}/run.json`,
         },
         covers: [scenario],
         writes: [`${PACKAGE_DIRECTORY}/diagnostics`],
@@ -1916,6 +1917,19 @@ async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
   let harness = sources[CYPRESS_HARNESS_PATH];
   harness = replaceQualificationSource(
     harness,
+    'import { readFileSync } from "node:fs";',
+    `import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";`,
+    `${CYPRESS_HARNESS_PATH} hashing import`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    'import { readFile } from "node:fs/promises";',
+    'import { readFile, realpath } from "node:fs/promises";',
+    `${CYPRESS_HARNESS_PATH} filesystem imports`,
+  );
+  harness = replaceQualificationSource(
+    harness,
     'import { dirname, resolve } from "node:path";',
     'import { dirname, isAbsolute, resolve } from "node:path";',
     CYPRESS_HARNESS_PATH,
@@ -1937,14 +1951,6 @@ async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
       ? browserArgument
       : environment.E2E_BROWSER ?? DEFAULT_BROWSER;
   const browser = requestedBrowser.trim().toLowerCase();
-  if (
-    browserExecutable !== null &&
-    !environment.CYPRESS_BROWSER_DIGEST
-  ) {
-    throw new Error(
-      "CYPRESS_BROWSER_DIGEST is required for an explicit browser path",
-    );
-  }
   if (!SUPPORTED_BROWSERS.has(browser)) {`,
     `${CYPRESS_HARNESS_PATH} browser selection`,
   );
@@ -1956,10 +1962,6 @@ async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
     `  return {
     browser,
     browserExecutable,
-    browserExecutableDigest:
-      browserExecutable === null
-        ? null
-        : environment.CYPRESS_BROWSER_DIGEST,
     scenario,`,
     `${CYPRESS_HARNESS_PATH} selection result`,
   );
@@ -1968,6 +1970,101 @@ async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
     "      browser: selection.browser,",
     "      browser: selection.browserExecutable ?? selection.browser,",
     `${CYPRESS_HARNESS_PATH} Cypress launch`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `export async function runHarness({`,
+    `async function observeBrowserExecutable(path) {
+  const resolvedPath = await realpath(path);
+  return {
+    digest:
+      \`sha256:\${createHash("sha256")
+        .update(await readFile(resolvedPath))
+        .digest("hex")}\`,
+    realpath: resolvedPath,
+  };
+}
+
+export async function runHarness({`,
+    `${CYPRESS_HARNESS_PATH} browser observation`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `  let result;
+  let runError;
+  try {`,
+    `  let result;
+  let runError;
+  let browserExecutableBefore;
+  let browserExecutableAfter;
+  try {`,
+    `${CYPRESS_HARNESS_PATH} browser observation state`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `    const scenarioDirectory = resolve(
+      DIAGNOSTICS_DIRECTORY,
+      selection.scenario,
+    );
+    result = await cypress.run({`,
+    `    const scenarioDirectory = resolve(
+      DIAGNOSTICS_DIRECTORY,
+      selection.scenario,
+    );
+    browserExecutableBefore = await observeBrowserExecutable(
+      selection.browserExecutable,
+    );
+    result = await cypress.run({`,
+    `${CYPRESS_HARNESS_PATH} pre-run browser observation`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `      spec: resolve(HARNESS_DIRECTORY, SCENARIOS.get(selection.scenario)),
+    });
+  } catch (error) {
+    runError = error;
+  }
+
+  const finishedAt = new Date().toISOString();`,
+    `      spec: resolve(HARNESS_DIRECTORY, SCENARIOS.get(selection.scenario)),
+    });
+    browserExecutableAfter = await observeBrowserExecutable(
+      selection.browserExecutable,
+    );
+    if (
+      browserExecutableBefore.realpath !==
+        browserExecutableAfter.realpath ||
+      browserExecutableBefore.digest !== browserExecutableAfter.digest
+    ) {
+      throw new Error(
+        "Chrome executable changed while the Cypress scenario was running",
+      );
+    }
+  } catch (error) {
+    runError = error;
+    if (
+      browserExecutableBefore !== undefined &&
+      browserExecutableAfter === undefined
+    ) {
+      try {
+        browserExecutableAfter = await observeBrowserExecutable(
+          selection.browserExecutable,
+        );
+      } catch {
+        // The original run error remains the primary scenario failure.
+      }
+    }
+  }
+  selection.browserExecutableEvidence =
+    browserExecutableBefore === undefined
+      ? null
+      : {
+          after: browserExecutableAfter ?? null,
+          before: browserExecutableBefore,
+        };
+
+  const finishedAt = new Date().toISOString();`,
+    `${CYPRESS_HARNESS_PATH} post-run browser observation`,
   );
 
   let reporting = sources[CYPRESS_REPORTING_PATH];
@@ -1980,8 +2077,7 @@ async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
     version: result?.browserVersion ?? null,
   };`,
     `  return {
-    executableDigest: selection.browserExecutableDigest ?? null,
-    executablePath: selection.browserExecutable ?? null,
+    executable: selection.browserExecutableEvidence ?? null,
     name: result?.browserName ?? selection.browser,
     requested: selection.browser,
     selectionSource: selection.source,
@@ -2502,10 +2598,6 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
       report.browser?.name !== capability.browser ||
       report.browser?.selectionSource !== "--browser" ||
       report.browser?.version !== capability.browser_evidence.version ||
-      report.browser?.executablePath !==
-        capability.browser_evidence.realpath ||
-      report.browser?.executableDigest !==
-        capability.browser_evidence.digest ||
       report.operatingSystem?.requested !== capability.os
     ) {
       throw new Error(
@@ -2515,6 +2607,10 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
     const scenarioCheck = plan.checks.find(
       ({ id }) => id === `${capability.id}-${report.scenario}`,
     );
+    const expectedBrowserObservation = {
+      digest: capability.browser_evidence.digest,
+      realpath: capability.browser_evidence.realpath,
+    };
     if (
       scenarioCheck === undefined ||
       JSON.stringify(scenarioCheck.arguments.slice(-2)) !==
@@ -2524,14 +2620,21 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
         ]) ||
       scenarioCheck.environment.CYPRESS_BROWSER_PATH !==
         capability.browser_evidence.realpath ||
-      scenarioCheck.environment.CYPRESS_BROWSER_DIGEST !==
-        capability.browser_evidence.digest ||
+      "CYPRESS_BROWSER_DIGEST" in scenarioCheck.environment ||
+      JSON.stringify(stableValue(report.browser?.executable)) !==
+        JSON.stringify(
+          stableValue({
+            after: expectedBrowserObservation,
+            before: expectedBrowserObservation,
+          }),
+        ) ||
       JSON.stringify(stableValue(scenarioCheck.browser_execution)) !==
         JSON.stringify(
           stableValue({
-            digest: capability.browser_evidence.digest,
-            realpath: capability.browser_evidence.realpath,
-            version: capability.browser_evidence.version,
+            expected_digest: capability.browser_evidence.digest,
+            expected_realpath: capability.browser_evidence.realpath,
+            initial_check_id: `${capability.id}-external-browser`,
+            result_report: reportPath,
           }),
         )
     ) {
@@ -2693,6 +2796,7 @@ function warningDescription(value) {
     const details = [];
     for (const key of [
       "message",
+      "msg",
       "title",
       "code",
       "count",
@@ -2705,7 +2809,7 @@ function warningDescription(value) {
         typeof entry === "number"
       ) {
         details.push(
-          key === "message"
+          ["message", "msg"].includes(key)
             ? String(entry).trim()
             : `${key}=${String(entry).trim()}`,
         );
@@ -2747,6 +2851,7 @@ function structuredWarnings(
         "code",
         "count",
         "message",
+        "msg",
         "title",
       ].includes(key.toLowerCase()),
     )
@@ -2757,7 +2862,8 @@ function structuredWarnings(
   const level = value.level ?? value.severity ?? value.type;
   if (
     typeof level === "string" &&
-    /^(?:(?:deprecation|experimental)?warnings?)$/iu.test(level.trim())
+    /^(?:deprecated|warn(?:ing)?s?|(?:deprecation|experimental)warnings?)$/iu
+      .test(level.trim())
   ) {
     warnings.push(warningDescription(value));
   }
@@ -2825,12 +2931,6 @@ function checkBinding(check, {
       version,
     };
   }
-  if (
-    check.kind === "command" &&
-    check.browser_execution !== undefined
-  ) {
-    return structuredClone(check.browser_execution);
-  }
   return undefined;
 }
 
@@ -2865,9 +2965,153 @@ function expectedCheckBinding(check) {
     check.kind === "command" &&
     check.browser_execution !== undefined
   ) {
-    return structuredClone(check.browser_execution);
+    const observation = {
+      digest: check.browser_execution.expected_digest,
+      realpath: check.browser_execution.expected_realpath,
+    };
+    return {
+      after: structuredClone(observation),
+      before: structuredClone(observation),
+    };
   }
   return undefined;
+}
+
+async function observeBrowserExecutable(path) {
+  const resolvedPath = await realpath(path);
+  return {
+    digest: hash(await readFile(resolvedPath)),
+    realpath: resolvedPath,
+  };
+}
+
+async function runScenarioQualificationCheck(
+  check,
+  {
+    checkResults,
+    environment,
+    executeCheck,
+    revision,
+    workspaceRoot,
+  },
+) {
+  const startedAt = new Date().toISOString();
+  let before;
+  let after;
+  let raw;
+  let reportExecutable;
+  try {
+    before = await observeBrowserExecutable(
+      check.browser_execution.expected_realpath,
+    );
+    const initial = checkResults.find(
+      ({ id }) => id === check.browser_execution.initial_check_id,
+    );
+    if (
+      initial?.status !== "pass" ||
+      initial.binding?.realpath !== before.realpath ||
+      initial.binding?.digest !== before.digest ||
+      before.realpath !== check.browser_execution.expected_realpath ||
+      before.digest !== check.browser_execution.expected_digest
+    ) {
+      throw new Error(
+        "Chrome executable changed after its initial qualification check",
+      );
+    }
+    const effectiveEnvironment = effectiveCheckEnvironment(
+      environment,
+      workspaceRoot,
+      check.environment,
+    );
+    raw =
+      executeCheck === undefined
+        ? await runCommandCheck(check, {
+            environment: effectiveEnvironment,
+            revision,
+            workspaceRoot,
+          })
+        : await executeCheck(structuredClone(check), {
+            environment: effectiveEnvironment,
+            packageRoot: repositoryPath(
+              workspaceRoot,
+              PACKAGE_DIRECTORY,
+            ),
+            workspaceRoot,
+          });
+    after = await observeBrowserExecutable(
+      check.browser_execution.expected_realpath,
+    );
+    if (
+      before.realpath !== after.realpath ||
+      before.digest !== after.digest
+    ) {
+      throw new Error(
+        "Chrome executable changed while the Cypress scenario was running",
+      );
+    }
+    if (raw?.status === "pass") {
+      const report = await readWorkspaceJson(
+        workspaceRoot,
+        check.browser_execution.result_report,
+        `${check.id} result report`,
+      );
+      reportExecutable = report.browser?.executable;
+      if (
+        JSON.stringify(stableValue(reportExecutable)) !==
+        JSON.stringify(stableValue({ after, before }))
+      ) {
+        throw new Error(
+          "Cypress report browser observations do not match execution",
+        );
+      }
+    }
+    const completedAt = new Date().toISOString();
+    return {
+      ...(raw ?? {}),
+      binding: { after, before },
+      evidence: [
+        ...(Array.isArray(raw?.evidence) ? raw.evidence : []),
+        commandEvidence(
+          check,
+          revision,
+          JSON.stringify({ after, before, reportExecutable }),
+          startedAt,
+          completedAt,
+        ),
+      ],
+    };
+  } catch (error) {
+    if (before !== undefined && after === undefined) {
+      try {
+        after = await observeBrowserExecutable(
+          check.browser_execution.expected_realpath,
+        );
+      } catch {
+        // The scenario already fails; missing post-run evidence stays null.
+      }
+    }
+    const completedAt = new Date().toISOString();
+    return {
+      ...(raw ?? {}),
+      status: "fail",
+      binding: { after: after ?? null, before: before ?? null },
+      evidence: [
+        ...(Array.isArray(raw?.evidence) ? raw.evidence : []),
+        commandEvidence(
+          check,
+          revision,
+          JSON.stringify({
+            after: after ?? null,
+            before: before ?? null,
+            error: error.message,
+            reportExecutable: reportExecutable ?? null,
+          }),
+          startedAt,
+          completedAt,
+        ),
+      ],
+    };
+  }
 }
 
 async function runCommandCheck(check, {
@@ -3320,6 +3564,14 @@ export async function qualifyCypressCandidate(
             ],
           };
         }
+      } else if (check.browser_execution !== undefined) {
+        raw = await runScenarioQualificationCheck(check, {
+          checkResults,
+          environment,
+          executeCheck,
+          revision: observation.repository.revision,
+          workspaceRoot,
+        });
       } else if (executeCheck === undefined) {
         raw = await runCommandCheck(check, {
           environment: effectiveCheckEnvironment(
