@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Dry-run, check, or synchronize catalog-derived E2E labels"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+exec mise -E web-e2e exec -- \
+  node .github/scripts/sync-e2e-labels.mjs "$@"

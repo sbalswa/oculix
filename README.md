@@ -168,7 +168,8 @@ The catalog is an explicit allowlist, not an OS × browser product. Every
 selected cell has standard cost, uses a GitHub-hosted Ubuntu runner, has a
 20-minute timeout, and runs with `fail-fast: false`. At most three cells run
 concurrently, so a full four-cell selection runs as three cells followed by
-one. A pull request with no `ci:e2e:*` label allocates no E2E matrix runner.
+the fourth when runner capacity is available. A pull request with no
+`ci:e2e:*` label allocates no E2E matrix runner.
 
 ### Pull-request selectors
 
@@ -197,9 +198,22 @@ obsolete in-progress selector work. Unrelated labels neither select E2E work
 nor cancel it. An unknown `ci:e2e:*` label fails planning instead of silently
 allocating the wrong runner.
 
-Repository label synchronization only creates or updates the available label
-definitions and their descriptions. It does not apply a selector to a pull
-request and therefore does not start E2E work.
+Repository label synchronization manages the available label definitions and
+their descriptions. It does not apply a selector to a pull request and
+therefore does not start E2E work.
+
+After changing `tests/e2e/capabilities.json`, preview and verify label drift
+before applying it:
+
+```sh
+mise run github:e2e-labels
+mise run github:e2e-labels -- --check
+mise run github:e2e-labels -- --apply
+```
+
+The task is dry-run by default. `--check` is also read-only and exits nonzero
+on drift. `--apply` creates and updates labels but retains stale managed labels;
+deletion requires the explicit `--apply --prune` combination.
 
 Labels applied by a workflow using GitHub's default `GITHUB_TOKEN` do not
 recursively trigger a new `pull_request:labeled` workflow run. Automation that
