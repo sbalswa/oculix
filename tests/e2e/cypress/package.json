@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "smoke": "node harness.mjs smoke",
-    "test": "node --test harness.test.mjs",
+    "test": "node --test harness.test.mjs task.test.mjs",
     "web-calculator": "node harness.mjs web-calculator"
   },
   "dependencies": {

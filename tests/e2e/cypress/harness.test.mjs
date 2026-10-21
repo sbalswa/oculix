@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveBrowserSelection } from "./harness.mjs";
+import {
+  resolveBrowserSelection,
+  resolveOperatingSystemSelection,
+} from "./harness.mjs";
 
 test("defaults local runs to Electron", () => {
   assert.deepEqual(
@@ -83,5 +86,61 @@ test("rejects unknown scenarios", () => {
         environment: {},
       }),
     /Unknown Cypress scenario: calculator/,
+  );
+});
+
+test("accepts explicit matrix operating systems compatible with the host", () => {
+  assert.deepEqual(
+    resolveOperatingSystemSelection({
+      environment: { E2E_OS: "Ubuntu" },
+      linuxDistribution: "ubuntu",
+      platform: "linux",
+    }),
+    {
+      hostDistribution: "ubuntu",
+      hostPlatform: "linux",
+      operatingSystem: "ubuntu",
+      operatingSystemSource: "E2E_OS",
+    },
+  );
+  assert.deepEqual(
+    resolveOperatingSystemSelection({
+      environment: {},
+      platform: "darwin",
+    }),
+    {
+      hostDistribution: null,
+      hostPlatform: "darwin",
+      operatingSystem: "macos",
+      operatingSystemSource: "local default",
+    },
+  );
+});
+
+test("rejects unknown and host-incompatible operating systems", () => {
+  assert.throws(
+    () =>
+      resolveOperatingSystemSelection({
+        environment: { E2E_OS: "solaris" },
+        platform: "linux",
+      }),
+    /Unsupported E2E operating system "solaris"/,
+  );
+  assert.throws(
+    () =>
+      resolveOperatingSystemSelection({
+        environment: { E2E_OS: "windows" },
+        platform: "linux",
+      }),
+    /requires host platform "win32", but the current host is "linux"/,
+  );
+  assert.throws(
+    () =>
+      resolveOperatingSystemSelection({
+        environment: { E2E_OS: "ubuntu" },
+        linuxDistribution: "amzn",
+        platform: "linux",
+      }),
+    /requires Ubuntu, but the current Linux distribution is "amzn"/,
   );
 });

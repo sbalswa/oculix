@@ -1,5 +1,5 @@
 # PowerShell sibling of mise/tasks/e2e/cypress/smoke.
-#MISE description="Run the Cypress browser-independent smoke scenario"
+#MISE description="Run the Cypress calculator-independent browser smoke"
 $ErrorActionPreference = "Stop"
 
 if (-not $env:MISE_PROJECT_ROOT) {

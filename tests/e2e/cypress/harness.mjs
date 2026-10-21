@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,17 @@ const SUPPORTED_BROWSERS = new Set([
   "edge",
   "electron",
   "firefox",
+]);
+const OPERATING_SYSTEMS = new Map([
+  ["linux", "linux"],
+  ["macos", "darwin"],
+  ["ubuntu", "linux"],
+  ["windows", "win32"],
+]);
+const DEFAULT_OPERATING_SYSTEMS = new Map([
+  ["darwin", "macos"],
+  ["linux", "linux"],
+  ["win32", "windows"],
 ]);
 const SCENARIOS = new Map([
   ["smoke", "specs/smoke.cy.mjs"],
@@ -82,6 +94,59 @@ export function resolveBrowserSelection({
   };
 }
 
+function detectLinuxDistribution() {
+  try {
+    const osRelease = readFileSync("/etc/os-release", "utf8");
+    const id = osRelease.match(/^ID=(?:"([^"]+)"|'([^']+)'|(.+))$/m);
+    return (id?.[1] ?? id?.[2] ?? id?.[3] ?? "unknown").toLowerCase();
+  } catch {
+    return "unknown";
+  }
+}
+
+export function resolveOperatingSystemSelection({
+  environment = process.env,
+  platform = process.platform,
+  linuxDistribution =
+    platform === "linux" ? detectLinuxDistribution() : undefined,
+} = {}) {
+  const defaultOperatingSystem = DEFAULT_OPERATING_SYSTEMS.get(platform);
+  if (defaultOperatingSystem === undefined) {
+    throw new Error(`Unsupported host platform "${platform}"`);
+  }
+
+  const requestedOperatingSystem =
+    environment.E2E_OS ?? defaultOperatingSystem;
+  const operatingSystem = requestedOperatingSystem.trim().toLowerCase();
+  const expectedPlatform = OPERATING_SYSTEMS.get(operatingSystem);
+  if (expectedPlatform === undefined) {
+    throw new Error(
+      `Unsupported E2E operating system "${requestedOperatingSystem}". ` +
+        `Supported values: ${[...OPERATING_SYSTEMS.keys()].join(", ")}`,
+    );
+  }
+  if (expectedPlatform !== platform) {
+    throw new Error(
+      `E2E_OS="${requestedOperatingSystem}" requires host platform ` +
+        `"${expectedPlatform}", but the current host is "${platform}"`,
+    );
+  }
+  if (operatingSystem === "ubuntu" && linuxDistribution !== "ubuntu") {
+    throw new Error(
+      `E2E_OS="${requestedOperatingSystem}" requires Ubuntu, but the ` +
+        `current Linux distribution is "${linuxDistribution}"`,
+    );
+  }
+
+  return {
+    hostDistribution: linuxDistribution ?? null,
+    hostPlatform: platform,
+    operatingSystem,
+    operatingSystemSource:
+      environment.E2E_OS === undefined ? "local default" : "E2E_OS",
+  };
+}
+
 async function cypressVersion() {
   const packageJson = JSON.parse(
     await readFile(resolve(HARNESS_DIRECTORY, "package.json"), "utf8"),
@@ -103,8 +168,12 @@ async function retainFailureDiagnostics(selection, result, error) {
         cypressVersion: await cypressVersion(),
         error: error?.stack ?? null,
         failures: result?.failures ?? null,
+        hostDistribution: selection.hostDistribution,
         message: result?.message ?? null,
         nodeVersion: process.version,
+        operatingSystem: selection.operatingSystem,
+        operatingSystemSource: selection.operatingSystemSource,
+        hostPlatform: selection.hostPlatform,
         scenario: selection.scenario,
         selectionSource: selection.source,
         totalFailed: result?.totalFailed ?? null,
@@ -137,7 +206,10 @@ function failureMessage(selection, result) {
 }
 
 async function run() {
-  const selection = resolveBrowserSelection();
+  const selection = {
+    ...resolveBrowserSelection(),
+    ...resolveOperatingSystemSelection(),
+  };
   const baseUrl =
     selection.scenario === "web-calculator"
       ? process.env.WEB_CALCULATOR_URL
@@ -151,6 +223,9 @@ async function run() {
   await rm(DIAGNOSTICS_DIRECTORY, { force: true, recursive: true });
   process.stdout.write(
     `Cypress ${await cypressVersion()} with Node ${process.version}; ` +
+      `os=${selection.operatingSystem} ` +
+      `(${selection.operatingSystemSource}, host=${selection.hostPlatform}` +
+      `${selection.hostDistribution === null ? "" : `/${selection.hostDistribution}`}); ` +
       `browser=${selection.browser} (${selection.source})\n`,
   );
 

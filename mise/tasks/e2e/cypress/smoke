@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Run the Cypress browser-independent smoke scenario"
+#MISE description="Run the Cypress calculator-independent browser smoke"
 set -euo pipefail
 
 cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
