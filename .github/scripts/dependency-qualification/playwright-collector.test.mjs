@@ -303,6 +303,14 @@ function ebmlElement(identifier, payload) {
   ]);
 }
 
+function unknownSizeEbmlElement(identifier, payload) {
+  return Buffer.concat([
+    Buffer.from(identifier, "hex"),
+    Buffer.from([0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    payload,
+  ]);
+}
+
 function validWebmFixture() {
   const header = ebmlElement(
     "1a45dfa3",
@@ -342,7 +350,7 @@ function validWebmFixture() {
     ]),
   );
   const tracks = ebmlElement("1654ae6b", track);
-  const cluster = ebmlElement(
+  const cluster = unknownSizeEbmlElement(
     "1f43b675",
     Buffer.concat([
       ebmlElement("e7", Buffer.from([0])),
@@ -351,7 +359,7 @@ function validWebmFixture() {
   );
   return Buffer.concat([
     header,
-    ebmlElement(
+    unknownSizeEbmlElement(
       "18538067",
       Buffer.concat([information, tracks, cluster]),
     ),
@@ -1202,7 +1210,7 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
       },
     ],
     [
-      "truncated WebM declared payload",
+      "truncated SimpleBlock inside unknown-size Segment and Cluster",
       async (packageRoot) => {
         const path = join(
           packageRoot,
@@ -1210,6 +1218,20 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
         );
         const contents = await readFile(path);
         await writeFile(path, contents.subarray(0, contents.length - 1));
+      },
+    ],
+    [
+      "malformed child inside unknown-size Cluster",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/smoke/artifacts/video.webm",
+        );
+        const contents = await readFile(path);
+        const timecode = contents.indexOf(Buffer.from([0xe7, 0x81, 0]));
+        assert.notEqual(timecode, -1);
+        contents[timecode] = 0;
+        await writeFile(path, contents);
       },
     ],
     [
