@@ -16,6 +16,14 @@ CONTROL_IMAGES = {
     "four": "four.png",
     "equals": "equals.png",
 }
+CONTROL_LAYOUT = {
+    "seven": (0, 60, 65, 52),
+    "multiply": (217, 60, 65, 52),
+    "four": (0, 120, 65, 52),
+    "three": (145, 180, 65, 52),
+    "equals": (145, 240, 137, 52),
+}
+CONTROL_SEARCH_MARGIN = 6
 
 
 def capability():
@@ -60,6 +68,17 @@ def find_control(screen, selected_capability, name):
             "using %s." % (name, image)
         )
     return match
+
+
+def find_anchored_control(clear, selected_capability, name):
+    offset_x, offset_y, width, height = CONTROL_LAYOUT[name]
+    search = Region(
+        clear.getX() + offset_x - CONTROL_SEARCH_MARGIN,
+        clear.getY() + offset_y - CONTROL_SEARCH_MARGIN,
+        width + (2 * CONTROL_SEARCH_MARGIN),
+        height + (2 * CONTROL_SEARCH_MARGIN),
+    )
+    return find_control(search, selected_capability, name)
 
 
 def result_region(controls):
@@ -108,10 +127,16 @@ try:
     Settings.OcrTextRead = True
     Settings.OcrTextSearch = True
 
-    controls = {}
-    for name in ("clear", "seven", "multiply", "three", "four", "equals"):
+    stage = "image matching: clear"
+    clear = find_control(screen, selected_capability, "clear")
+    controls = {"clear": clear}
+    for name in ("seven", "multiply", "three", "four", "equals"):
         stage = "image matching: %s" % name
-        controls[name] = find_control(screen, selected_capability, name)
+        controls[name] = find_anchored_control(
+            clear,
+            selected_capability,
+            name,
+        )
 
     for name in ("clear", "seven", "multiply", "three", "four", "equals"):
         stage = "visible interaction: %s" % name
