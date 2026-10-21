@@ -311,7 +311,9 @@ function unknownSizeEbmlElement(identifier, payload) {
   ]);
 }
 
-function validWebmFixture() {
+function validWebmFixture(
+  simpleBlock = Buffer.from([0x81, 0, 0, 0x80, 0]),
+) {
   const header = ebmlElement(
     "1a45dfa3",
     Buffer.concat([
@@ -354,7 +356,7 @@ function validWebmFixture() {
     "1f43b675",
     Buffer.concat([
       ebmlElement("e7", Buffer.from([0])),
-      ebmlElement("a3", Buffer.from([0x81, 0, 0, 0x80, 0])),
+      ebmlElement("a3", simpleBlock),
     ]),
   );
   return Buffer.concat([
@@ -1221,6 +1223,48 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
       },
     ],
     [
+      "reserved SimpleBlock flags",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          validWebmFixture(Buffer.from([0x81, 0, 0, 0x90, 0])),
+        );
+      },
+    ],
+    [
+      "truncated Xiph-lacing metadata",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          validWebmFixture(
+            Buffer.from([0x81, 0, 0, 0x82, 1, 0xff]),
+          ),
+        );
+      },
+    ],
+    [
+      "indivisible fixed-size lacing payload",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          validWebmFixture(
+            Buffer.from([0x81, 0, 0, 0x84, 1, 1, 2, 3]),
+          ),
+        );
+      },
+    ],
+    [
+      "truncated EBML-lacing metadata",
+      async (packageRoot) => {
+        await writeFile(
+          join(packageRoot, "test-results/smoke/artifacts/video.webm"),
+          validWebmFixture(
+            Buffer.from([0x81, 0, 0, 0x86, 2, 0x81]),
+          ),
+        );
+      },
+    ],
+    [
       "malformed child inside unknown-size Cluster",
       async (packageRoot) => {
         const path = join(
@@ -1453,6 +1497,60 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
           validation.disposition.reason_codes.includes(
             "ARTIFACT_VALIDATION_FAILED",
           ),
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+});
+
+test("artifact admission accepts valid WebM lacing modes", async (t) => {
+  const cases = [
+    [
+      "Xiph",
+      Buffer.from([0x81, 0, 0, 0x82, 1, 1, 0xaa, 0xbb]),
+    ],
+    [
+      "fixed-size",
+      Buffer.from([0x81, 0, 0, 0x84, 1, 1, 2, 3, 4]),
+    ],
+    [
+      "EBML",
+      Buffer.from([
+        0x81,
+        0,
+        0,
+        0x86,
+        2,
+        0x81,
+        0xbf,
+        1,
+        2,
+        3,
+      ]),
+    ],
+  ];
+
+  for (const [name, simpleBlock] of cases) {
+    await t.test(name, async () => {
+      const repository = await createRepository();
+      try {
+        const validation = await qualifyWithArtifacts(
+          repository,
+          async (packageRoot) => {
+            await writeFile(
+              join(
+                packageRoot,
+                "test-results/smoke/artifacts/video.webm",
+              ),
+              validWebmFixture(simpleBlock),
+            );
+          },
+        );
+        assert.equal(
+          validation.disposition.state,
+          "independently-qualified",
         );
       } finally {
         await repository.cleanup();
