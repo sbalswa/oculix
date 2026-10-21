@@ -38,7 +38,16 @@ def capability():
 
 
 def asset_path(selected_capability, image):
-    bundle = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.environ.get("MISE_PROJECT_ROOT")
+    if not project_root:
+        raise AssertionError("MISE_PROJECT_ROOT is required for visual assets")
+    bundle = os.path.join(
+        project_root,
+        "tests",
+        "e2e",
+        "oculix",
+        "web-calculator.sikuli",
+    )
     return os.path.join(bundle, "assets", selected_capability, image)
 
 

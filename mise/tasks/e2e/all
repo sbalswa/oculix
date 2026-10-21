@@ -11,7 +11,7 @@ if [[ "$(uname -s)" != "Linux" ]] ||
 fi
 
 E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:selenium
-E2E_OS=ubuntu E2E_BROWSER=electron mise run e2e:cypress
+E2E_OS=ubuntu E2E_BROWSER=chrome mise run e2e:cypress
 E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:playwright
 
 for command in dbus-run-session fluxbox gnome-calculator setsid xvfb-run; do

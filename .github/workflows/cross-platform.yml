@@ -156,13 +156,13 @@ jobs:
             environment: web-e2e
             task: e2e:selenium
             diagnostics: tests/e2e/selenium/diagnostics/
-          - id: cypress-ubuntu-electron
+          - id: cypress-ubuntu-chrome
             position: 2
             total: 4
             tool: cypress
             runner: ubuntu-latest
             os: ubuntu
-            browser: electron
+            browser: chrome
             environment: web-e2e
             task: e2e:cypress
             diagnostics: tests/e2e/cypress/diagnostics/
@@ -186,6 +186,7 @@ jobs:
             environment: oculix,web-e2e
             task: e2e:oculix:web-calculator
             diagnostics: oculix-web-calculator-diagnostics/
+            linux_packages: xdotool
             oculix_chromium_disable_sandbox: "1"
             use_xvfb: true
 
@@ -201,6 +202,16 @@ jobs:
         with:
           version: ${{ needs.configuration.outputs.mise-version }}
           install_args: --locked
+
+      - name: Install matrix Linux dependencies
+        if: ${{ runner.os == 'Linux' && matrix.linux_packages }}
+        shell: bash
+        env:
+          E2E_LINUX_PACKAGES: ${{ matrix.linux_packages }}
+        run: |
+          read -r -a packages <<<"$E2E_LINUX_PACKAGES"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes "${packages[@]}"
 
       - name: Run mise task ${{ matrix.task }} on Unix
         id: run-unix

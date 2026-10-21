@@ -8,14 +8,14 @@ import {
 } from "./harness.mjs";
 import { WINDOWS_UNSUPPORTED_MESSAGE } from "./platform.mjs";
 
-test("defaults local runs to Electron", () => {
+test("defaults local runs to Chrome", () => {
   assert.deepEqual(
     resolveBrowserSelection({
       arguments_: ["smoke"],
       environment: {},
     }),
     {
-      browser: "electron",
+      browser: "chrome",
       scenario: "smoke",
       source: "local default",
     },
