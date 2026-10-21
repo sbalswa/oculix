@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#MISE description="Serve the deterministic web calculator fixture"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+exec node tests/e2e/fixtures/web-calculator/server.mjs "$@"

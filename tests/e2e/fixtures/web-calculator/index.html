@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Web Calculator Fixture</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Arial, sans-serif;
+        background: #e8edf2;
+        color: #101820;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        place-items: center;
+      }
+
+      .calculator {
+        width: 320px;
+        padding: 16px;
+        border: 3px solid #101820;
+        border-radius: 8px;
+        background: #ffffff;
+      }
+
+      .display {
+        display: block;
+        width: 100%;
+        height: 72px;
+        overflow: hidden;
+        padding: 12px;
+        border: 2px solid #101820;
+        background: #101820;
+        color: #ffffff;
+        font-size: 40px;
+        font-variant-numeric: tabular-nums;
+        line-height: 44px;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .keypad {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      button {
+        height: 52px;
+        border: 2px solid #101820;
+        border-radius: 4px;
+        background: #f7f9fb;
+        color: #101820;
+        font: inherit;
+        font-size: 22px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button:focus-visible {
+        outline: 4px solid #005fcc;
+        outline-offset: 2px;
+      }
+
+      .operator {
+        background: #ffd43b;
+      }
+
+      .clear {
+        grid-column: span 3;
+        background: #dce9f7;
+      }
+
+      .equals {
+        grid-column: span 2;
+        background: #146c43;
+        color: #ffffff;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="calculator" data-testid="calculator">
+      <output
+        id="display"
+        class="display"
+        data-testid="display"
+        aria-label="Calculator display"
+        aria-live="polite"
+      >0</output>
+      <div class="keypad" aria-label="Calculator keypad">
+        <button class="clear" data-action="clear" data-testid="clear" type="button">clear</button>
+        <button class="operator" data-action="operator" data-value="divide" aria-label="Divide" type="button">÷</button>
+
+        <button data-action="digit" data-value="7" type="button">7</button>
+        <button data-action="digit" data-value="8" type="button">8</button>
+        <button data-action="digit" data-value="9" type="button">9</button>
+        <button class="operator" data-action="operator" data-value="multiply" aria-label="Multiply" data-testid="multiply" type="button">×</button>
+
+        <button data-action="digit" data-value="4" type="button">4</button>
+        <button data-action="digit" data-value="5" type="button">5</button>
+        <button data-action="digit" data-value="6" type="button">6</button>
+        <button class="operator" data-action="operator" data-value="subtract" aria-label="Subtract" type="button">−</button>
+
+        <button data-action="digit" data-value="1" type="button">1</button>
+        <button data-action="digit" data-value="2" type="button">2</button>
+        <button data-action="digit" data-value="3" type="button">3</button>
+        <button class="operator" data-action="operator" data-value="add" aria-label="Add" type="button">+</button>
+
+        <button data-action="digit" data-value="0" type="button">0</button>
+        <button data-action="decimal" type="button">.</button>
+        <button class="equals" data-action="equals" aria-label="Equals" data-testid="equals" type="button">=</button>
+      </div>
+    </main>
+    <script id="calculator-script">
+      const display = document.querySelector("#display");
+      let currentValue = "0";
+      let storedValue = null;
+      let pendingOperator = null;
+      let replaceCurrent = false;
+
+      const operations = {
+        add: (left, right) => left + right,
+        subtract: (left, right) => left - right,
+        multiply: (left, right) => left * right,
+        divide: (left, right) => left / right,
+      };
+
+      function render(value) {
+        currentValue = String(value);
+        display.textContent = currentValue;
+      }
+
+      function calculate() {
+        if (pendingOperator === null || storedValue === null) {
+          return;
+        }
+
+        const result = operations[pendingOperator](
+          Number(storedValue),
+          Number(currentValue),
+        );
+        render(Number.isFinite(result) ? result : "Error");
+        storedValue = null;
+        pendingOperator = null;
+        replaceCurrent = true;
+      }
+
+      document.querySelectorAll("button[data-action]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const { action, value } = button.dataset;
+
+          if (action === "clear") {
+            render("0");
+            storedValue = null;
+            pendingOperator = null;
+            replaceCurrent = false;
+            return;
+          }
+
+          if (action === "digit") {
+            render(
+              replaceCurrent || currentValue === "0"
+                ? value
+                : currentValue + value,
+            );
+            replaceCurrent = false;
+            return;
+          }
+
+          if (action === "decimal") {
+            if (replaceCurrent) {
+              render("0.");
+              replaceCurrent = false;
+            } else if (!currentValue.includes(".")) {
+              render(currentValue + ".");
+            }
+            return;
+          }
+
+          if (action === "operator") {
+            if (pendingOperator !== null && !replaceCurrent) {
+              calculate();
+            }
+            storedValue = currentValue;
+            pendingOperator = value;
+            replaceCurrent = true;
+            return;
+          }
+
+          if (action === "equals") {
+            calculate();
+          }
+        });
+      });
+    </script>
+  </body>
+</html>
