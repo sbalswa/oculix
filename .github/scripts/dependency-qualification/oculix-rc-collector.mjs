@@ -28,6 +28,9 @@ const RC_PATTERN =
   /^(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc([1-9][0-9]*)$/u;
 const STABLE_PATTERN =
   /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
+const TEMURIN_SPECIFIER_PATTERN = /^temurin-([1-9][0-9]*)$/u;
+const TEMURIN_RUNTIME_PATTERN =
+  /^temurin-([1-9][0-9]*)(?:\.(0|[1-9][0-9]*)){1,3}(?:\+[0-9A-Za-z.-]+)?$/u;
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const RESULT_STATUSES = new Set([
@@ -41,6 +44,7 @@ const RESULT_STATUSES = new Set([
 
 export const OCULIX_RC_PROVIDER_ID = "oculix-rc";
 export const OCULIX_RC_COMPONENT_ID = "oculix-release-candidate";
+export const OCULIX_JAVA_COMPONENT_ID = "oculix-java-runtime";
 export const OCULIX_CONFIG_PATH = "mise/config.oculix.toml";
 export const OCULIX_LOCK_PATH = "mise/mise.oculix.lock";
 export const OCULIX_MANAGED_PATHS = Object.freeze([
@@ -85,6 +89,8 @@ export const OCULIX_QUALIFICATION_CHECKS = deepFreeze([
     },
   },
 ]);
+
+export class OculixJavaRuntimeIncompatibilityError extends Error {}
 
 function deepFreeze(value) {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -338,6 +344,226 @@ function assertCurrentLock(lockContents, currentVersion) {
   }
 }
 
+function parseTomlString(block, key, context) {
+  const match = new RegExp(
+    `^\\s*${key}\\s*=\\s*"([^"]+)"\\s*(?:#.*)?$`,
+    "mu",
+  ).exec(block);
+  if (match === null) {
+    throw new Error(`${context} must contain one ${key}`);
+  }
+  return match[1];
+}
+
+function parseStringArray(block, key, context) {
+  const match = new RegExp(
+    `^\\s*${key}\\s*=\\s*(\\[[^\\n]+\\])\\s*(?:#.*)?$`,
+    "mu",
+  ).exec(block);
+  if (match === null) {
+    throw new Error(`${context} must contain ${key}`);
+  }
+  let values;
+  try {
+    values = JSON.parse(match[1]);
+  } catch {
+    throw new Error(`${context} contains invalid ${key}`);
+  }
+  if (
+    !Array.isArray(values) ||
+    values.length === 0 ||
+    values.some((value) => typeof value !== "string" || value.length === 0) ||
+    new Set(values).size !== values.length
+  ) {
+    throw new Error(`${context} contains invalid ${key}`);
+  }
+  return values;
+}
+
+function configuredTemurinPolicy(configContents) {
+  const matches = [
+    ...String(configContents).matchAll(
+      /^\s*java\s*=\s*"([^"]+)"\s*(?:#.*)?$/gmu,
+    ),
+  ];
+  if (matches.length !== 1) {
+    throw new Error(
+      `${OCULIX_CONFIG_PATH} must contain exactly one Java specifier`,
+    );
+  }
+  const specifier = matches[0][1];
+  const parsed = TEMURIN_SPECIFIER_PATTERN.exec(specifier);
+  if (parsed === null) {
+    throw new Error(
+      `${OCULIX_CONFIG_PATH} Java must be a review-gated temurin-N major`,
+    );
+  }
+  const majorNumber = Number(parsed[1]);
+  if (!Number.isSafeInteger(majorNumber)) {
+    throw new Error(
+      `${OCULIX_CONFIG_PATH} Java major must be a safe integer`,
+    );
+  }
+  return {
+    major: parsed[1],
+    specifier,
+  };
+}
+
+function javaMajorConstraint(major) {
+  return `>=${major}.0.0 <${Number(major) + 1}.0.0`;
+}
+
+function javaPlatformToken(platform) {
+  return {
+    "linux-arm64": "aarch64_linux_hotspot",
+    "linux-x64": "x64_linux_hotspot",
+    "macos-arm64": "aarch64_mac_hotspot",
+    "windows-x64": "x64_windows_hotspot",
+  }[platform];
+}
+
+function parseLockedJavaPlatform(block, platform, major) {
+  const checksum = parseTomlString(
+    block,
+    "checksum",
+    `${OCULIX_LOCK_PATH} Java ${platform}`,
+  );
+  if (!SHA256_PATTERN.test(checksum)) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} checksum must be SHA-256`,
+    );
+  }
+  const url = parseTomlString(
+    block,
+    "url",
+    `${OCULIX_LOCK_PATH} Java ${platform}`,
+  );
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new Error(`${OCULIX_LOCK_PATH} Java ${platform} URL is invalid`);
+  }
+  const expectedPrefix =
+    `/adoptium/temurin${major}-binaries/releases/download/`;
+  if (
+    parsedUrl.protocol !== "https:" ||
+    parsedUrl.hostname !== "github.com" ||
+    !parsedUrl.pathname.startsWith(expectedPrefix) ||
+    !parsedUrl.pathname.includes(javaPlatformToken(platform))
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} URL does not bind Temurin ${major}`,
+    );
+  }
+  return { checksum, platform, url };
+}
+
+function javaIdentityProjection(identity) {
+  return {
+    backend: identity.backend,
+    major: identity.major,
+    platforms: identity.platforms,
+    resolved_version: identity.resolved_version,
+    solver_version: identity.solver_version,
+    specifier: identity.specifier,
+  };
+}
+
+export function parseOculixJavaIdentity(configContents, lockContents) {
+  const policy = configuredTemurinPolicy(configContents);
+  const lock = String(lockContents);
+  const headers = [...lock.matchAll(/^\[\[tools\.java\]\]\s*$/gmu)];
+  if (headers.length !== 1) {
+    throw new Error(`${OCULIX_LOCK_PATH} must contain one Java tool record`);
+  }
+  const toolStart = headers[0].index + headers[0][0].length;
+  const nextHeader = lock.indexOf("\n[", toolStart);
+  const toolBlock = lock.slice(
+    toolStart,
+    nextHeader === -1 ? lock.length : nextHeader,
+  );
+  const lockedVersion = parseTomlString(
+    toolBlock,
+    "version",
+    `${OCULIX_LOCK_PATH} Java`,
+  );
+  const versionMatch = TEMURIN_RUNTIME_PATTERN.exec(lockedVersion);
+  if (versionMatch === null || versionMatch[1] !== policy.major) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java version must resolve ${policy.specifier}`,
+    );
+  }
+  const backend = parseTomlString(
+    toolBlock,
+    "backend",
+    `${OCULIX_LOCK_PATH} Java`,
+  );
+  if (backend !== "core:java") {
+    throw new Error(`${OCULIX_LOCK_PATH} Java backend must be core:java`);
+  }
+  const specifiers = parseStringArray(
+    toolBlock,
+    "specifiers",
+    `${OCULIX_LOCK_PATH} Java`,
+  );
+  if (specifiers.length !== 1 || specifiers[0] !== policy.specifier) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java specifier must equal ${policy.specifier}`,
+    );
+  }
+
+  const platformExpression =
+    /^\[tools\.java\."platforms\.([a-z0-9-]+)"\]\s*$/gmu;
+  const matches = [...lock.matchAll(platformExpression)];
+  const platforms = matches.map((match, index) => {
+    const platform = match[1];
+    if (!OCULIX_LOCK_PLATFORMS.includes(platform)) {
+      throw new Error(
+        `${OCULIX_LOCK_PATH} contains unsupported Java platform ${platform}`,
+      );
+    }
+    const blockStart = match.index + match[0].length;
+    const blockEnd =
+      index + 1 < matches.length ? matches[index + 1].index : lock.length;
+    return parseLockedJavaPlatform(
+      lock.slice(blockStart, blockEnd),
+      platform,
+      policy.major,
+    );
+  }).sort((left, right) => left.platform.localeCompare(right.platform));
+  const actualPlatforms = platforms.map(({ platform }) => platform);
+  if (
+    new Set(actualPlatforms).size !== OCULIX_LOCK_PLATFORMS.length ||
+    JSON.stringify(actualPlatforms) !==
+      JSON.stringify([...OCULIX_LOCK_PLATFORMS].sort())
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java must lock every supported platform exactly once`,
+    );
+  }
+  const identity = {
+    backend,
+    major: policy.major,
+    platforms,
+    resolved_version: lockedVersion.slice("temurin-".length),
+    solver_version: lockedVersion
+      .slice("temurin-".length)
+      .split("+", 1)[0]
+      .split(".")
+      .slice(0, 3)
+      .concat(["0", "0"])
+      .slice(0, 3)
+      .join("."),
+    specifier: policy.specifier,
+  };
+  return deepFreeze({
+    ...identity,
+    identity_digest: sha256(javaIdentityProjection(identity)),
+  });
+}
+
 function repositoryEvidence(path, contents, revision, observedAt) {
   return {
     type: "repository-file",
@@ -346,6 +572,35 @@ function repositoryEvidence(path, contents, revision, observedAt) {
     digest: sha256(contents),
     observed_at: observedAt,
   };
+}
+
+function javaRuntimeEvidence(identity, observedAt) {
+  return [
+    {
+      type: "temurin-policy",
+      locator: OCULIX_CONFIG_PATH,
+      revision: identity.specifier,
+      digest: sha256({
+        major: identity.major,
+        specifier: identity.specifier,
+      }),
+      observed_at: observedAt,
+    },
+    {
+      type: "locked-java-runtime",
+      locator: OCULIX_LOCK_PATH,
+      revision: `temurin-${identity.resolved_version}`,
+      digest: identity.identity_digest,
+      observed_at: observedAt,
+    },
+    ...identity.platforms.map((platform) => ({
+      type: "locked-java-artifact",
+      locator: platform.url,
+      revision: `temurin-${identity.resolved_version}:${platform.platform}`,
+      digest: platform.checksum,
+      observed_at: observedAt,
+    })),
+  ];
 }
 
 function assetNames(version) {
@@ -463,6 +718,7 @@ function observationBase({
   capabilityCatalog,
   current,
   generatedAt,
+  javaIdentity,
   repository,
 }) {
   return {
@@ -483,11 +739,32 @@ function observationBase({
         ecosystem: "mise",
         current,
         candidate: null,
-        eventual_managed_paths: [...OCULIX_MANAGED_PATHS],
+        eventual_managed_paths: [OCULIX_CONFIG_PATH],
+        affected_capabilities: [...OCULIX_CAPABILITIES],
+      },
+      {
+        id: OCULIX_JAVA_COMPONENT_ID,
+        lane: "oculix-rc",
+        ecosystem: "mise",
+        current: {
+          version: javaIdentity.solver_version,
+          evidence: javaRuntimeEvidence(javaIdentity, generatedAt),
+        },
+        candidate: null,
+        eventual_managed_paths: [OCULIX_LOCK_PATH],
         affected_capabilities: [...OCULIX_CAPABILITIES],
       },
     ],
-    relations: [],
+    relations: [
+      {
+        id: "oculix-rc-requires-java-runtime",
+        type: "shares-runtime",
+        from: OCULIX_RC_COMPONENT_ID,
+        to: OCULIX_JAVA_COMPONENT_ID,
+        hard: true,
+        constraint: javaMajorConstraint(javaIdentity.major),
+      },
+    ],
   };
 }
 
@@ -517,9 +794,14 @@ export async function collectOculixRcObservation({
   );
   const currentVersion = currentVersionFromConfig(configContents);
   assertCurrentLock(lockContents, currentVersion);
+  const javaIdentity = parseOculixJavaIdentity(
+    configContents,
+    lockContents,
+  );
   const document = observationBase({
     capabilityCatalog,
     generatedAt,
+    javaIdentity,
     repository: structuredClone(repository),
     current: {
       version: currentVersion,
@@ -527,12 +809,6 @@ export async function collectOculixRcObservation({
         repositoryEvidence(
           OCULIX_CONFIG_PATH,
           configContents,
-          repository.revision,
-          generatedAt,
-        ),
-        repositoryEvidence(
-          OCULIX_LOCK_PATH,
-          lockContents,
           repository.revision,
           generatedAt,
         ),
@@ -581,6 +857,87 @@ export async function collectOculixRcObservation({
 
 export const discoverOculixRc = collectOculixRcObservation;
 
+function javaComponent(observation) {
+  const component = observation.components.find(
+    ({ id }) => id === OCULIX_JAVA_COMPONENT_ID,
+  );
+  if (component === undefined || component.candidate !== null) {
+    throw new Error(
+      "Oculix RC observation must contain one current-only Java runtime",
+    );
+  }
+  return component;
+}
+
+function javaIdentityFromObservation(observation) {
+  const component = javaComponent(observation);
+  const policy = component.current.evidence.find(
+    ({ type }) => type === "temurin-policy",
+  );
+  const runtime = component.current.evidence.find(
+    ({ type }) => type === "locked-java-runtime",
+  );
+  const relation = observation.relations.find(
+    ({ id }) => id === "oculix-rc-requires-java-runtime",
+  );
+  const platforms = component.current.evidence
+    .filter(({ type }) => type === "locked-java-artifact")
+    .map((evidence) => {
+      const separator = evidence.revision.lastIndexOf(":");
+      const expectedPrefix = `${runtime?.revision}:`;
+      return {
+        checksum: evidence.digest,
+        platform: evidence.revision.startsWith(expectedPrefix)
+          ? evidence.revision.slice(separator + 1)
+          : "",
+        url: evidence.locator,
+      };
+    })
+    .sort((left, right) => left.platform.localeCompare(right.platform));
+  const expectedPlatforms = [...OCULIX_LOCK_PLATFORMS].sort();
+  const actualPlatforms = platforms.map(({ platform }) => platform);
+  const specifierMatch = TEMURIN_SPECIFIER_PATTERN.exec(
+    policy?.revision ?? "",
+  );
+  const resolvedVersion =
+    runtime?.revision.startsWith("temurin-") === true
+      ? runtime.revision.slice("temurin-".length)
+      : "";
+  if (
+    policy === undefined ||
+    runtime === undefined ||
+    specifierMatch === null ||
+    TEMURIN_RUNTIME_PATTERN.test(`temurin-${resolvedVersion}`) === false ||
+    relation?.type !== "shares-runtime" ||
+    relation.from !== OCULIX_RC_COMPONENT_ID ||
+    relation.to !== OCULIX_JAVA_COMPONENT_ID ||
+    relation.hard !== true ||
+    relation.constraint !== javaMajorConstraint(specifierMatch[1]) ||
+    JSON.stringify(actualPlatforms) !== JSON.stringify(expectedPlatforms)
+  ) {
+    throw new Error(
+      "Oculix RC observation does not bind its configured Java runtime",
+    );
+  }
+  const identity = {
+    backend: "core:java",
+    major: specifierMatch[1],
+    platforms,
+    resolved_version: resolvedVersion,
+    solver_version: component.current.version,
+    specifier: policy.revision,
+  };
+  const identityDigest = sha256(javaIdentityProjection(identity));
+  if (identityDigest !== runtime.digest) {
+    throw new Error("Oculix RC Java runtime identity digest is inconsistent");
+  }
+  return deepFreeze({
+    ...identity,
+    component_id: component.id,
+    identity_digest: identityDigest,
+  });
+}
+
 function candidateComponent(observation) {
   if (
     observation?.kind !== "observation" ||
@@ -614,18 +971,20 @@ export function createOculixRcQualificationPlan({
   runner,
 }) {
   const component = candidateComponent(observation);
+  const java = javaIdentityFromObservation(observation);
   const normalizedRunner = requireRunner(runner);
   return deepFreeze({
     schema_version: 1,
     provider_id: observation.provider_id,
     candidate_digest: subjectDigest(observation),
     candidate_version: component.candidate.version,
+    java: structuredClone(java),
     repository: structuredClone(observation.repository),
     runner: normalizedRunner,
     workspace: {
       kind: "ephemeral-copy",
       source_revision: observation.repository.revision,
-      managed_paths: [...component.eventual_managed_paths],
+      managed_paths: [...OCULIX_MANAGED_PATHS],
     },
     lock: {
       platforms: [...OCULIX_LOCK_PLATFORMS],
@@ -728,9 +1087,30 @@ function diffProjection(entries) {
   }));
 }
 
+function requirePreparedJavaIdentity(
+  configContents,
+  lockContents,
+  expectedIdentity,
+  message,
+) {
+  let actual;
+  try {
+    actual = parseOculixJavaIdentity(configContents, lockContents);
+  } catch (error) {
+    throw new OculixJavaRuntimeIncompatibilityError(
+      `${message}: ${error.message}`,
+    );
+  }
+  if (actual.identity_digest !== expectedIdentity.identity_digest) {
+    throw new OculixJavaRuntimeIncompatibilityError(message);
+  }
+  return actual;
+}
+
 export async function prepareOculixRcCandidate({
   candidateVersion,
   currentVersion,
+  javaIdentity,
   lockCommand,
   managedPaths,
   runCommand = runOculixQualificationCommand,
@@ -743,6 +1123,12 @@ export async function prepareOculixRcCandidate({
         await readFile(join(workspacePath, path)),
       ]),
     ),
+  );
+  requirePreparedJavaIdentity(
+    before.get(OCULIX_CONFIG_PATH),
+    before.get(OCULIX_LOCK_PATH),
+    javaIdentity,
+    "Ephemeral workspace Java does not match the collected identity",
   );
   const configPath = join(workspacePath, OCULIX_CONFIG_PATH);
   const configContents = before.get(OCULIX_CONFIG_PATH).toString("utf8");
@@ -793,14 +1179,22 @@ export async function prepareOculixRcCandidate({
       "Generated Oculix lock does not bind the candidate on every platform",
     );
   }
+  const afterJava = requirePreparedJavaIdentity(
+    after.get(OCULIX_CONFIG_PATH),
+    after.get(OCULIX_LOCK_PATH),
+    javaIdentity,
+    "Oculix candidate preparation changed the review-gated Java runtime",
+  );
   return deepFreeze({
     changed_paths: entries.map(({ path }) => path),
     diff_digest: sha256(diffProjection(entries)),
+    java_identity_digest: afterJava.identity_digest,
   });
 }
 
 async function executePlannedCheck({
   check,
+  plan,
   runCommand = runOculixQualificationCommand,
   workspacePath,
 }) {
@@ -818,17 +1212,19 @@ async function executePlannedCheck({
         stderr: result?.stderr ?? "",
         stdout: result?.stdout ?? "",
       }),
+      java_identity_digest: plan.java.identity_digest,
     };
   } catch (error) {
     return {
       status: "fail",
       warnings: [],
       output_digest: sha256(String(error?.message ?? error)),
+      java_identity_digest: plan.java.identity_digest,
     };
   }
 }
 
-function validateCheckResult(result, checkId) {
+function validateCheckResult(result, checkId, expectedJavaIdentityDigest) {
   if (!RESULT_STATUSES.has(result?.status)) {
     throw new Error(`${checkId} returned an invalid result status`);
   }
@@ -847,9 +1243,23 @@ function validateCheckResult(result, checkId) {
   if (!SHA256_PATTERN.test(outputDigest)) {
     throw new Error(`${checkId} output digest must be SHA-256`);
   }
+  const reportedJavaIdentity = result.java_identity_digest;
+  if (
+    typeof reportedJavaIdentity !== "string" ||
+    !SHA256_PATTERN.test(reportedJavaIdentity)
+  ) {
+    throw new Error(
+      `${checkId} must report the observed Java identity digest`,
+    );
+  }
+  const javaCompatible =
+    result.java_compatible !== false &&
+    reportedJavaIdentity === expectedJavaIdentityDigest;
   return {
+    javaCompatible,
+    javaIdentityDigest: reportedJavaIdentity,
     outputDigest,
-    status: result.status,
+    status: javaCompatible ? result.status : "fail",
     warnings: [...result.warnings],
   };
 }
@@ -885,6 +1295,9 @@ function executionEvidence({
       candidate_digest: plan.candidate_digest,
       check,
       diff_digest: diffDigest,
+      expected_java: plan.java,
+      java_compatible: checkResult.javaCompatible,
+      java_identity_digest: checkResult.javaIdentityDigest,
       output_digest: checkResult.outputDigest,
       repository: plan.repository,
       runner: plan.runner,
@@ -904,6 +1317,7 @@ function errorEvidence({ error, plan, stage }) {
     digest: sha256({
       candidate_digest: plan.candidate_digest,
       error: String(error?.message ?? error),
+      expected_java: plan.java,
       repository: plan.repository,
       runner: plan.runner,
       stage,
@@ -932,9 +1346,17 @@ function validationDocument({
         : [
             {
               type: "generated-lock-diff",
-              locator: component.eventual_managed_paths.join(","),
+              locator: plan.workspace.managed_paths.join(","),
               revision: plan.repository.revision,
               digest: diffDigest,
+            },
+            {
+              type: "java-runtime-identity",
+              locator:
+                `${OCULIX_LOCK_PATH}#temurin-` +
+                plan.java.resolved_version,
+              revision: plan.repository.revision,
+              digest: plan.java.identity_digest,
             },
             ...relevant.map(({ check, result }) =>
               executionEvidence({
@@ -973,6 +1395,14 @@ function validationDocument({
 }
 
 function qualificationDisposition(checkResults) {
+  if (
+    checkResults.some(({ result }) => result.javaCompatible === false)
+  ) {
+    return {
+      state: "incompatible",
+      reason_codes: ["OCULIX_RC_JAVA_RUNTIME_INCOMPATIBLE"],
+    };
+  }
   if (
     checkResults.some(({ result }) => result.status !== "pass")
   ) {
@@ -1030,10 +1460,16 @@ export async function qualifyOculixRc({
       preparation = await prepareCandidate({
         candidateVersion: component.candidate.version,
         currentVersion: component.current.version,
+        javaIdentity: plan.java,
         lockCommand: plan.lock.command,
         managedPaths: plan.workspace.managed_paths,
         workspacePath: workspace.path,
       });
+      if (preparation.java_identity_digest !== plan.java.identity_digest) {
+        throw new OculixJavaRuntimeIncompatibilityError(
+          "Candidate preparation reported a different Java runtime",
+        );
+      }
       if (
         !SHA256_PATTERN.test(preparation?.diff_digest) ||
         JSON.stringify([...preparation.changed_paths].sort()) !==
@@ -1048,8 +1484,15 @@ export async function qualifyOculixRc({
         checkResults: [],
         diffDigest: sha256("preparation-failed"),
         disposition: {
-          state: "blocked",
-          reason_codes: ["OCULIX_RC_PREPARATION_FAILED"],
+          state:
+            error instanceof OculixJavaRuntimeIncompatibilityError
+              ? "incompatible"
+              : "blocked",
+          reason_codes: [
+            error instanceof OculixJavaRuntimeIncompatibilityError
+              ? "OCULIX_RC_JAVA_RUNTIME_INCOMPATIBLE"
+              : "OCULIX_RC_PREPARATION_FAILED",
+          ],
         },
         error,
         generatedAt,
@@ -1072,6 +1515,7 @@ export async function qualifyOculixRc({
             workspacePath: workspace.path,
           }),
           check.id,
+          plan.java.identity_digest,
         );
         checkResults.push({ check, result });
       } catch (error) {

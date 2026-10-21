@@ -20,16 +20,20 @@ import {
   subjectDigest,
   validateDocument,
   validateIndependentQualification,
+  validateProviderSet,
 } from "./contract.mjs";
 import {
   OCULIX_CONFIG_PATH,
+  OCULIX_JAVA_COMPONENT_ID,
   OCULIX_LOCK_PATH,
   OCULIX_LOCK_PLATFORMS,
   OCULIX_QUALIFICATION_CHECKS,
+  OculixJavaRuntimeIncompatibilityError,
   collectOculixRcObservation,
   compareOculixRcVersions,
   createOculixRcQualificationPlan,
   parseOculixRcTag,
+  parseOculixJavaIdentity,
   parseStableOculixVersion,
   prepareOculixRcCandidate,
   qualifyOculixRc,
@@ -98,6 +102,10 @@ async function collectorInputs(overrides = {}) {
 
 async function candidateObservation(overrides = {}) {
   return collectOculixRcObservation(await collectorInputs(overrides));
+}
+
+function component(observation, id) {
+  return observation.components.find((entry) => entry.id === id);
 }
 
 test("strict RC parsing rejects lookalikes and leading zeroes", () => {
@@ -199,6 +207,23 @@ test("duplicate releases for the newest numeric RC fail closed", async () => {
   );
 });
 
+test("strictly parses the configured and resolved Temurin identity", async () => {
+  const identity = parseOculixJavaIdentity(
+    await fixture("config.oculix.toml"),
+    await fixture("mise.oculix.lock"),
+  );
+  assert.equal(identity.specifier, "temurin-17");
+  assert.equal(identity.major, "17");
+  assert.equal(identity.resolved_version, "17.0.20+101");
+  assert.equal(identity.solver_version, "17.0.20");
+  assert.deepEqual(
+    identity.platforms.map(({ platform }) => platform),
+    [...OCULIX_LOCK_PLATFORMS].sort(),
+  );
+  assert.match(identity.identity_digest, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(Object.isFrozen(identity), true);
+});
+
 test("collector publishes a frozen contract observation with immutable evidence", async () => {
   const observation = await candidateObservation();
   assert.equal(observation.disposition.state, "candidate");
@@ -222,8 +247,84 @@ test("collector publishes a frozen contract observation with immutable evidence"
   );
   assert.equal(Object.isFrozen(observation), true);
   assert.equal(Object.isFrozen(observation.components[0].candidate), true);
+  const java = component(observation, OCULIX_JAVA_COMPONENT_ID);
+  assert.equal(java.current.version, "17.0.20");
+  assert.equal(java.candidate, null);
+  assert.deepEqual(
+    java.current.evidence.map(({ type }) => type),
+    [
+      "temurin-policy",
+      "locked-java-runtime",
+      "locked-java-artifact",
+      "locked-java-artifact",
+      "locked-java-artifact",
+      "locked-java-artifact",
+    ],
+  );
+  assert.deepEqual(observation.relations, [
+    {
+      id: "oculix-rc-requires-java-runtime",
+      type: "shares-runtime",
+      from: "oculix-release-candidate",
+      to: OCULIX_JAVA_COMPONENT_ID,
+      hard: true,
+      constraint: ">=17.0.0 <18.0.0",
+    },
+  ]);
   assert.doesNotThrow(() =>
     validateDocument(observation, contractOptions),
+  );
+  assert.doesNotThrow(() =>
+    validateProviderSet([observation], contractOptions),
+  );
+});
+
+test("Java metadata is strict and never selects a Java candidate", async (context) => {
+  await context.test("configured major mismatch", async () => {
+    let queriedReleases = false;
+    const inputs = await collectorInputs({
+      listReleases: async () => {
+        queriedReleases = true;
+        return [];
+      },
+    });
+    await assert.rejects(
+      collectOculixRcObservation({
+        ...inputs,
+        readRepositoryFile: async (path) =>
+          path === OCULIX_CONFIG_PATH
+            ? (await fixture("config.oculix.toml")).replace(
+                "temurin-17",
+                "temurin-21",
+              )
+            : fixture("mise.oculix.lock"),
+      }),
+      /Java version must resolve temurin-21/,
+    );
+    assert.equal(queriedReleases, false);
+  });
+  await context.test("missing platform evidence", async () => {
+    const config = await fixture("config.oculix.toml");
+    const lock = (await fixture("mise.oculix.lock")).replace(
+      /\n\[tools\.java\."platforms\.windows-x64"\][\s\S]*$/u,
+      "",
+    );
+    assert.throws(
+      () =>
+        parseOculixJavaIdentity(
+          config,
+          lock,
+        ),
+      /must lock every supported platform exactly once/,
+    );
+  });
+  const observation = await candidateObservation();
+  assert.equal(
+    observation.components.filter(
+      ({ id, candidate }) =>
+        id === OCULIX_JAVA_COMPONENT_ID && candidate !== null,
+    ).length,
+    0,
   );
 });
 
@@ -367,8 +468,53 @@ test("qualification plan binds candidate, commit, runner, lock platforms, and ch
   assert.deepEqual(plan.runner, RUNNER);
   assert.deepEqual(plan.lock.platforms, OCULIX_LOCK_PLATFORMS);
   assert.deepEqual(plan.checks, OCULIX_QUALIFICATION_CHECKS);
+  assert.deepEqual(
+    {
+      major: plan.java.major,
+      resolved_version: plan.java.resolved_version,
+      specifier: plan.java.specifier,
+    },
+    {
+      major: "17",
+      resolved_version: "17.0.20+101",
+      specifier: "temurin-17",
+    },
+  );
+  assert.match(plan.java.identity_digest, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(plan.lock.command.includes("--bump"), false);
   assert.equal(plan.workspace.kind, "ephemeral-copy");
   assert.equal(Object.isFrozen(plan), true);
+});
+
+test("qualification identity changes with any locked Java artifact", async () => {
+  const baseline = await candidateObservation();
+  const changedLock = (await fixture("mise.oculix.lock")).replace(
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  );
+  const changed = await candidateObservation({
+    readRepositoryFile: async (path) =>
+      path === OCULIX_LOCK_PATH
+        ? changedLock
+        : fixture("config.oculix.toml"),
+  });
+  const baselinePlan = createOculixRcQualificationPlan({
+    observation: baseline,
+    runner: RUNNER,
+  });
+  const changedPlan = createOculixRcQualificationPlan({
+    observation: changed,
+    runner: RUNNER,
+  });
+  assert.notEqual(subjectDigest(baseline), subjectDigest(changed));
+  assert.notEqual(
+    baselinePlan.java.identity_digest,
+    changedPlan.java.identity_digest,
+  );
+  assert.notEqual(
+    baselinePlan.candidate_digest,
+    changedPlan.candidate_digest,
+  );
 });
 
 test("candidate preparation rewrites and relocks only the ephemeral copy", async () => {
@@ -378,6 +524,10 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
   const lockPath = join(workspacePath, OCULIX_LOCK_PATH);
   const originalConfig = await fixture("config.oculix.toml");
   const originalLock = await fixture("mise.oculix.lock");
+  const javaIdentity = parseOculixJavaIdentity(
+    originalConfig,
+    originalLock,
+  );
   const commands = [];
   try {
     await mkdir(resolve(configPath, ".."), { recursive: true });
@@ -386,6 +536,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
     const prepared = await prepareOculixRcCandidate({
       candidateVersion: "4.1.0-rc10",
       currentVersion: "4.0.0",
+      javaIdentity,
       lockCommand: [
         "mise",
         "-E",
@@ -415,6 +566,10 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
       OCULIX_LOCK_PATH,
     ]);
     assert.match(prepared.diff_digest, /^sha256:[0-9a-f]{64}$/u);
+    assert.equal(
+      prepared.java_identity_digest,
+      javaIdentity.identity_digest,
+    );
     assert.deepEqual(commands, [
       {
         command: "mise",
@@ -435,6 +590,45 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
       await fixture("config.oculix.toml"),
       originalConfig,
       "the source fixture remains unchanged",
+    );
+    await writeFile(configPath, originalConfig);
+    await writeFile(lockPath, originalLock);
+    await assert.rejects(
+      prepareOculixRcCandidate({
+        candidateVersion: "4.1.0-rc10",
+        currentVersion: "4.0.0",
+        javaIdentity,
+        lockCommand: [
+          "mise",
+          "-E",
+          "oculix",
+          "lock",
+          "--platform",
+          OCULIX_LOCK_PLATFORMS.join(","),
+          "java",
+          "http:oculixide",
+        ],
+        managedPaths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
+        runCommand: async () => {
+          await writeFile(
+            lockPath,
+            originalLock
+              .replace(
+                'version = "4.0.0"',
+                'version = "4.1.0-rc10"',
+              )
+              .replace(
+                "temurin-17.0.20+101",
+                "temurin-21.0.1+1",
+              ),
+          );
+          return { stderr: "", stdout: "" };
+        },
+        workspacePath,
+      }),
+      (error) =>
+        error instanceof OculixJavaRuntimeIncompatibilityError &&
+        /review-gated Java runtime/u.test(error.message),
     );
   } finally {
     await rm(temporaryRoot, { force: true, recursive: true });
@@ -461,6 +655,7 @@ function successfulQualification(overrides = {}) {
         return {
           changed_paths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
           diff_digest: DIFF_DIGEST,
+          java_identity_digest: input.javaIdentity.identity_digest,
         };
       },
       repositoryRoot: REPOSITORY_ROOT,
@@ -470,6 +665,7 @@ function successfulQualification(overrides = {}) {
           status: "pass",
           warnings: [],
           output: input.check.id,
+          java_identity_digest: input.plan.java.identity_digest,
         };
       },
       runner: RUNNER,
@@ -508,8 +704,9 @@ test("qualification mutates only an external ephemeral workspace", async () => {
   const evidence = validation.results[0].evidence;
   assert.equal(evidence[0].type, "generated-lock-diff");
   assert.equal(evidence[0].digest, DIFF_DIGEST);
+  assert.equal(evidence[1].type, "java-runtime-identity");
   assert.deepEqual(
-    evidence.slice(1).map(({ revision }) => revision),
+    evidence.slice(2).map(({ revision }) => revision),
     [REPOSITORY.revision, REPOSITORY.revision],
   );
 });
@@ -535,10 +732,12 @@ test("failed, warning, and unknown checks cannot independently qualify", async (
   ]) {
     await context.test(scenario.name, async () => {
       const qualification = successfulQualification({
-        runCheck: async ({ check }) =>
-          check.id === "repository-policy"
+        runCheck: async ({ check, plan }) => ({
+          ...(check.id === "repository-policy"
             ? scenario.result
-            : { status: "pass", warnings: [], output: "passed" },
+            : { status: "pass", warnings: [], output: "passed" }),
+          java_identity_digest: plan.java.identity_digest,
+        }),
       });
       const { validation } = await qualification.promise;
       assert.equal(validation.disposition.state, "blocked");
@@ -551,6 +750,21 @@ test("failed, warning, and unknown checks cannot independently qualify", async (
       );
     });
   }
+});
+
+test("missing execution Java identity cannot qualify", async () => {
+  const qualification = successfulQualification({
+    runCheck: async ({ check }) => ({
+      status: "pass",
+      warnings: [],
+      output: check.id,
+    }),
+  });
+  const { validation } = await qualification.promise;
+  assert.deepEqual(validation.disposition, {
+    state: "unavailable",
+    reason_codes: ["OCULIX_RC_VALIDATION_UNAVAILABLE"],
+  });
 });
 
 test("preparation failures stay blocked and always dispose the workspace", async () => {
@@ -569,6 +783,44 @@ test("preparation failures stay blocked and always dispose the workspace", async
   assert.doesNotThrow(() =>
     validateDocument(validation, contractOptions),
   );
+});
+
+test("Java incompatibility has one stable preparation and execution reason", async (context) => {
+  await context.test("preparation", async () => {
+    const qualification = successfulQualification({
+      prepareCandidate: async () => ({
+        changed_paths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
+        diff_digest: DIFF_DIGEST,
+        java_identity_digest:
+          "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      }),
+    });
+    const { validation } = await qualification.promise;
+    assert.deepEqual(validation.disposition, {
+      state: "incompatible",
+      reason_codes: ["OCULIX_RC_JAVA_RUNTIME_INCOMPATIBLE"],
+    });
+  });
+  await context.test("execution", async () => {
+    const qualification = successfulQualification({
+      runCheck: async ({ check, plan }) => ({
+        status: "pass",
+        warnings: [],
+        output: check.id,
+        java_compatible: check.id !== "repository-policy",
+        java_identity_digest: plan.java.identity_digest,
+      }),
+    });
+    const { validation } = await qualification.promise;
+    assert.deepEqual(validation.disposition, {
+      state: "incompatible",
+      reason_codes: ["OCULIX_RC_JAVA_RUNTIME_INCOMPATIBLE"],
+    });
+    assert.equal(validation.results[0].status, "fail");
+    assert.doesNotThrow(() =>
+      validateDocument(validation, contractOptions),
+    );
+  });
 });
 
 test("root or in-tree workspaces are rejected before preparation", async () => {
@@ -595,10 +847,11 @@ test("candidate or generated diff changes validation evidence identity", async (
   const first = successfulQualification();
   const { validation: baseline } = await first.promise;
   const second = successfulQualification({
-    prepareCandidate: async () => ({
+    prepareCandidate: async ({ javaIdentity }) => ({
       changed_paths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
       diff_digest:
         "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      java_identity_digest: javaIdentity.identity_digest,
     }),
   });
   const { validation: changedDiff } = await second.promise;
