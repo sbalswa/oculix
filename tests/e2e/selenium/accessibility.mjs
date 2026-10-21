@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+
 import AxeBuilder from "@axe-core/webdriverjs";
 
 export const ACCESSIBILITY_TAGS = Object.freeze([
@@ -22,6 +25,10 @@ function findingCount(findings) {
   );
 }
 
+function counted(value, singular) {
+  return `${value} ${value === 1 ? singular : `${singular}s`}`;
+}
+
 export function normalizeAccessibilityResults(results) {
   return {
     inapplicable: results.inapplicable.length,
@@ -40,6 +47,42 @@ export function accessibilityOutcome(results) {
     counts,
     status: counts.violations > 0 ? "failed" : "passed",
   };
+}
+
+export function formatAccessibilitySummary(results) {
+  const outcome = accessibilityOutcome(results);
+  const engineVersion = results.testEngine?.version ?? "unknown";
+  const incompleteReview =
+    outcome.counts.incomplete > 0
+      ? "required; findings are nonblocking"
+      : "not required; no incomplete findings";
+  return [
+    "# Selenium accessibility summary",
+    "",
+    `- Outcome: **${outcome.status}**`,
+    `- Engine: \`axe-core ${engineVersion}\``,
+    `- Policy tags: ${ACCESSIBILITY_TAGS.map((tag) => `\`${tag}\``).join(", ")}`,
+    `- Violations: ${counted(outcome.counts.violations, "rule")} / ${counted(outcome.counts.violationNodes, "node")} (blocking)`,
+    `- Incomplete: ${counted(outcome.counts.incomplete, "rule")} / ${counted(outcome.counts.incompleteNodes, "node")}`,
+    `- Manual review: ${incompleteReview}`,
+    "",
+    "Any automated violation blocks this scenario. Incomplete findings are retained for manual review and do not block.",
+    "",
+  ].join("\n");
+}
+
+export async function writeAccessibilityReports({
+  accessibilityPath,
+  results,
+  summaryPath,
+}) {
+  await mkdir(dirname(accessibilityPath), { recursive: true });
+  await writeFile(
+    accessibilityPath,
+    `${JSON.stringify(results, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(summaryPath, formatAccessibilitySummary(results), "utf8");
 }
 
 export function enforceAccessibilityPolicy(results) {

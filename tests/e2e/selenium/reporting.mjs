@@ -66,6 +66,10 @@ export async function createScenarioReporter({
   const directory = resolve(diagnosticsDirectory, scenario);
   const paths = {
     accessibility: resolve(directory, "accessibility.json"),
+    accessibilitySummary: resolve(
+      directory,
+      "accessibility-summary.md",
+    ),
     failureMetadata: resolve(directory, "metadata.json"),
     failureScreenshot: resolve(directory, "screenshot.png"),
     pageSource: resolve(directory, "page-source.html"),
@@ -89,7 +93,10 @@ export async function createScenarioReporter({
     },
     capability: {
       browser: process.env.E2E_BROWSER ?? "chrome",
-      id: null,
+      id:
+        process.env.E2E_OS === undefined
+          ? null
+          : `selenium-${process.env.E2E_OS}-${process.env.E2E_BROWSER ?? "chrome"}`,
       os: process.env.E2E_OS ?? null,
     },
     environment: {
@@ -164,7 +171,7 @@ export async function createScenarioReporter({
       const os = metadata.os ?? state.capability.os;
       state.capability = {
         browser,
-        id: os === null ? null : `${os}-${browser}`,
+        id: os === null ? null : `selenium-${os}-${browser}`,
         os,
       };
       state.environment = {
@@ -186,6 +193,10 @@ export async function createScenarioReporter({
       const artifacts = {
         accessibility: await existingArtifactPath(
           paths.accessibility,
+          repositoryDirectory,
+        ),
+        accessibilitySummary: await existingArtifactPath(
+          paths.accessibilitySummary,
           repositoryDirectory,
         ),
         failureMetadata: await existingArtifactPath(

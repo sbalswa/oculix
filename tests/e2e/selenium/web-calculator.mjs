@@ -6,6 +6,7 @@ import { By, until } from "selenium-webdriver";
 import {
   auditAccessibility,
   enforceAccessibilityPolicy,
+  writeAccessibilityReports,
 } from "./accessibility.mjs";
 import { runScenario } from "./harness.mjs";
 import { createScenarioReporter } from "./reporting.mjs";
@@ -85,11 +86,11 @@ await runScenario(
     }
 
     try {
-      await writeFile(
-        reporter.paths.accessibility,
-        `${JSON.stringify(accessibilityResults, null, 2)}\n`,
-        "utf8",
-      );
+      await writeAccessibilityReports({
+        accessibilityPath: reporter.paths.accessibility,
+        results: accessibilityResults,
+        summaryPath: reporter.paths.accessibilitySummary,
+      });
     } catch (error) {
       reporter.recordAccessibilityError(error);
       reporter.recordFailure("accessibility-report", error);
