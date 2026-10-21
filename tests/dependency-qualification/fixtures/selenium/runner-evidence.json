@@ -1,0 +1,23 @@
+{
+  "runner": "ubuntu-latest",
+  "browser": {
+    "name": "chromium",
+    "version": "141.0.7390.54",
+    "compatibility_key": "141.0.7390",
+    "locator": "https://github.com/actions/runner-images/commit/browser",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "path": "/usr/bin/chromium",
+    "realpath": "/usr/bin/chromium",
+    "executable_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "driver": {
+    "name": "chromedriver",
+    "version": "141.0.7390.54",
+    "compatibility_key": "141.0.7390",
+    "locator": "https://github.com/actions/runner-images/commit/driver",
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "path": "/usr/bin/chromedriver",
+    "realpath": "/usr/bin/chromedriver",
+    "executable_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}

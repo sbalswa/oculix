@@ -1,0 +1,41 @@
+{
+  "@axe-core/webdriverjs": {
+    "name": "@axe-core/webdriverjs",
+    "version": "4.15.0",
+    "dist": {
+      "tarball": "https://registry.npmjs.org/@axe-core/webdriverjs/-/webdriverjs-4.15.0.tgz",
+      "integrity": "sha512-Y2FuZGlkYXRlLWF4ZQ=="
+    },
+    "dependencies": {
+      "axe-core": "~4.15.0"
+    },
+    "engines": {
+      "node": ">=24.0.0"
+    },
+    "peerDependencies": {
+      "selenium-webdriver": ">=4.40.0"
+    }
+  },
+  "axe-core": {
+    "name": "axe-core",
+    "version": "4.15.0",
+    "dist": {
+      "tarball": "https://registry.npmjs.org/axe-core/-/axe-core-4.15.0.tgz",
+      "integrity": "sha512-Y2FuZGlkYXRlLWF4ZS1jb3Jl"
+    },
+    "engines": {
+      "node": ">=4.0.0"
+    }
+  },
+  "selenium-webdriver": {
+    "name": "selenium-webdriver",
+    "version": "4.52.0",
+    "dist": {
+      "tarball": "https://registry.npmjs.org/selenium-webdriver/-/selenium-webdriver-4.52.0.tgz",
+      "integrity": "sha512-Y2FuZGlkYXRlLXNlbGVuaXVt"
+    },
+    "engines": {
+      "node": ">=24.0.0"
+    }
+  }
+}
