@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-#MISE description="Run all Oculix E2E scenarios in order"
+#MISE description="Run supported Oculix E2E scenarios in order"
 set -euo pipefail
 
 mise run e2e:oculix:smoke
+# Phase 1 adds the web scenario only to the local Ubuntu aggregate. Matrix CI
+# calls the parameterized leaf directly with its explicit capability fields.
+if [[ "$(uname -s)" == "Linux" ]] &&
+  grep -Eq '^ID="?ubuntu"?$' /etc/os-release; then
+  mise run e2e:oculix:web-calculator \
+    --os ubuntu \
+    --browser chromium
+fi
 mise run e2e:oculix:native-calculator

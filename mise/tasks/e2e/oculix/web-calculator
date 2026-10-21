@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#MISE description="Run the Oculix web calculator scenario for a capability"
+#USAGE flag "--os <os>" required=#true help="Capability operating system" {
+#USAGE   choices "ubuntu"
+#USAGE }
+#USAGE flag "--browser <browser>" required=#true help="Capability browser" {
+#USAGE   choices "chromium"
+#USAGE }
+set -euo pipefail
+
+selected_os="${usage_os?}"
+selected_browser="${usage_browser?}"
+capability="$selected_os-$selected_browser"
+case "$capability" in
+  ubuntu-chromium)
+    ;;
+  *)
+    printf \
+      "oculix web-calculator: unsupported capability '%s'; supported: ubuntu-chromium.\n" \
+      "$capability" >&2
+    exit 2
+    ;;
+esac
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+
+[[ "$(uname -s)" == "Linux" ]] ||
+  {
+    printf 'oculix web-calculator: ubuntu-chromium requires Linux.\n' >&2
+    exit 1
+  }
+command -v node >/dev/null 2>&1 ||
+  {
+    printf 'oculix web-calculator: the web-e2e Node.js is required.\n' >&2
+    exit 1
+  }
+mise where http:oculixide >/dev/null 2>&1 ||
+  {
+    printf 'oculix web-calculator: the oculix environment is required.\n' >&2
+    exit 1
+  }
+command -v xvfb-run >/dev/null 2>&1 ||
+  {
+    printf 'oculix web-calculator: xvfb-run is required.\n' >&2
+    exit 1
+  }
+command -v setsid >/dev/null 2>&1 ||
+  {
+    printf 'oculix web-calculator: setsid is required.\n' >&2
+    exit 1
+  }
+
+capability_runner="$MISE_PROJECT_ROOT/tests/e2e/oculix/web-calculator.sikuli/run-capability"
+exec mise run e2e:fixtures:web-calculator:with-server \
+  xvfb-run -a -s "-screen 0 1280x1024x24 -nolisten tcp" \
+  "$capability_runner" \
+  "$selected_os" \
+  "$selected_browser"
