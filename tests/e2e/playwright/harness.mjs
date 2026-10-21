@@ -94,7 +94,7 @@ export function validateOperatingSystem(
   selected,
   {
     arch = process.arch,
-    linuxDistribution = null,
+    linuxRelease = null,
     platform = process.platform,
   } = {},
 ) {
@@ -116,25 +116,42 @@ export function validateOperatingSystem(
   if (
     platform === "linux" &&
     selected.startsWith("ubuntu") &&
-    linuxDistribution !== "ubuntu"
+    linuxRelease?.id !== "ubuntu"
   ) {
     fail(
       `E2E_OS "${selected}" requires an Ubuntu host, but ` +
-        `/etc/os-release reports ${linuxDistribution ?? "no distribution ID"}.`,
+        `/etc/os-release reports ${linuxRelease?.id ?? "no distribution ID"}.`,
+    );
+  }
+  const versionedUbuntu = /^ubuntu-(\d{2}\.\d{2})$/.exec(selected);
+  if (
+    versionedUbuntu !== null &&
+    linuxRelease?.versionId !== versionedUbuntu[1]
+  ) {
+    fail(
+      `E2E_OS "${selected}" requires Ubuntu ${versionedUbuntu[1]}, but ` +
+        `/etc/os-release reports ${linuxRelease?.versionId ?? "no VERSION_ID"}.`,
     );
   }
   return selected;
 }
 
-async function linuxDistribution() {
+function releaseValue(contents, key) {
+  const match = new RegExp(`^${key}="?([^"\\n]+)"?$`, "m").exec(contents);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+async function linuxRelease() {
   if (process.platform !== "linux") {
     return null;
   }
 
   try {
     const release = await readFile("/etc/os-release", "utf8");
-    const match = /^ID="?([^"\n]+)"?$/m.exec(release);
-    return match?.[1]?.toLowerCase() ?? null;
+    return {
+      id: releaseValue(release, "ID"),
+      versionId: releaseValue(release, "VERSION_ID"),
+    };
   } catch (error) {
     if (error.code === "ENOENT") {
       return null;
@@ -147,7 +164,7 @@ async function selectedOperatingSystem() {
   return validateOperatingSystem(
     normalize(process.env.E2E_OS) ?? process.platform,
     {
-      linuxDistribution: await linuxDistribution(),
+      linuxRelease: await linuxRelease(),
     },
   );
 }
@@ -196,7 +213,7 @@ async function prepare(project, operatingSystem) {
   }
 
   const installArguments = ["exec", "--", "playwright", "install"];
-  if ((await linuxDistribution()) === "ubuntu") {
+  if ((await linuxRelease())?.id === "ubuntu") {
     installArguments.push("--with-deps");
   }
   installArguments.push(project);
@@ -274,19 +291,24 @@ async function runTest(scenario, project, operatingSystem) {
     PLAYWRIGHT_PROJECT: project,
   };
   await runNpm(
-    [
-      "exec",
-      "--",
-      "playwright",
-      "test",
-      specification,
-      `--project=${project}`,
-    ],
+    playwrightTestArguments(specification, project),
     {
       env: environment,
       timeoutMs: TEST_TIMEOUT_MS,
     },
   );
+}
+
+export function playwrightTestArguments(specification, project) {
+  return [
+    "exec",
+    "--offline",
+    "--",
+    "playwright",
+    "test",
+    specification,
+    `--project=${project}`,
+  ];
 }
 
 async function writeDiagnostics(scenario, project, operatingSystem, error) {

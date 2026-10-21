@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  playwrightTestArguments,
   validateOperatingSystem,
   validatePreparationRecord,
 } from "./harness.mjs";
@@ -47,7 +48,10 @@ test("accepts an Ubuntu matrix alias on an Ubuntu host", () => {
   assert.equal(
     validateOperatingSystem("ubuntu-latest", {
       arch: "x64",
-      linuxDistribution: "ubuntu",
+      linuxRelease: {
+        id: "ubuntu",
+        versionId: "26.04",
+      },
       platform: "linux",
     }),
     "ubuntu-latest",
@@ -59,9 +63,53 @@ test("rejects an Ubuntu matrix alias on another Linux distribution", () => {
     () =>
       validateOperatingSystem("ubuntu-24.04", {
         arch: "arm64",
-        linuxDistribution: "amzn",
+        linuxRelease: {
+          id: "amzn",
+          versionId: "2023",
+        },
         platform: "linux",
       }),
     /requires an Ubuntu host/,
+  );
+});
+
+test("accepts a versioned Ubuntu alias only at the matching VERSION_ID", () => {
+  assert.equal(
+    validateOperatingSystem("ubuntu-24.04", {
+      arch: "x64",
+      linuxRelease: {
+        id: "ubuntu",
+        versionId: "24.04",
+      },
+      platform: "linux",
+    }),
+    "ubuntu-24.04",
+  );
+  assert.throws(
+    () =>
+      validateOperatingSystem("ubuntu-24.04", {
+        arch: "x64",
+        linuxRelease: {
+          id: "ubuntu",
+          versionId: "26.04",
+        },
+        platform: "linux",
+      }),
+    /requires Ubuntu 24.04/,
+  );
+});
+
+test("constructs scenario npm execution in offline mode", () => {
+  assert.deepEqual(
+    playwrightTestArguments("smoke.spec.mjs", "chromium"),
+    [
+      "exec",
+      "--offline",
+      "--",
+      "playwright",
+      "test",
+      "smoke.spec.mjs",
+      "--project=chromium",
+    ],
   );
 });

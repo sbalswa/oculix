@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
 import {
+  CleanupError,
+  createWindowsProcessTracker,
   npmInvocation,
   ProcessStoppedError,
   runProcess,
+  runTaskkill,
   stopProcessTree,
 } from "./process-runner.mjs";
 
@@ -106,6 +110,7 @@ test("escalates a Windows process tree to forced taskkill after grace", async ()
         force,
         processId,
       });
+      return true;
     },
     waitForExitWithinImplementation: async () => waitResults.shift(),
   });
@@ -120,6 +125,194 @@ test("escalates a Windows process tree to forced taskkill after grace", async ()
       processId: 1234,
     },
   ]);
+});
+
+test("cleans tracked Windows descendants after the direct child exited", async () => {
+  const calls = [];
+  const child = {
+    exitCode: 1,
+    pid: 1234,
+    signalCode: null,
+  };
+
+  await stopProcessTree(child, {
+    ownedProcessIds: [5678],
+    platform: "win32",
+    runTaskkillImplementation: async (processId, force) => {
+      calls.push({
+        force,
+        processId,
+      });
+      return true;
+    },
+  });
+
+  assert.deepEqual(calls, [
+    {
+      force: false,
+      processId: 1234,
+    },
+    {
+      force: true,
+      processId: 5678,
+    },
+  ]);
+});
+
+test("Windows tracking retains descendants after their original parent exits", async () => {
+  const probes = [];
+  const responses = [
+    [1234, 5678],
+    [5678, 9012],
+  ];
+  const tracker = createWindowsProcessTracker(1234, {
+    intervalMs: 60_000,
+    probeImplementation: async (roots) => {
+      probes.push(roots);
+      return responses.shift();
+    },
+  });
+
+  assert.deepEqual(await tracker.finish(), [5678, 9012]);
+  assert.deepEqual(probes, [
+    [1234],
+    [1234, 5678],
+  ]);
+});
+
+test("runProcess forwards tracked Windows descendants after nonzero exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.pid = 1234;
+  child.signalCode = null;
+  const cleanups = [];
+
+  const run = runProcess("example.exe", [], {
+    platform: "win32",
+    spawnImplementation: () => {
+      queueMicrotask(() => {
+        child.exitCode = 1;
+        child.emit("exit", 1, null);
+      });
+      return child;
+    },
+    stopProcessTreeImplementation: async (_child, options) => {
+      cleanups.push(options);
+    },
+    timeoutMs: 1_000,
+    windowsTrackerFactory: () => ({
+      finish: async () => [1234, 5678],
+    }),
+  });
+
+  await assert.rejects(run, /example\.exe exited with code 1/);
+  assert.deepEqual(cleanups, [
+    {
+      ownedProcessIds: [5678],
+      platform: "win32",
+      signal: "SIGTERM",
+    },
+  ]);
+});
+
+test("bounds taskkill.exe itself and reports its timeout", async () => {
+  const utility = new EventEmitter();
+  utility.exitCode = null;
+  utility.signalCode = null;
+  utility.kill = (signal) => {
+    utility.exitCode = 1;
+    utility.signalCode = signal;
+    queueMicrotask(() => utility.emit("exit", 1, signal));
+    return true;
+  };
+
+  await assert.rejects(
+    runTaskkill(1234, true, {
+      forceWaitMs: 10,
+      spawnImplementation: () => utility,
+      timeoutMs: 10,
+    }),
+    (error) =>
+      error instanceof CleanupError &&
+      /taskkill\.exe.*timed out after 10ms/.test(error.message),
+  );
+});
+
+test("fails within a bounded interval when taskkill cannot be reaped", async () => {
+  const utility = new EventEmitter();
+  utility.exitCode = null;
+  utility.signalCode = null;
+  utility.kill = () => true;
+
+  await assert.rejects(
+    runTaskkill(1234, true, {
+      forceWaitMs: 10,
+      spawnImplementation: () => utility,
+      timeoutMs: 10,
+    }),
+    (error) =>
+      error instanceof CleanupError &&
+      /did not exit within 20ms/.test(error.message),
+  );
+});
+
+test("fails clearly when a POSIX process group survives SIGKILL", async () => {
+  const signals = [];
+  const child = {
+    exitCode: null,
+    pid: 1234,
+    signalCode: null,
+  };
+
+  await assert.rejects(
+    stopProcessTree(child, {
+      graceMs: 10,
+      platform: "linux",
+      signalProcessGroupImplementation: (processId, signal) => {
+        signals.push({
+          processId,
+          signal,
+        });
+        return true;
+      },
+      waitForExitWithinImplementation: async () => true,
+      waitForProcessGroupExitImplementation: async () => false,
+    }),
+    (error) =>
+      error instanceof CleanupError &&
+      /still exists after SIGKILL/.test(error.message),
+  );
+  assert.deepEqual(signals, [
+    {
+      processId: 1234,
+      signal: "SIGTERM",
+    },
+    {
+      processId: 1234,
+      signal: "SIGKILL",
+    },
+  ]);
+});
+
+test("fails clearly when the direct child misses its forced deadline", async () => {
+  const child = {
+    exitCode: null,
+    pid: 1234,
+    signalCode: null,
+  };
+
+  await assert.rejects(
+    stopProcessTree(child, {
+      graceMs: 10,
+      platform: "linux",
+      signalProcessGroupImplementation: () => true,
+      waitForExitWithinImplementation: async () => false,
+      waitForProcessGroupExitImplementation: async () => true,
+    }),
+    (error) =>
+      error instanceof CleanupError &&
+      /Direct child 1234 did not exit after SIGKILL/.test(error.message),
+  );
 });
 
 test(
