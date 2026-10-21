@@ -1,72 +1,163 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveBrowserSelection } from "./harness.mjs";
+import { resolveCapability } from "./configuration.mjs";
 
-test("defaults local runs to Chromium", () => {
-  const selection = resolveBrowserSelection({
+test("defaults local Linux runs to Chrome with an honest OS label", () => {
+  const capability = resolveCapability({
     arguments_: [],
     environment: {},
+    linuxDistribution: "amzn",
+    platform: "linux",
   });
 
-  assert.equal(selection.name, "chromium");
-  assert.equal(selection.source, "local default");
+  assert.equal(capability.browser, "chrome");
+  assert.equal(capability.browserSource, "local default");
+  assert.equal(capability.os, "linux");
+  assert.equal(capability.osSource, "host default");
+  assert.equal(capability.downloadsAllowed, false);
 });
 
-test("accepts an environment selection and binary", () => {
-  const selection = resolveBrowserSelection({
+test("accepts an explicit Ubuntu Chromium capability and binary", () => {
+  const capability = resolveCapability({
     arguments_: [],
     environment: {
-      E2E_BROWSER: "chrome",
-      E2E_BROWSER_BINARY: "/opt/google/chrome",
+      E2E_BROWSER: "chromium",
+      E2E_BROWSER_BINARY: "/usr/bin/chromium",
+      E2E_DRIVER_BINARY: "/usr/bin/chromedriver",
+      E2E_OS: "ubuntu",
     },
+    linuxDistribution: "ubuntu",
+    platform: "linux",
   });
 
-  assert.equal(selection.name, "chrome");
-  assert.equal(selection.binary, "/opt/google/chrome");
-  assert.equal(selection.source, "E2E_BROWSER");
+  assert.equal(capability.browser, "chromium");
+  assert.equal(capability.browserBinary, "/usr/bin/chromium");
+  assert.equal(capability.driverBinary, "/usr/bin/chromedriver");
+  assert.equal(capability.os, "ubuntu");
 });
 
-test("task arguments override the environment selection", () => {
-  const selection = resolveBrowserSelection({
-    arguments_: ["--browser", "chrome"],
-    environment: { E2E_BROWSER: "chromium" },
+test("task arguments override environment capability fields", () => {
+  const capability = resolveCapability({
+    arguments_: ["--browser", "chrome", "--os", "ubuntu"],
+    environment: {
+      E2E_BROWSER: "chromium",
+      E2E_OS: "linux",
+    },
+    linuxDistribution: "ubuntu",
+    platform: "linux",
   });
 
-  assert.equal(selection.name, "chrome");
-  assert.equal(selection.source, "--browser");
+  assert.equal(capability.browser, "chrome");
+  assert.equal(capability.browserSource, "--browser");
+  assert.equal(capability.os, "ubuntu");
+  assert.equal(capability.osSource, "--os");
 });
 
 for (const requestedBrowser of ["", "firefox", "safari"]) {
   test(`rejects unsupported browser value "${requestedBrowser}"`, () => {
     assert.throws(
       () =>
-        resolveBrowserSelection({
+        resolveCapability({
           arguments_: [`--browser=${requestedBrowser}`],
           environment: {},
+          linuxDistribution: "ubuntu",
+          platform: "linux",
         }),
       /Unsupported E2E browser/,
     );
   });
 }
 
-test("rejects duplicate browser arguments", () => {
+test("rejects unsupported and host-incompatible OS values", () => {
   assert.throws(
     () =>
-      resolveBrowserSelection({
+      resolveCapability({
+        arguments_: ["--os", "solaris"],
+        environment: {},
+        linuxDistribution: "ubuntu",
+        platform: "linux",
+      }),
+    /Unsupported E2E OS/,
+  );
+  assert.throws(
+    () =>
+      resolveCapability({
+        arguments_: ["--os", "windows"],
+        environment: {},
+        linuxDistribution: "ubuntu",
+        platform: "linux",
+      }),
+    /requires host platform "win32"/,
+  );
+});
+
+test("rejects an Ubuntu capability on another Linux distribution", () => {
+  assert.throws(
+    () =>
+      resolveCapability({
+        arguments_: ["--os", "ubuntu"],
+        environment: {},
+        linuxDistribution: "amzn",
+        platform: "linux",
+      }),
+    /requires an Ubuntu host/,
+  );
+});
+
+test("rejects duplicate capability arguments", () => {
+  assert.throws(
+    () =>
+      resolveCapability({
         arguments_: ["--browser", "chromium", "--browser=chrome"],
         environment: {},
+        linuxDistribution: "ubuntu",
+        platform: "linux",
       }),
-    /Browser selection may only be provided once/,
+    /--browser may only be provided once/,
+  );
+  assert.throws(
+    () =>
+      resolveCapability({
+        arguments_: ["--os", "linux", "--os=ubuntu"],
+        environment: {},
+        linuxDistribution: "ubuntu",
+        platform: "linux",
+      }),
+    /--os may only be provided once/,
+  );
+});
+
+test("requires an explicit downloads policy value", () => {
+  assert.throws(
+    () =>
+      resolveCapability({
+        arguments_: [],
+        environment: { E2E_SELENIUM_ALLOW_DOWNLOADS: "sometimes" },
+        linuxDistribution: "ubuntu",
+        platform: "linux",
+      }),
+    /must be one of/,
+  );
+  assert.equal(
+    resolveCapability({
+      arguments_: [],
+      environment: { E2E_SELENIUM_ALLOW_DOWNLOADS: "true" },
+      linuxDistribution: "ubuntu",
+      platform: "linux",
+    }).downloadsAllowed,
+    true,
   );
 });
 
 test("rejects unrelated task arguments", () => {
   assert.throws(
     () =>
-      resolveBrowserSelection({
+      resolveCapability({
         arguments_: ["--headed"],
         environment: {},
+        linuxDistribution: "ubuntu",
+        platform: "linux",
       }),
     /Unknown argument/,
   );

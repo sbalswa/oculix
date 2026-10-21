@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test browser-selection.test.mjs",
+    "test": "node --test browser-selection.test.mjs harness.test.mjs",
+    "setup": "node setup.mjs",
     "smoke": "npm test --silent && node smoke.mjs",
     "web-calculator": "node web-calculator.mjs"
   },

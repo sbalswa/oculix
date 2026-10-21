@@ -13,6 +13,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & mise -E web-e2e exec -- `
+    npm --prefix tests/e2e/selenium run setup -- @args
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+& mise -E web-e2e exec -- `
     node tests/e2e/fixtures/web-calculator/lifecycle.mjs `
     npm --prefix tests/e2e/selenium run web-calculator -- @args
 exit $LASTEXITCODE

@@ -1,103 +1,16 @@
-import { execFileSync } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
+import { resolve } from "node:path";
 
-import { Builder } from "selenium-webdriver";
 import chrome from "selenium-webdriver/chrome.js";
 
-const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const DIAGNOSTICS_DIRECTORY = resolve(HARNESS_DIRECTORY, "diagnostics");
-const DEFAULT_BROWSER = "chromium";
-const MAX_TEXT_DIAGNOSTIC_BYTES = 256 * 1024;
-
-const BROWSERS = new Map([
-  [
-    "chromium",
-    {
-      driverBrowser: "chrome",
-      description: "Chromium-compatible browser",
-    },
-  ],
-  [
-    "chrome",
-    {
-      driverBrowser: "chrome",
-      description: "Google Chrome",
-    },
-  ],
-]);
-
-function parseArguments(arguments_) {
-  let browser;
-
-  for (let index = 0; index < arguments_.length; index += 1) {
-    const argument = arguments_[index];
-    if (argument === "--browser") {
-      if (browser !== undefined) {
-        throw new Error("Browser selection may only be provided once");
-      }
-      browser = arguments_[index + 1];
-      if (browser === undefined) {
-        throw new Error("--browser requires a value");
-      }
-      index += 1;
-    } else if (argument.startsWith("--browser=")) {
-      if (browser !== undefined) {
-        throw new Error("Browser selection may only be provided once");
-      }
-      browser = argument.slice("--browser=".length);
-    } else {
-      throw new Error(
-        `Unknown argument: ${argument}\nUsage: [--browser chromium|chrome]`,
-      );
-    }
-  }
-
-  return { browser };
-}
-
-export function resolveBrowserSelection({
-  arguments_ = process.argv.slice(2),
-  environment = process.env,
-} = {}) {
-  const { browser: argumentBrowser } = parseArguments(arguments_);
-  const requestedBrowser =
-    argumentBrowser ?? environment.E2E_BROWSER ?? DEFAULT_BROWSER;
-  const name = requestedBrowser.toLowerCase();
-  const configuration = BROWSERS.get(name);
-
-  if (configuration === undefined) {
-    throw new Error(
-      `Unsupported E2E browser "${requestedBrowser}". ` +
-        `Supported values: ${[...BROWSERS.keys()].join(", ")}`,
-    );
-  }
-
-  return {
-    ...configuration,
-    binary: environment.E2E_BROWSER_BINARY || null,
-    name,
-    source:
-      argumentBrowser !== undefined
-        ? "--browser"
-        : environment.E2E_BROWSER
-          ? "E2E_BROWSER"
-          : "local default",
-  };
-}
-
-function truncateUtf8(value, maximumBytes = MAX_TEXT_DIAGNOSTIC_BYTES) {
-  const buffer = Buffer.from(value, "utf8");
-  if (buffer.length <= maximumBytes) {
-    return value;
-  }
-
-  return (
-    buffer.subarray(0, maximumBytes).toString("utf8") +
-    `\n<!-- truncated after ${maximumBytes} bytes -->\n`
-  );
-}
+import { resolveCapability } from "./configuration.mjs";
+import { writeFailureDiagnostics } from "./diagnostics.mjs";
+import {
+  DIAGNOSTICS_DIRECTORY,
+  HARNESS_DIRECTORY,
+  runtimeStatePath,
+  scenarioLogDirectory,
+} from "./runtime.mjs";
 
 async function packageVersion() {
   const packageJson = JSON.parse(
@@ -114,155 +27,251 @@ function driverVersion(capabilities) {
   return "unknown";
 }
 
-async function browserMetadata(driver, selection) {
+async function browserMetadata(driver, capability, state) {
   const capabilities = await driver.getCapabilities();
   return {
-    browser: selection.name,
-    browserBinary: selection.binary,
+    browser: capability.browser,
+    browserBinary: state.browserBinary,
     browserName: capabilities.getBrowserName(),
+    browserSource: capability.browserSource,
     browserVersion: capabilities.getBrowserVersion(),
+    downloadsAllowed: state.downloadsAllowed,
+    driverBinary: state.driverBinary,
     driverVersion: driverVersion(capabilities),
+    hostDistribution: capability.hostDistribution,
+    hostPlatform: capability.hostPlatform,
     nodeVersion: process.version,
+    os: capability.os,
+    osSource: capability.osSource,
     platformName: capabilities.getPlatform(),
-    selectionSource: selection.source,
+    provisioner: state.provisioner,
     seleniumVersion: await packageVersion(),
   };
 }
 
-function gitRevision() {
+async function loadResourceState(capability) {
+  const statePath = runtimeStatePath(capability);
+  let state;
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return null;
+    state = JSON.parse(await readFile(statePath, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Selenium resources are not prepared at ${statePath}. ` +
+        "Run the Selenium setup task before the scenario.",
+      { cause: error },
+    );
+  }
+
+  if (
+    state.schemaVersion !== 1 ||
+    state.browser !== capability.browser ||
+    state.os !== capability.os ||
+    typeof state.browserBinary !== "string" ||
+    typeof state.driverBinary !== "string"
+  ) {
+    throw new Error(
+      `Selenium resource state at ${statePath} does not match ` +
+        `${capability.os}/${capability.browser}; rerun setup.`,
+    );
+  }
+  await access(state.browserBinary);
+  await access(state.driverBinary);
+  return state;
+}
+
+function asError(error) {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+export async function createDriverWithService({ create, service }) {
+  try {
+    return await create(service);
+  } catch (caughtError) {
+    const error = asError(caughtError);
+    try {
+      await service.kill();
+    } catch (cleanupError) {
+      if (cleanupError !== error) {
+        error.cleanupError = asError(cleanupError);
+      }
+    }
+    throw error;
   }
 }
 
-async function retainFailureDiagnostics(driver, scenario, error, metadata) {
-  const scenarioDirectory = resolve(DIAGNOSTICS_DIRECTORY, scenario);
-  await rm(scenarioDirectory, { force: true, recursive: true });
-  await mkdir(scenarioDirectory, { recursive: true });
-
-  const diagnosticMetadata = {
-    ...metadata,
-    error: truncateUtf8(error?.stack || String(error), 32 * 1024),
-    gitRevision: gitRevision(),
-    scenario,
-    timestamp: new Date().toISOString(),
-  };
-
-  const capture = async (name, operation) => {
-    try {
-      await operation();
-    } catch (captureError) {
-      diagnosticMetadata[`${name}CaptureError`] = String(captureError);
+export async function buildAndConfigureDriver({
+  build,
+  configure = async (driver) => {
+    await driver.manage().setTimeouts({
+      implicit: 0,
+      pageLoad: 15_000,
+      script: 5_000,
+    });
+  },
+}) {
+  let driver;
+  try {
+    driver = await build();
+    await configure(driver);
+    return driver;
+  } catch (caughtError) {
+    const error = asError(caughtError);
+    if (driver !== undefined) {
+      try {
+        await driver.quit();
+      } catch (cleanupError) {
+        if (cleanupError !== error) {
+          error.cleanupError = asError(cleanupError);
+        }
+      }
     }
-  };
-
-  await capture("screenshot", async () => {
-    const screenshot = await driver.takeScreenshot();
-    await writeFile(
-      resolve(scenarioDirectory, "screenshot.png"),
-      screenshot,
-      "base64",
-    );
-  });
-  await capture("pageSource", async () => {
-    const source = await driver.getPageSource();
-    await writeFile(
-      resolve(scenarioDirectory, "page-source.html"),
-      truncateUtf8(source),
-      "utf8",
-    );
-  });
-  await capture("currentUrl", async () => {
-    diagnosticMetadata.currentUrl = await driver.getCurrentUrl();
-  });
-  await capture("title", async () => {
-    diagnosticMetadata.title = await driver.getTitle();
-  });
-
-  const metadataPath = resolve(scenarioDirectory, "metadata.json");
-  await writeFile(
-    metadataPath,
-    `${JSON.stringify(diagnosticMetadata, null, 2)}\n`,
-    "utf8",
-  );
-  console.error(`Selenium failure diagnostics: ${scenarioDirectory}`);
+    throw error;
+  }
 }
 
-async function buildDriver(selection) {
+async function buildDriver(state, logPaths) {
   const options = new chrome.Options();
   options.addArguments(
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
     "--disable-dev-shm-usage",
+    "--disable-sync",
     "--headless=new",
+    "--no-first-run",
     "--no-sandbox",
     "--window-size=1280,720",
   );
-  if (selection.binary !== null) {
-    options.setChromeBinaryPath(selection.binary);
-  }
+  options.setChromeBinaryPath(state.browserBinary);
+  options.setChromeLogFile(logPaths.browser);
 
-  const driver = await new Builder()
-    .forBrowser(selection.driverBrowser)
-    .setChromeOptions(options)
+  const service = new chrome.ServiceBuilder(state.driverBinary)
+    .loggingTo(logPaths.driver)
     .build();
-  await driver.manage().setTimeouts({
-    implicit: 0,
-    pageLoad: 15_000,
-    script: 5_000,
+
+  return buildAndConfigureDriver({
+    build: () =>
+      createDriverWithService({
+        create: () => chrome.Driver.createSession(options, service),
+        service,
+      }),
   });
-  return driver;
+}
+
+async function prepareScenarioLogs(capability, scenario) {
+  const directory = scenarioLogDirectory(capability, scenario);
+  await rm(directory, { force: true, recursive: true });
+  await mkdir(directory, { recursive: true });
+  return {
+    directory,
+    paths: {
+      browser: resolve(directory, "browser.log"),
+      driver: resolve(directory, "driver.log"),
+    },
+  };
+}
+
+function baseMetadata(capability, state) {
+  return {
+    browser: capability?.browser ?? process.env.E2E_BROWSER ?? "chrome",
+    browserBinary: state?.browserBinary ?? null,
+    browserSource: capability?.browserSource ?? null,
+    downloadsAllowed: state?.downloadsAllowed ?? null,
+    driverBinary: state?.driverBinary ?? null,
+    hostDistribution: capability?.hostDistribution ?? null,
+    hostPlatform: process.platform,
+    os: capability?.os ?? process.env.E2E_OS ?? null,
+    osSource: capability?.osSource ?? null,
+    phase: state === undefined ? "startup" : "driver-startup",
+    provisioner: state?.provisioner ?? null,
+  };
 }
 
 export async function runScenario(scenario, scenarioFunction) {
-  const selection = resolveBrowserSelection();
+  let capability;
   let driver;
-  let primaryError;
+  let failure;
+  let logDirectory;
+  let logPaths = {};
+  let metadata;
+  let state;
+
+  await rm(resolve(DIAGNOSTICS_DIRECTORY, scenario), {
+    force: true,
+    recursive: true,
+  });
 
   try {
-    driver = await buildDriver(selection);
-    const metadata = await browserMetadata(driver, selection);
+    capability = resolveCapability();
+    state = await loadResourceState(capability);
+    const logs = await prepareScenarioLogs(capability, scenario);
+    logDirectory = logs.directory;
+    logPaths = logs.paths;
+    driver = await buildDriver(state, logPaths);
+    metadata = await browserMetadata(driver, capability, state);
     console.log(
       [
         `Selenium ${metadata.seleniumVersion}`,
         `Node ${metadata.nodeVersion}`,
         `${metadata.browserName} ${metadata.browserVersion}`,
         `driver ${metadata.driverVersion}`,
-        `selection ${selection.name} (${selection.source})`,
+        `capability ${metadata.os}/${metadata.browser}`,
+        `provisioner ${metadata.provisioner}`,
       ].join(" | "),
     );
-    await scenarioFunction(driver, selection);
-  } catch (error) {
-    primaryError = error;
-    if (driver !== undefined) {
-      const metadata = await browserMetadata(driver, selection).catch(() => ({
-        browser: selection.name,
-        browserBinary: selection.binary,
-        selectionSource: selection.source,
-      }));
-      await retainFailureDiagnostics(driver, scenario, error, metadata).catch(
-        (diagnosticError) => {
+    await scenarioFunction(driver, capability);
+  } catch (caughtError) {
+    failure = asError(caughtError);
+    metadata = {
+      ...baseMetadata(capability, state),
+      ...metadata,
+    };
+    await writeFailureDiagnostics({
+      diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
+      driver,
+      error: failure,
+      logPaths,
+      metadata,
+      scenario,
+    }).catch((diagnosticError) => {
+      console.error(
+        `Could not retain Selenium diagnostics: ${diagnosticError}`,
+      );
+    });
+  }
+
+  if (driver !== undefined) {
+    try {
+      await driver.quit();
+    } catch (quitError) {
+      if (failure !== undefined) {
+        failure.cleanupError = quitError;
+      } else {
+        failure = quitError;
+        await writeFailureDiagnostics({
+          diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
+          driver,
+          error: quitError,
+          logPaths,
+          metadata: {
+            ...baseMetadata(capability, state),
+            ...metadata,
+            phase: "cleanup",
+          },
+          scenario,
+        }).catch((diagnosticError) => {
           console.error(
             `Could not retain Selenium diagnostics: ${diagnosticError}`,
           );
-        },
-      );
-    }
-    throw error;
-  } finally {
-    if (driver !== undefined) {
-      try {
-        await driver.quit();
-      } catch (quitError) {
-        if (primaryError !== undefined) {
-          console.error(`Could not quit Selenium browser: ${quitError}`);
-        } else {
-          throw quitError;
-        }
+        });
       }
     }
+  }
+
+  if (logDirectory !== undefined) {
+    await rm(logDirectory, { force: true, recursive: true });
+  }
+  if (failure !== undefined) {
+    throw failure;
   }
 }
