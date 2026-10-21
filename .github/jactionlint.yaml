@@ -1,4 +1,6 @@
 # Enforce the repository's baseline GitHub Actions policy.
+profile: default
+
 rules:
   unpinned-uses: error
   missing-permissions: error
