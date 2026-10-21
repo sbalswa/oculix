@@ -2,9 +2,11 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   stat,
@@ -124,18 +126,16 @@ function exactString(value, label) {
 
 const SEMVER_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u;
-const PARTIAL_VERSION_PATTERN =
-  /^(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])){0,2}$/u;
+const NUMERIC_PARTIAL_PATTERN =
+  /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){0,2}$/u;
+const WILDCARD_PARTIAL_PATTERN =
+  /^(?:(?:0|[1-9]\d*)\.){0,2}(?:[xX*])(?:\.(?:[xX*])){0,2}$/u;
 const INTEGRITY_PATTERN = /^sha(?:256|384|512)-[A-Za-z0-9+/]+={0,2}$/u;
 
-function assertSemver(value, label) {
-  exactString(value, label);
+function strictSemverMatch(value) {
   const match = SEMVER_PATTERN.exec(value);
   if (match === null) {
-    throw new MetadataError(
-      "SEMVER_METADATA_INVALID",
-      `${label} must be a strict semantic version`,
-    );
+    return null;
   }
   const prerelease = match[4]?.split(".") ?? [];
   if (
@@ -144,30 +144,55 @@ function assertSemver(value, label) {
       identifier.length > 1 &&
       identifier.startsWith("0"))
   ) {
+    return null;
+  }
+  return match;
+}
+
+function assertSemver(value, label) {
+  exactString(value, label);
+  if (strictSemverMatch(value) === null) {
     throw new MetadataError(
       "SEMVER_METADATA_INVALID",
-      `${label} has a numeric prerelease identifier with a leading zero`,
+      `${label} must be a strict semantic version without leading-zero prereleases`,
     );
   }
   return value;
 }
 
-function validComparator(token) {
-  const match = /^(?:[<>]=?|[=~^])?(.*)$/u.exec(token);
-  if (match === null) {
+function validNumericPartial(value) {
+  return NUMERIC_PARTIAL_PATTERN.test(value);
+}
+
+function validWildcardPartial(value) {
+  if (!WILDCARD_PARTIAL_PATTERN.test(value)) {
     return false;
   }
-  const version = match[1];
-  if (SEMVER_PATTERN.test(version)) {
-    return true;
-  }
-  if (!PARTIAL_VERSION_PATTERN.test(version)) {
-    return false;
-  }
-  const segments = version.split(".");
+  const segments = value.split(".");
   const wildcard = segments.findIndex((segment) => /^[xX*]$/u.test(segment));
-  return wildcard === -1 ||
+  return wildcard !== -1 &&
     segments.slice(wildcard).every((segment) => /^[xX*]$/u.test(segment));
+}
+
+function validRangeVersion(value, { wildcard = false } = {}) {
+  return strictSemverMatch(value) !== null ||
+    validNumericPartial(value) ||
+    (wildcard && validWildcardPartial(value));
+}
+
+// Supported npm-semver subset: exact/partial versions, trailing wildcards,
+// comparator sets, caret/tilde ranges, || alternatives, and plain hyphen
+// ranges. Anything outside this grammar fails closed.
+function rangeTokenKind(token) {
+  const modifier = /^([~^])(.+)$/u.exec(token);
+  if (modifier !== null) {
+    return validRangeVersion(modifier[2]) ? "modifier" : null;
+  }
+  const comparator = /^(>=|<=|>|<|=)(.+)$/u.exec(token);
+  if (comparator !== null) {
+    return validRangeVersion(comparator[2]) ? "comparator" : null;
+  }
+  return validRangeVersion(token, { wildcard: true }) ? "bare" : null;
 }
 
 function assertSemverRange(value, label) {
@@ -190,9 +215,21 @@ function assertSemverRange(value, label) {
       );
     }
     const hyphen = /^(\S+)\s+-\s+(\S+)$/u.exec(alternative);
-    const valid = hyphen === null
-      ? alternative.split(/\s+/u).every(validComparator)
-      : validComparator(hyphen[1]) && validComparator(hyphen[2]);
+    let valid;
+    if (hyphen !== null) {
+      valid =
+        validRangeVersion(hyphen[1]) &&
+        validRangeVersion(hyphen[2]);
+    } else if (/\s-\s/u.test(alternative)) {
+      valid = false;
+    } else {
+      const kinds = alternative
+        .split(/\s+/u)
+        .map(rangeTokenKind);
+      valid = kinds.length === 1
+        ? kinds[0] !== null
+        : kinds.every((kind) => kind === "comparator");
+    }
     if (!valid) {
       throw new MetadataError(
         "SEMVER_RANGE_INVALID",
@@ -646,6 +683,16 @@ export async function collectPlaywrightCohort({
   const observedAt = timestamp(generatedAt);
   const packageFile = join(repositoryRoot, PACKAGE_PATH);
   const lockFile = join(repositoryRoot, LOCK_PATH);
+  await assertConfinedExistingPath(repositoryRoot, repositoryRoot, {
+    kind: "directory",
+  });
+  await Promise.all([
+    assertConfinedExistingPath(repositoryRoot, packageFile, { kind: "file" }),
+    assertConfinedExistingPath(repositoryRoot, lockFile, { kind: "file" }),
+    assertConfinedExistingPath(repositoryRoot, capabilityPath, {
+      kind: "file",
+    }),
+  ]);
   const [packageContents, lockContents, catalogContents] = await Promise.all([
     readFile(packageFile),
     readFile(lockFile),
@@ -1108,13 +1155,51 @@ function runtimeMetadataFromOutput(output) {
 }
 
 export async function runQualificationStep(step) {
+  const allowedEnvironment = new Set([
+    "E2E_BROWSER",
+    "E2E_OS",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_PROJECT",
+    "npm_config_cache",
+  ]);
+  const unknownEnvironment = Object.keys(step.environment).filter(
+    (key) => !allowedEnvironment.has(key),
+  );
+  if (unknownEnvironment.length > 0) {
+    throw new Error(
+      `Qualification step contains unsafe environment keys: ` +
+        unknownEnvironment.sort().join(", "),
+    );
+  }
+  const temporaryDirectory = join(step.cwd, ".qualification-tmp");
+  await mkdir(temporaryDirectory, { recursive: true });
+  const environment = {};
+  for (const key of [
+    "PATH",
+    "Path",
+    "PATHEXT",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "WINDIR",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "CI",
+  ]) {
+    if (typeof process.env[key] === "string") {
+      environment[key] = process.env[key];
+    }
+  }
+  Object.assign(environment, step.environment, {
+    TEMP: temporaryDirectory,
+    TMP: temporaryDirectory,
+    TMPDIR: temporaryDirectory,
+  });
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(step.command, step.arguments, {
       cwd: step.cwd,
-      env: {
-        ...process.env,
-        ...step.environment,
-      },
+      env: environment,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1146,8 +1231,13 @@ export async function runQualificationStep(step) {
 }
 
 async function verifyAppliedCandidate(workspaceRoot, candidate) {
-  const packageJson = await readJson(join(workspaceRoot, PACKAGE_PATH));
-  const lockfile = await readJson(join(workspaceRoot, LOCK_PATH));
+  const packageRoot = join(workspaceRoot, PACKAGE_DIRECTORY);
+  const packagePath = join(workspaceRoot, PACKAGE_PATH);
+  const lockPath = join(workspaceRoot, LOCK_PATH);
+  await assertConfinedExistingPath(packageRoot, packagePath, { kind: "file" });
+  await assertConfinedExistingPath(packageRoot, lockPath, { kind: "file" });
+  const packageJson = await readJson(packagePath);
+  const lockfile = await readJson(lockPath);
   const applied = currentPackageCohort(packageJson, lockfile);
   if (packageVersion(applied) !== packageVersion(candidate)) {
     throw new Error(
@@ -1165,8 +1255,90 @@ async function verifyAppliedCandidate(workspaceRoot, candidate) {
 function pathInside(parent, child) {
   const relativePath = relative(resolve(parent), resolve(child));
   return relativePath !== ".." &&
-    !relativePath.startsWith(`..${sep}`) &&
-    !resolve(child).startsWith(`${resolve(parent)}${sep}..`);
+    !relativePath.startsWith(`..${sep}`);
+}
+
+async function assertConfinedExistingPath(
+  root,
+  path,
+  { kind = null, rootMayBeSymlink = false } = {},
+) {
+  if (!pathInside(root, path)) {
+    throw new Error(`Path escapes confinement: ${path}`);
+  }
+  const rootStatus = await lstat(root);
+  if (
+    !rootStatus.isDirectory() ||
+    (!rootMayBeSymlink && rootStatus.isSymbolicLink())
+  ) {
+    throw new Error(`Confinement root is not a real directory: ${root}`);
+  }
+  const pathStatus = await lstat(path);
+  const [resolvedRoot, resolvedPath] = await Promise.all([
+    realpath(root),
+    realpath(path),
+  ]);
+  if (!pathInside(resolvedRoot, resolvedPath)) {
+    throw new Error(`Resolved path escapes confinement: ${path}`);
+  }
+  const resolvedStatus = pathStatus.isSymbolicLink()
+    ? await stat(resolvedPath)
+    : pathStatus;
+  if (
+    (kind === "file" && !resolvedStatus.isFile()) ||
+    (kind === "directory" && !resolvedStatus.isDirectory())
+  ) {
+    throw new Error(`Confined path has the wrong type: ${path}`);
+  }
+  return resolvedPath;
+}
+
+async function validateWorkspaceLayout(workspaceRoot) {
+  await assertConfinedExistingPath(workspaceRoot, workspaceRoot, {
+    kind: "directory",
+  });
+  const packageRoot = join(workspaceRoot, PACKAGE_DIRECTORY);
+  await assertConfinedExistingPath(workspaceRoot, packageRoot, {
+    kind: "directory",
+  });
+  await assertConfinedExistingPath(
+    packageRoot,
+    join(workspaceRoot, PACKAGE_PATH),
+    { kind: "file" },
+  );
+  await assertConfinedExistingPath(
+    packageRoot,
+    join(workspaceRoot, LOCK_PATH),
+    { kind: "file" },
+  );
+}
+
+async function validateStepConfinement(workspaceRoot, step) {
+  const packageRoot = join(workspaceRoot, PACKAGE_DIRECTORY);
+  const [resolvedPackage, resolvedCwd] = await Promise.all([
+    assertConfinedExistingPath(workspaceRoot, packageRoot, {
+      kind: "directory",
+    }),
+    assertConfinedExistingPath(packageRoot, step.cwd, {
+      kind: "directory",
+    }),
+  ]);
+  if (resolvedCwd !== resolvedPackage) {
+    throw new Error(`Qualification step cwd is outside package root: ${step.cwd}`);
+  }
+  for (const key of ["PLAYWRIGHT_BROWSERS_PATH", "npm_config_cache"]) {
+    const path = step.environment[key];
+    if (path === undefined) {
+      continue;
+    }
+    if (!pathInside(packageRoot, path)) {
+      throw new Error(`${key} escapes the package boundary`);
+    }
+    await mkdir(path, { recursive: true });
+    await assertConfinedExistingPath(packageRoot, path, {
+      kind: "directory",
+    });
+  }
 }
 
 async function verifyRuntimeBrowser({
@@ -1178,6 +1350,12 @@ async function verifyRuntimeBrowser({
     workspaceRoot,
     PACKAGE_DIRECTORY,
     "node_modules/playwright-core/browsers.json",
+  );
+  const packageRoot = join(workspaceRoot, PACKAGE_DIRECTORY);
+  await assertConfinedExistingPath(
+    packageRoot,
+    installedMetadataPath,
+    { kind: "file" },
   );
   const installedMetadata = await readJson(installedMetadataPath);
   const installedChromium = chromiumRecord(installedMetadata);
@@ -1204,12 +1382,15 @@ async function verifyRuntimeBrowser({
     PACKAGE_DIRECTORY,
     ".playwright-browsers",
   );
-  if (!pathInside(browserRoot, runtimeMetadata.executablePath)) {
-    throw new Error(
-      "Runtime Chromium executable is outside the ephemeral package boundary",
-    );
-  }
-  const executable = await stat(runtimeMetadata.executablePath);
+  await assertConfinedExistingPath(packageRoot, browserRoot, {
+    kind: "directory",
+  });
+  const executablePath = await assertConfinedExistingPath(
+    browserRoot,
+    runtimeMetadata.executablePath,
+    { kind: "file" },
+  );
+  const executable = await stat(executablePath);
   if (!executable.isFile() || executable.size === 0) {
     throw new Error("Runtime Chromium executable is missing or empty");
   }
@@ -1218,6 +1399,9 @@ async function verifyRuntimeBrowser({
 async function filesBelow(root) {
   const result = [];
   async function visit(directory) {
+    await assertConfinedExistingPath(root, directory, {
+      kind: "directory",
+    });
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
@@ -1264,21 +1448,127 @@ function validTimestamp(value) {
     /Z$/u.test(value);
 }
 
-async function validateArtifactSemantics(workspaceRoot, path) {
-  const contents = await readFile(join(workspaceRoot, path));
-  if (path.endsWith(".png")) {
-    const pngSignature = Buffer.from([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    ]);
-    if (
-      contents.length < 24 ||
-      !contents.subarray(0, 8).equals(pngSignature) ||
-      contents.subarray(12, 16).toString("ascii") !== "IHDR"
-    ) {
-      return `${path} is not a structurally identifiable PNG`;
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+let crcTable = null;
+
+function pngCrc32(contents) {
+  if (crcTable === null) {
+    crcTable = Array.from({ length: 256 }, (_, value) => {
+      let current = value;
+      for (let bit = 0; bit < 8; bit += 1) {
+        current = (current & 1) === 1
+          ? 0xedb88320 ^ (current >>> 1)
+          : current >>> 1;
+      }
+      return current >>> 0;
+    });
+  }
+  let crc = 0xffffffff;
+  for (const byte of contents) {
+    crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function validPng(contents) {
+  if (
+    contents.length < 57 ||
+    !contents.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+  ) {
+    return false;
+  }
+  let offset = PNG_SIGNATURE.length;
+  let chunkIndex = 0;
+  let sawIdat = false;
+  let sawIend = false;
+  while (offset < contents.length) {
+    if (offset + 12 > contents.length) {
+      return false;
     }
-  } else if (path.endsWith(".webm") && contents.length === 0) {
-    return `${path} is an empty video artifact`;
+    const length = contents.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const dataStart = typeStart + 4;
+    const crcStart = dataStart + length;
+    const nextOffset = crcStart + 4;
+    if (nextOffset > contents.length) {
+      return false;
+    }
+    const type = contents.subarray(typeStart, dataStart).toString("ascii");
+    if (!/^[A-Za-z]{4}$/u.test(type)) {
+      return false;
+    }
+    const expectedCrc = contents.readUInt32BE(crcStart);
+    const actualCrc = pngCrc32(contents.subarray(typeStart, crcStart));
+    if (expectedCrc !== actualCrc) {
+      return false;
+    }
+    if (chunkIndex === 0) {
+      const bitDepth = contents[dataStart + 8];
+      const colorType = contents[dataStart + 9];
+      const validDepths = new Map([
+        [0, new Set([1, 2, 4, 8, 16])],
+        [2, new Set([8, 16])],
+        [3, new Set([1, 2, 4, 8])],
+        [4, new Set([8, 16])],
+        [6, new Set([8, 16])],
+      ]);
+      if (
+        type !== "IHDR" ||
+        length !== 13 ||
+        contents.readUInt32BE(dataStart) === 0 ||
+        contents.readUInt32BE(dataStart + 4) === 0 ||
+        !validDepths.get(colorType)?.has(bitDepth) ||
+        contents[dataStart + 10] !== 0 ||
+        contents[dataStart + 11] !== 0 ||
+        ![0, 1].includes(contents[dataStart + 12])
+      ) {
+        return false;
+      }
+    } else if (type === "IHDR") {
+      return false;
+    }
+    if (type === "IDAT") {
+      sawIdat = true;
+    }
+    if (type === "IEND") {
+      if (length !== 0 || nextOffset !== contents.length) {
+        return false;
+      }
+      sawIend = true;
+    }
+    if (sawIend && nextOffset !== contents.length) {
+      return false;
+    }
+    offset = nextOffset;
+    chunkIndex += 1;
+  }
+  return sawIdat && sawIend;
+}
+
+function validWebm(contents) {
+  return contents.length > 8 &&
+    contents.subarray(0, 4).equals(
+      Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
+    ) &&
+    contents.subarray(0, 4096).includes(Buffer.from("webm"));
+}
+
+async function validateArtifactSemantics(workspaceRoot, path) {
+  const artifactPath = join(workspaceRoot, path);
+  await assertConfinedExistingPath(
+    join(workspaceRoot, PACKAGE_DIRECTORY),
+    artifactPath,
+    { kind: "file" },
+  );
+  const contents = await readFile(artifactPath);
+  if (path.endsWith(".png")) {
+    if (!validPng(contents)) {
+      return `${path} is not a structurally valid PNG`;
+    }
+  } else if (path.endsWith(".webm") && !validWebm(contents)) {
+    return `${path} is not a nonempty WebM artifact`;
   } else if (path.endsWith(".html")) {
     const html = contents.toString("utf8");
     if (!/<html(?:\s|>)/iu.test(html) || !/<\/html>/iu.test(html)) {
@@ -1296,15 +1586,24 @@ async function validateArtifactSemantics(workspaceRoot, path) {
   return null;
 }
 
-function validateResultReport(report, capability, candidate, reportPath) {
+function validateResultReport(
+  report,
+  capability,
+  candidate,
+  reportPath,
+  artifactPaths,
+) {
   const problems = [];
   const scenario = report?.scenario;
+  const expectedScenario =
+    /\/test-results\/([^/]+)\/result\.json$/u.exec(reportPath)?.[1];
   if (
     !isObject(report) ||
     report.schemaVersion !== 1 ||
     report.tool !== "playwright" ||
     report.capabilityId !== capability.id ||
     !capability.scenarios.includes(scenario) ||
+    scenario !== expectedScenario ||
     report.status !== "passed"
   ) {
     problems.push(
@@ -1326,7 +1625,12 @@ function validateResultReport(report, capability, candidate, reportPath) {
     !validTimestamp(report.timestamps.startedAt) ||
     !validTimestamp(report.timestamps.completedAt) ||
     !Number.isFinite(report.timestamps.durationMs) ||
-    report.timestamps.durationMs < 0
+    report.timestamps.durationMs < 0 ||
+    Date.parse(report.timestamps.completedAt) <
+      Date.parse(report.timestamps.startedAt) ||
+    Date.parse(report.timestamps.completedAt) -
+      Date.parse(report.timestamps.startedAt) !==
+      report.timestamps.durationMs
   ) {
     problems.push(`result report ${reportPath} has invalid timestamps`);
   }
@@ -1360,6 +1664,18 @@ function validateResultReport(report, capability, candidate, reportPath) {
   ) {
     problems.push(`result report ${reportPath} has invalid artifact paths`);
   }
+  const videoAttachments = report.artifacts?.attachments?.filter(
+    (attachment) =>
+      isObject(attachment) &&
+      attachment.contentType === "video/webm" &&
+      typeof attachment.path === "string" &&
+      attachment.path.startsWith(`${scenarioRoot}/artifacts/`) &&
+      attachment.path.endsWith(".webm") &&
+      artifactPaths.has(attachment.path),
+  ) ?? [];
+  if (videoAttachments.length === 0) {
+    problems.push(`result report ${reportPath} does not bind its WebM evidence`);
+  }
   if (
     scenario === "web-calculator" &&
     (
@@ -1379,15 +1695,41 @@ function validateResultReport(report, capability, candidate, reportPath) {
   return problems;
 }
 
-function validateNativeReport(report, path) {
+function nativeReportFiles(suites) {
+  return suites.flatMap((suite) => [
+    ...(typeof suite?.file === "string" ? [suite.file] : []),
+    ...nativeReportFiles(Array.isArray(suite?.suites) ? suite.suites : []),
+    ...(Array.isArray(suite?.specs)
+      ? suite.specs.flatMap((specification) =>
+          typeof specification?.file === "string"
+            ? [specification.file]
+            : [])
+      : []),
+  ]);
+}
+
+function validateNativeReport(report, path, scenario) {
+  const expectedSpecification = `${scenario}.spec.mjs`;
   if (
     !isObject(report) ||
     !isObject(report.config) ||
+    Object.keys(report.config).length === 0 ||
     !Array.isArray(report.suites) ||
+    report.suites.length === 0 ||
     !Array.isArray(report.errors) ||
     report.errors.length !== 0 ||
     !isObject(report.stats) ||
-    report.stats.unexpected !== 0
+    !["expected", "skipped", "unexpected", "flaky"].every(
+      (key) => Number.isInteger(report.stats[key]) && report.stats[key] >= 0,
+    ) ||
+    report.stats.expected === 0 ||
+    report.stats.unexpected !== 0 ||
+    !nativeReportFiles(report.suites).some(
+      (file) =>
+        file === expectedSpecification ||
+        file.endsWith(`/${expectedSpecification}`) ||
+        file.endsWith(`\\${expectedSpecification}`),
+    )
   ) {
     return [`native Playwright report ${path} is invalid or unsuccessful`];
   }
@@ -1402,8 +1744,49 @@ function validFindingCounts(value) {
     value.nodes >= 0;
 }
 
-function validateAccessibility(raw, summary, markdown) {
+function findingCounts(findings) {
+  if (
+    !Array.isArray(findings) ||
+    findings.some((finding) => !Array.isArray(finding?.nodes))
+  ) {
+    return null;
+  }
+  return {
+    rules: findings.length,
+    nodes: findings.reduce(
+      (total, finding) => total + finding.nodes.length,
+      0,
+    ),
+  };
+}
+
+const EXPECTED_ACCESSIBILITY_POLICY = {
+  automatedStandard: "WCAG 2.0, 2.1, and 2.2 Level A/AA",
+  blocking: "any-violation",
+  incomplete: "retained-nonblocking",
+  tags: [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "wcag22a",
+    "wcag22aa",
+  ],
+};
+
+function validateAccessibility(
+  raw,
+  summary,
+  markdown,
+  resultAccessibility,
+) {
   const problems = [];
+  const computedCounts = Object.fromEntries(
+    ["violations", "incomplete", "passes", "inapplicable"].map((key) => [
+      key,
+      findingCounts(raw?.[key]),
+    ]),
+  );
   if (
     !isObject(raw) ||
     !isObject(raw.testEngine) ||
@@ -1421,19 +1804,30 @@ function validateAccessibility(raw, summary, markdown) {
   if (
     !isObject(summary) ||
     summary.status !== "passed" ||
-    !isObject(summary.policy) ||
+    stableJson(summary.policy) !== stableJson(EXPECTED_ACCESSIBILITY_POLICY) ||
     !isObject(summary.counts) ||
     !["violations", "incomplete", "passes", "inapplicable"].every(
       (key) => validFindingCounts(summary.counts[key]),
     ) ||
     summary.counts.violations.rules !== 0 ||
     summary.counts.violations.nodes !== 0 ||
+    stableJson(summary.counts) !== stableJson(computedCounts) ||
+    stableJson(summary.testEngine) !== stableJson(raw.testEngine) ||
+    stableJson(summary.testEnvironment) !== stableJson(raw.testEnvironment) ||
+    stableJson(summary.testRunner) !== stableJson(raw.testRunner) ||
+    summary.timestamp !== raw.timestamp ||
+    summary.url !== raw.url ||
     !Array.isArray(summary.violations) ||
     summary.violations.length !== 0 ||
     !Array.isArray(summary.incomplete)
   ) {
     problems.push(
       "accessibility summary is invalid or reports blocking violations",
+    );
+  }
+  if (stableJson(resultAccessibility) !== stableJson(summary)) {
+    problems.push(
+      "scenario result accessibility evidence contradicts its summary",
     );
   }
   if (
@@ -1452,6 +1846,7 @@ async function defaultInspectCapability({
   candidate,
 }) {
   const allFiles = await filesBelow(workspaceRoot);
+  const allFileSet = new Set(allFiles);
   const problems = [];
   const matchedFiles = new Set();
   for (const pattern of capability.required_files) {
@@ -1485,6 +1880,7 @@ async function defaultInspectCapability({
   }
 
   const observedScenarios = new Set();
+  const reportsByScenario = new Map();
   for (const reportPath of capability.result_reports) {
     if (!allFiles.includes(reportPath)) {
       problems.push(`missing result report ${reportPath}`);
@@ -1499,10 +1895,17 @@ async function defaultInspectCapability({
       continue;
     }
     problems.push(
-      ...validateResultReport(report, capability, candidate, reportPath),
+      ...validateResultReport(
+        report,
+        capability,
+        candidate,
+        reportPath,
+        allFileSet,
+      ),
     );
     if (typeof report.scenario === "string") {
       observedScenarios.add(report.scenario);
+      reportsByScenario.set(report.scenario, report);
     }
     if (
       capability.require_accessibility &&
@@ -1523,6 +1926,7 @@ async function defaultInspectCapability({
           ...validateNativeReport(
             await readJson(join(workspaceRoot, nativePath)),
             nativePath,
+            scenario,
           ),
         );
       } catch (error) {
@@ -1533,6 +1937,18 @@ async function defaultInspectCapability({
   for (const scenario of capability.scenarios) {
     if (!observedScenarios.has(scenario)) {
       problems.push(`missing passing result for scenario ${scenario}`);
+    }
+  }
+  const orderedReports = [...capability.scenarios]
+    .sort()
+    .map((scenario) => reportsByScenario.get(scenario))
+    .filter((report) => report !== undefined);
+  for (let index = 1; index < orderedReports.length; index += 1) {
+    if (
+      Date.parse(orderedReports[index].timestamps?.startedAt) <
+      Date.parse(orderedReports[index - 1].timestamps?.completedAt)
+    ) {
+      problems.push("scenario result timestamps are not monotonic");
     }
   }
   if (capability.require_accessibility) {
@@ -1548,6 +1964,7 @@ async function defaultInspectCapability({
             join(workspaceRoot, `${root}/accessibility-summary.md`),
             "utf8",
           ),
+          reportsByScenario.get("web-calculator")?.accessibility,
         ),
       );
     } catch (error) {
@@ -1625,6 +2042,9 @@ function repositoryNameFromRemote(remote) {
 }
 
 export async function inspectRepositoryState(repositoryRoot) {
+  await assertConfinedExistingPath(repositoryRoot, repositoryRoot, {
+    kind: "directory",
+  });
   const [topLevel, revision, status, remote, tracked] = await Promise.all([
     gitOutput(repositoryRoot, ["rev-parse", "--show-toplevel"]),
     gitOutput(repositoryRoot, ["rev-parse", "HEAD"]),
@@ -1645,12 +2065,20 @@ export async function inspectRepositoryState(repositoryRoot) {
     await Promise.all(
       trackedPaths.map(async (path) => [
         path,
-        digest(await readFile(join(repositoryRoot, path))),
+        digest(
+          await readFile(
+            await assertConfinedExistingPath(
+              repositoryRoot,
+              join(repositoryRoot, path),
+              { kind: "file" },
+            ),
+          ),
+        ),
       ]),
     ),
   );
   return {
-    root: resolve(topLevel.toString("utf8").trim()),
+    root: await realpath(topLevel.toString("utf8").trim()),
     revision: revision.toString("utf8").trim(),
     repositoryName: repositoryNameFromRemote(
       remote.toString("utf8").trim(),
@@ -1681,6 +2109,7 @@ function sourceInspectionFailures(inspection, observation, repositoryRoot) {
 }
 
 async function verifyWorkspaceRevision(workspaceRoot, trackedFiles) {
+  await validateWorkspaceLayout(workspaceRoot);
   const actualPaths = await filesBelow(workspaceRoot);
   const expectedPaths = [...trackedFiles.keys()].sort();
   if (stableJson(actualPaths) !== stableJson(expectedPaths)) {
@@ -1691,7 +2120,11 @@ async function verifyWorkspaceRevision(workspaceRoot, trackedFiles) {
   for (const [path, expectedDigest] of trackedFiles) {
     let contents;
     try {
-      contents = await readFile(join(workspaceRoot, path));
+      const trackedPath = join(workspaceRoot, path);
+      await assertConfinedExistingPath(workspaceRoot, trackedPath, {
+        kind: "file",
+      });
+      contents = await readFile(trackedPath);
     } catch {
       throw new Error(`Ephemeral workspace is missing tracked file ${path}`);
     }
@@ -1706,10 +2139,16 @@ async function verifyWorkspaceRevision(workspaceRoot, trackedFiles) {
 async function snapshotTree(root) {
   return new Map(
     await Promise.all(
-      (await filesBelow(root)).map(async (path) => [
-        path,
-        digest(await readFile(join(root, path))),
-      ]),
+      (await filesBelow(root)).map(async (path) => {
+        const absolutePath = join(root, path);
+        await assertConfinedExistingPath(root, absolutePath, {
+          kind: "file",
+        });
+        return [
+          path,
+          digest(await readFile(absolutePath)),
+        ];
+      }),
     ),
   );
 }
@@ -1900,6 +2339,7 @@ export async function qualifyPlaywrightCandidate({
   async function execute(step) {
     let result;
     try {
+      await validateStepConfinement(workspace.root, step);
       result = normalizeStepResult(await runStep(step));
     } catch (error) {
       result = {
@@ -1908,6 +2348,13 @@ export async function qualifyPlaywrightCandidate({
         warnings: [],
         error: error.message,
       };
+      if (
+        /(?:confinement|package boundary|package root|wrong type)/iu.test(
+          error.message,
+        )
+      ) {
+        globalFailures.push("WORKSPACE_BOUNDARY_VIOLATION");
+      }
     }
     transcript.push({ id: step.id, ...result });
     const warningTarget = step.capability_id === null
@@ -1917,11 +2364,15 @@ export async function qualifyPlaywrightCandidate({
       capabilityWarnings.get(capabilityId).push(...result.warnings);
     }
     if (workspace !== null && workspaceBaseline !== null) {
-      const boundaryChanges = await workspaceBoundaryViolations(
-        workspace.root,
-        workspaceBaseline,
-      );
-      if (boundaryChanges.length > 0) {
+      try {
+        const boundaryChanges = await workspaceBoundaryViolations(
+          workspace.root,
+          workspaceBaseline,
+        );
+        if (boundaryChanges.length > 0) {
+          globalFailures.push("WORKSPACE_BOUNDARY_VIOLATION");
+        }
+      } catch {
         globalFailures.push("WORKSPACE_BOUNDARY_VIOLATION");
       }
     }
