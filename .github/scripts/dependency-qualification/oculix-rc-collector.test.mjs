@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import {
   mkdir,
   mkdtemp,
@@ -9,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   canonicalDocument,
@@ -57,6 +59,7 @@ const RUNNER = {
 };
 const DIFF_DIGEST =
   "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const execFile = promisify(execFileCallback);
 
 async function fixture(name) {
   return readFile(new URL(name, FIXTURE_ROOT), "utf8");
@@ -276,9 +279,21 @@ test("missing tag or required asset evidence fails closed", async (context) => {
       reason_codes: ["OCULIX_RC_EVIDENCE_UNAVAILABLE"],
     });
   });
+  await context.test("asset origin", async () => {
+    const releases = await jsonFixture("releases.json");
+    releases[0].assets[0].browser_download_url =
+      "https://example.invalid/oculixide.jar";
+    const observation = await candidateObservation({
+      listReleases: async () => releases,
+    });
+    assert.deepEqual(observation.disposition, {
+      state: "unavailable",
+      reason_codes: ["OCULIX_RC_EVIDENCE_UNAVAILABLE"],
+    });
+  });
 });
 
-test("collection is read-only and stable selection stays prerelease-exclusive", async () => {
+test("stable and RC selectors remain behaviorally isolated", async () => {
   const reads = [];
   const stableScriptPath = resolve(
     REPOSITORY_ROOT,
@@ -303,6 +318,41 @@ test("collection is read-only and stable selection stays prerelease-exclusive", 
     after,
     /\.prerelease == false/u,
     "stable release selection must continue rejecting prereleases",
+  );
+  const stableSelection = await execFile(
+    "bash",
+    [
+      "-c",
+      String.raw`
+        source "$1"
+        date() {
+          case "$*" in
+            *"days ago"*) printf '2000000000\n' ;;
+            *) printf '1000000000\n' ;;
+          esac
+        }
+        gh() {
+          printf 'v5.0.0-rc1\t2026-01-01T00:00:00Z\n'
+          printf 'v4.0.1\t2026-01-01T00:00:00Z\n'
+        }
+        latest_eligible_release "oculix-org/Oculix" "4.0.0"
+      `,
+      "bash",
+      stableScriptPath,
+    ],
+    {
+      cwd: REPOSITORY_ROOT,
+      env: {
+        ...process.env,
+        GITHUB_REPOSITORY: "sbalswa/oculix",
+      },
+    },
+  );
+  assert.equal(stableSelection.stdout, "4.0.1");
+  const releases = await jsonFixture("releases.json");
+  assert.equal(
+    selectNewestOculixRc(releases, "4.0.0").version,
+    "4.1.0-rc10",
   );
 });
 
