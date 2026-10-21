@@ -273,11 +273,18 @@ test("plans package tests before every catalog-selected Cypress check", async ()
       covers.length === 1 &&
       ["smoke", "web-calculator"].includes(covers[0]),
   )) {
-    assert.deepEqual(check.arguments.slice(-2), ["--browser", "chrome"]);
+    assert.deepEqual(check.arguments.slice(-2), [
+      "--browser",
+      plan.selected_capabilities[0].browser_evidence.realpath,
+    ]);
     assert.equal(check.environment.E2E_BROWSER, "chrome");
     assert.equal(
       check.environment.CHROME_BIN,
       plan.selected_capabilities[0].browser_evidence.realpath,
+    );
+    assert.equal(
+      check.environment.CYPRESS_BROWSER_DIGEST,
+      plan.selected_capabilities[0].browser_evidence.digest,
     );
     assert.equal(
       check.environment.CYPRESS_INSTALL_BINARY,
@@ -322,6 +329,11 @@ test("strictly binds the entire prescribed qualification plan", async () => {
     (plan) => {
       plan.selected_capabilities[0]
         .accessibility_policy.blockingViolationCount = 99;
+    },
+    (plan) => {
+      plan.browser_launch_overlay.source_digests[
+        "tests/e2e/cypress/harness.mjs"
+      ] = `sha256:${"f".repeat(64)}`;
     },
     (plan) => {
       plan.node.locked = "26.0.0";
@@ -587,6 +599,47 @@ test("detects compound, plural, case-insensitive, and structured warnings", () =
     detectCypressWarnings('{"warningsCount":2,"warnings":[]}')
       .some((warning) => warning === "warningsCount: 2"),
   );
+  const structured = detectCypressWarnings(
+    JSON.stringify({
+      warnings: [
+        {
+          message: "structured object warning",
+          code: "CYPRESS_WARN",
+          count: 3,
+        },
+        { unexpected: "still blocks" },
+      ],
+    }),
+  );
+  assert.equal(structured.length, 2);
+  assert.ok(
+    structured.some(
+      (warning) =>
+        warning.includes("structured object warning") &&
+        warning.includes("code=CYPRESS_WARN") &&
+        warning.includes("count=3"),
+    ),
+  );
+  assert.ok(
+    structured.some((warning) => warning.includes("unexpected")),
+  );
+  assert.ok(
+    detectCypressWarnings(
+      '[{"message":"array warning","code":"W_ARRAY","count":1}]',
+    ).some(
+      (warning) =>
+        warning.includes("array warning") &&
+        warning.includes("code=W_ARRAY") &&
+        warning.includes("count=1"),
+    ),
+  );
+  assert.ok(
+    detectCypressWarnings(
+      '{"message":"object warning","code":"W_OBJECT","count":1}',
+    ).some((warning) => warning.includes("object warning")),
+  );
+  assert.deepEqual(detectCypressWarnings('{"warnings":[]}'), []);
+  assert.deepEqual(detectCypressWarnings("[]"), []);
 });
 
 async function copyCollectorInputs(source, destination) {
@@ -594,6 +647,8 @@ async function copyCollectorInputs(source, destination) {
     PACKAGE_PATH,
     LOCK_PATH,
     "tests/e2e/capabilities.json",
+    "tests/e2e/cypress/harness.mjs",
+    "tests/e2e/cypress/reporting.mjs",
     "mise/config.web-e2e.toml",
     "mise/mise.web-e2e.lock",
   ];
@@ -745,6 +800,8 @@ function scenarioReport(plan, capability, scenario) {
       videos: [`${base}/videos/${spec}.mp4`],
     },
     browser: {
+      executableDigest: capability.browser_evidence.digest,
+      executablePath: capability.browser_evidence.realpath,
       name: capability.browser,
       requested: capability.browser,
       selectionSource: "--browser",
@@ -851,6 +908,7 @@ function checkEvidence(check, sequence = 0) {
 function passingExecutor(plan, observed, overrides = {}) {
   let sequence = 0;
   return async (check, context) => {
+    await overrides.inspectCheck?.(check, context);
     observed.push({
       check,
       environment: context.environment,
@@ -883,7 +941,7 @@ function passingExecutor(plan, observed, overrides = {}) {
     }
     const currentSequence = sequence;
     sequence += 1;
-    const binding = {
+    const binding = check.browser_execution ?? {
       "file-evidence": {
         digest: check.expected_digest,
         locator: check.path,
@@ -925,10 +983,38 @@ test("qualifies every check in an ephemeral workspace without mutation", async (
     "utf8",
   );
   const observed = [];
+  let inspectedOverlay = false;
   const result = await qualifyCypressCandidate(collection, {
     executeCheck: passingExecutor(
       collection.qualification_plan,
       observed,
+      {
+        inspectCheck: async (check, context) => {
+          if (!check.covers.includes("smoke")) {
+            return;
+          }
+          inspectedOverlay = true;
+          const [harness, reporting] = await Promise.all([
+            readFile(
+              join(context.workspaceRoot, "tests/e2e/cypress/harness.mjs"),
+              "utf8",
+            ),
+            readFile(
+              join(
+                context.workspaceRoot,
+                "tests/e2e/cypress/reporting.mjs",
+              ),
+              "utf8",
+            ),
+          ]);
+          assert.match(
+            harness,
+            /browser: selection\.browserExecutable \?\? selection\.browser/u,
+          );
+          assert.match(reporting, /executableDigest:/u);
+          assert.match(reporting, /executablePath:/u);
+        },
+      },
     ),
     generatedAt: "2026-10-21T17:02:00Z",
     materializeWorkspace: materializeQualificationInputs,
@@ -955,6 +1041,7 @@ test("qualifies every check in an ephemeral workspace without mutation", async (
   );
   assert.equal(result.checks.length, collection.qualification_plan.checks.length);
   assert.ok(observed.length > 0);
+  assert.equal(inspectedOverlay, true);
   const workspaceRoot = observed[0].workspaceRoot;
   assert.ok(!workspaceRoot.startsWith(`${REPOSITORY_ROOT}/`));
   assert.ok(
@@ -962,6 +1049,27 @@ test("qualifies every check in an ephemeral workspace without mutation", async (
       ({ packageRoot }) =>
         packageRoot === join(workspaceRoot, "tests/e2e/cypress"),
     ),
+  );
+  assert.ok(
+    observed
+      .filter(({ check }) =>
+        check.covers.some((cover) =>
+          ["smoke", "web-calculator"].includes(cover),
+        ),
+      )
+      .every(
+        ({ check }) =>
+          check.arguments.at(-2) === "--browser" &&
+          check.arguments.at(-1) ===
+            collection.qualification_plan.selected_capabilities[0]
+              .browser_evidence.realpath,
+      ),
+  );
+  assert.equal(
+    result.checks.find(
+      ({ id }) => id === "cypress-reviewed-browser-launch",
+    ).status,
+    "pass",
   );
   assert.ok(
     observed.every(
@@ -1057,6 +1165,36 @@ test("binary and external Chrome execution must match reviewed evidence", async 
   assert.equal(
     installedResult.checks.find(
       ({ id }) => id === "cypress-installed-binary",
+    ).status,
+    "fail",
+  );
+
+  const forgedExecutionCollection = await collect();
+  const forgedExecution = await qualifyCypressCandidate(
+    forgedExecutionCollection,
+    {
+      executeCheck: passingExecutor(
+        forgedExecutionCollection.qualification_plan,
+        [],
+        {
+          binding: (check, binding) =>
+            check.covers.includes("smoke")
+              ? {
+                  ...binding,
+                  digest: `sha256:${"f".repeat(64)}`,
+                }
+              : binding,
+        },
+      ),
+      generatedAt: "2026-10-21T17:04:30Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    },
+  );
+  assert.equal(forgedExecution.validation.disposition.state, "blocked");
+  assert.equal(
+    forgedExecution.checks.find(
+      ({ id }) => id === "cypress-ubuntu-chrome-smoke",
     ).status,
     "fail",
   );
@@ -1168,10 +1306,11 @@ test("binary and external Chrome execution must match reviewed evidence", async 
       observed
         .filter(({ check }) => check.covers.includes("smoke"))
         .every(
-          ({ environment }) =>
+          ({ check, environment }) =>
             environment.CHROME_BIN === reviewedBrowser.realpath &&
             environment.CYPRESS_BROWSER_PATH ===
-              reviewedBrowser.realpath,
+              reviewedBrowser.realpath &&
+            check.arguments.at(-1) === reviewedBrowser.realpath,
         ),
     );
   } finally {
@@ -1189,6 +1328,14 @@ test("artifact semantics require complete scenario, browser, Node, accessibility
     },
     (reports) => {
       reports["web-calculator"].browser.version = "999.0.0.0";
+    },
+    (reports) => {
+      reports["web-calculator"].browser.executablePath =
+        "/tmp/unreviewed-chrome";
+    },
+    (reports) => {
+      reports["web-calculator"].browser.executableDigest =
+        `sha256:${"f".repeat(64)}`;
     },
     (reports) => {
       reports["web-calculator"].versions.node = "v26.0.0";

@@ -47,6 +47,8 @@ const PACKAGE_DIRECTORY = CYPRESS_PACKAGE_DIRECTORY;
 const PACKAGE_PATH = `${PACKAGE_DIRECTORY}/package.json`;
 const LOCK_PATH = `${PACKAGE_DIRECTORY}/package-lock.json`;
 const BINARY_POLICY_PATH = `${PACKAGE_DIRECTORY}/cypress.config.mjs`;
+const CYPRESS_HARNESS_PATH = `${PACKAGE_DIRECTORY}/harness.mjs`;
+const CYPRESS_REPORTING_PATH = `${PACKAGE_DIRECTORY}/reporting.mjs`;
 const CATALOG_PATH = "tests/e2e/capabilities.json";
 const NODE_CONFIG_PATH = "mise/config.web-e2e.toml";
 const NODE_LOCK_PATH = "mise/mise.web-e2e.lock";
@@ -837,6 +839,7 @@ function expectedPackage(name, currentVersion, currentLock, upstream) {
 }
 
 function qualificationChecks({
+  browserLaunchSources,
   capabilities,
   cypressBinary,
   node,
@@ -940,6 +943,15 @@ function qualificationChecks({
       covers: ["package-tests"],
       writes: [],
     },
+    {
+      id: "cypress-reviewed-browser-launch",
+      kind: "browser-launch-overlay",
+      scope: "global",
+      cwd: PACKAGE_DIRECTORY,
+      source_digests: structuredClone(browserLaunchSources),
+      covers: ["external-browser", "reviewed-browser-executable"],
+      writes: [CYPRESS_HARNESS_PATH, CYPRESS_REPORTING_PATH],
+    },
   ];
   for (const capability of capabilities) {
     checks.push({
@@ -968,15 +980,21 @@ function qualificationChecks({
           "tests/e2e/cypress/task.mjs",
           scenario,
           "--browser",
-          capability.browser,
+          capability.browser_evidence.realpath,
         ],
         cwd: ".",
         environment: {
           CHROME_BIN: capability.browser_evidence.realpath,
           CYPRESS_BROWSER_PATH: capability.browser_evidence.realpath,
+          CYPRESS_BROWSER_DIGEST: capability.browser_evidence.digest,
           CYPRESS_INSTALL_BINARY: cypressBinary.realpath,
           E2E_BROWSER: capability.browser,
           E2E_OS: capability.os,
+        },
+        browser_execution: {
+          digest: capability.browser_evidence.digest,
+          realpath: capability.browser_evidence.realpath,
+          version: capability.browser_evidence.version,
         },
         covers: [scenario],
         writes: [`${PACKAGE_DIRECTORY}/diagnostics`],
@@ -1028,6 +1046,7 @@ function qualificationPlanDigest(plan) {
 
 function qualificationPlan({
   axeMetadata,
+  browserLaunchSources,
   capabilities,
   cypressMetadata,
   cypressBinary,
@@ -1116,7 +1135,11 @@ function qualificationPlan({
     },
     node: structuredClone(node),
     selected_capabilities: selectedCapabilities,
+    browser_launch_overlay: {
+      source_digests: structuredClone(browserLaunchSources),
+    },
     checks: qualificationChecks({
+      browserLaunchSources,
       capabilities: selectedCapabilities,
       cypressBinary: binary,
       node,
@@ -1141,13 +1164,26 @@ export async function collectCypressCohort({
   const packageJson = await readJson(repositoryPath(root, PACKAGE_PATH));
   const lock = await readJson(repositoryPath(root, LOCK_PATH));
   const current = validatePackageFiles(packageJson, lock);
-  const [catalog, capabilityCatalog, nodeConfig, nodeLock] =
+  const [
+    catalog,
+    capabilityCatalog,
+    nodeConfig,
+    nodeLock,
+    cypressHarness,
+    cypressReporting,
+  ] =
     await Promise.all([
       readJson(repositoryPath(root, CATALOG_PATH)),
       readCapabilityCatalog(repositoryPath(root, CATALOG_PATH)),
       readFile(repositoryPath(root, NODE_CONFIG_PATH), "utf8"),
       readFile(repositoryPath(root, NODE_LOCK_PATH), "utf8"),
+      readFile(repositoryPath(root, CYPRESS_HARNESS_PATH), "utf8"),
+      readFile(repositoryPath(root, CYPRESS_REPORTING_PATH), "utf8"),
     ]);
+  const browserLaunchSources = {
+    [CYPRESS_HARNESS_PATH]: hash(cypressHarness),
+    [CYPRESS_REPORTING_PATH]: hash(cypressReporting),
+  };
   const capabilities = selectCapabilities(catalog);
   const node = parseNodeFiles(nodeConfig, nodeLock);
   const affectedCapabilities = capabilities.map(({ id }) => id);
@@ -1497,6 +1533,7 @@ export async function collectCypressCohort({
     observation,
     qualification_plan: qualificationPlan({
       axeMetadata: axeNpm.value,
+      browserLaunchSources,
       capabilities,
       cypressBinary:
         candidateBinary.value ?? currentBinary.value,
@@ -1716,14 +1753,30 @@ async function validateQualificationPrescription(
 ) {
   const plan = createCypressQualificationPlan(collection);
   const observation = collection.observation;
-  const [catalog, catalogBinding, packageJson, currentLock, nodeConfig, nodeLock] =
-    await Promise.all([
+  const [
+    catalog,
+    catalogBinding,
+    packageJson,
+    currentLock,
+    nodeConfig,
+    nodeLock,
+    cypressHarness,
+    cypressReporting,
+  ] = await Promise.all([
       readJson(repositoryPath(repositoryRoot, CATALOG_PATH)),
       readCapabilityCatalog(repositoryPath(repositoryRoot, CATALOG_PATH)),
       readJson(repositoryPath(repositoryRoot, PACKAGE_PATH)),
       readJson(repositoryPath(repositoryRoot, LOCK_PATH)),
       readFile(repositoryPath(repositoryRoot, NODE_CONFIG_PATH), "utf8"),
       readFile(repositoryPath(repositoryRoot, NODE_LOCK_PATH), "utf8"),
+      readFile(
+        repositoryPath(repositoryRoot, CYPRESS_HARNESS_PATH),
+        "utf8",
+      ),
+      readFile(
+        repositoryPath(repositoryRoot, CYPRESS_REPORTING_PATH),
+        "utf8",
+      ),
     ]);
   validateDocument(observation, {
     capabilityIds: catalogBinding.ids,
@@ -1770,6 +1823,10 @@ async function validateQualificationPrescription(
   };
   const expected = qualificationPlan({
     axeMetadata,
+    browserLaunchSources: {
+      [CYPRESS_HARNESS_PATH]: hash(cypressHarness),
+      [CYPRESS_REPORTING_PATH]: hash(cypressReporting),
+    },
     browserEvidence,
     capabilities: selectCapabilities(catalog),
     cypressBinary,
@@ -1831,6 +1888,127 @@ async function applyCandidatePackages(plan, workspaceRoot) {
   }
   packageJson.allowScripts[`cypress@${plan.cypress_binary.version}`] = true;
   await writeFile(path, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
+}
+
+function replaceQualificationSource(source, before, after, name) {
+  if (source.split(before).length !== 2) {
+    throw new Error(
+      `Cypress qualification browser overlay cannot patch ${name}`,
+    );
+  }
+  return source.replace(before, after);
+}
+
+async function installReviewedBrowserLaunchOverlay(check, workspaceRoot) {
+  const sources = {};
+  for (const [path, expectedDigest] of Object.entries(
+    check.source_digests,
+  )) {
+    const source = await readFile(repositoryPath(workspaceRoot, path), "utf8");
+    if (hash(source) !== expectedDigest) {
+      throw new Error(
+        `Cypress qualification browser overlay source changed: ${path}`,
+      );
+    }
+    sources[path] = source;
+  }
+
+  let harness = sources[CYPRESS_HARNESS_PATH];
+  harness = replaceQualificationSource(
+    harness,
+    'import { dirname, resolve } from "node:path";',
+    'import { dirname, isAbsolute, resolve } from "node:path";',
+    CYPRESS_HARNESS_PATH,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `  const requestedBrowser =
+    argumentBrowser ?? environment.E2E_BROWSER ?? DEFAULT_BROWSER;
+  const browser = requestedBrowser.trim().toLowerCase();
+  if (!SUPPORTED_BROWSERS.has(browser)) {`,
+    `  const browserArgument =
+    argumentBrowser ?? environment.E2E_BROWSER ?? DEFAULT_BROWSER;
+  const browserExecutable =
+    argumentBrowser !== undefined && isAbsolute(argumentBrowser)
+      ? resolve(argumentBrowser)
+      : null;
+  const requestedBrowser =
+    browserExecutable === null
+      ? browserArgument
+      : environment.E2E_BROWSER ?? DEFAULT_BROWSER;
+  const browser = requestedBrowser.trim().toLowerCase();
+  if (
+    browserExecutable !== null &&
+    !environment.CYPRESS_BROWSER_DIGEST
+  ) {
+    throw new Error(
+      "CYPRESS_BROWSER_DIGEST is required for an explicit browser path",
+    );
+  }
+  if (!SUPPORTED_BROWSERS.has(browser)) {`,
+    `${CYPRESS_HARNESS_PATH} browser selection`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    `  return {
+    browser,
+    scenario,`,
+    `  return {
+    browser,
+    browserExecutable,
+    browserExecutableDigest:
+      browserExecutable === null
+        ? null
+        : environment.CYPRESS_BROWSER_DIGEST,
+    scenario,`,
+    `${CYPRESS_HARNESS_PATH} selection result`,
+  );
+  harness = replaceQualificationSource(
+    harness,
+    "      browser: selection.browser,",
+    "      browser: selection.browserExecutable ?? selection.browser,",
+    `${CYPRESS_HARNESS_PATH} Cypress launch`,
+  );
+
+  let reporting = sources[CYPRESS_REPORTING_PATH];
+  reporting = replaceQualificationSource(
+    reporting,
+    `  return {
+    name: result?.browserName ?? selection.browser,
+    requested: selection.browser,
+    selectionSource: selection.source,
+    version: result?.browserVersion ?? null,
+  };`,
+    `  return {
+    executableDigest: selection.browserExecutableDigest ?? null,
+    executablePath: selection.browserExecutable ?? null,
+    name: result?.browserName ?? selection.browser,
+    requested: selection.browser,
+    selectionSource: selection.source,
+    version: result?.browserVersion ?? null,
+  };`,
+    `${CYPRESS_REPORTING_PATH} browser evidence`,
+  );
+
+  await Promise.all([
+    writeFile(
+      repositoryPath(workspaceRoot, CYPRESS_HARNESS_PATH),
+      harness,
+      "utf8",
+    ),
+    writeFile(
+      repositoryPath(workspaceRoot, CYPRESS_REPORTING_PATH),
+      reporting,
+      "utf8",
+    ),
+  ]);
+  return {
+    after: {
+      [CYPRESS_HARNESS_PATH]: hash(harness),
+      [CYPRESS_REPORTING_PATH]: hash(reporting),
+    },
+    before: structuredClone(check.source_digests),
+  };
 }
 
 async function treeEntries(root, directory = root) {
@@ -2324,10 +2502,41 @@ async function verifyArtifactSemantics(plan, check, workspaceRoot) {
       report.browser?.name !== capability.browser ||
       report.browser?.selectionSource !== "--browser" ||
       report.browser?.version !== capability.browser_evidence.version ||
+      report.browser?.executablePath !==
+        capability.browser_evidence.realpath ||
+      report.browser?.executableDigest !==
+        capability.browser_evidence.digest ||
       report.operatingSystem?.requested !== capability.os
     ) {
       throw new Error(
         `${reportPath} browser identity does not match reviewed evidence`,
+      );
+    }
+    const scenarioCheck = plan.checks.find(
+      ({ id }) => id === `${capability.id}-${report.scenario}`,
+    );
+    if (
+      scenarioCheck === undefined ||
+      JSON.stringify(scenarioCheck.arguments.slice(-2)) !==
+        JSON.stringify([
+          "--browser",
+          capability.browser_evidence.realpath,
+        ]) ||
+      scenarioCheck.environment.CYPRESS_BROWSER_PATH !==
+        capability.browser_evidence.realpath ||
+      scenarioCheck.environment.CYPRESS_BROWSER_DIGEST !==
+        capability.browser_evidence.digest ||
+      JSON.stringify(stableValue(scenarioCheck.browser_execution)) !==
+        JSON.stringify(
+          stableValue({
+            digest: capability.browser_evidence.digest,
+            realpath: capability.browser_evidence.realpath,
+            version: capability.browser_evidence.version,
+          }),
+        )
+    ) {
+      throw new Error(
+        `${reportPath} was not launched with the reviewed browser path`,
       );
     }
     if (
@@ -2440,7 +2649,11 @@ export function detectCypressWarnings(output) {
   const completeOutput = output.trim();
   if (completeOutput.length > 0) {
     try {
-      return sortedUnique(structuredWarnings(JSON.parse(completeOutput)));
+      return sortedUnique(
+        structuredWarnings(JSON.parse(completeOutput), {
+          rootContext: true,
+        }),
+      );
     } catch {
       // Mixed or unstructured command output is processed line by line.
     }
@@ -2452,7 +2665,11 @@ export function detectCypressWarnings(output) {
       continue;
     }
     try {
-      warnings.push(...structuredWarnings(JSON.parse(line)));
+      warnings.push(
+        ...structuredWarnings(JSON.parse(line), {
+          rootContext: true,
+        }),
+      );
       continue;
     } catch {
       // Continue with text detection for non-JSON command output.
@@ -2473,27 +2690,68 @@ function warningDescription(value) {
     return value.trim();
   }
   if (value !== null && typeof value === "object") {
-    if (typeof value.message === "string") {
-      return value.message.trim();
+    const details = [];
+    for (const key of [
+      "message",
+      "title",
+      "code",
+      "count",
+      "warningCount",
+      "warningsCount",
+    ]) {
+      const entry = value[key];
+      if (
+        (typeof entry === "string" && entry.trim().length > 0) ||
+        typeof entry === "number"
+      ) {
+        details.push(
+          key === "message"
+            ? String(entry).trim()
+            : `${key}=${String(entry).trim()}`,
+        );
+      }
     }
-    if (typeof value.title === "string") {
-      return value.title.trim();
+    if (details.length > 0) {
+      return details.join("; ");
     }
     return JSON.stringify(stableValue(value));
   }
   return String(value);
 }
 
-function structuredWarnings(value, { warningContext = false } = {}) {
+function structuredWarnings(
+  value,
+  { rootContext = false, warningContext = false } = {},
+) {
   if (value === null || value === undefined) {
     return [];
   }
   if (Array.isArray(value)) {
     return value.flatMap((entry) =>
-      structuredWarnings(entry, { warningContext }));
+      structuredWarnings(entry, {
+        warningContext: warningContext || rootContext,
+      }));
   }
   if (typeof value !== "object") {
     return warningContext ? [warningDescription(value)] : [];
+  }
+  if (warningContext) {
+    return Object.keys(value).length === 0
+      ? []
+      : [warningDescription(value)].filter(Boolean);
+  }
+  if (
+    rootContext &&
+    Object.keys(value).some((key) =>
+      [
+        "code",
+        "count",
+        "message",
+        "title",
+      ].includes(key.toLowerCase()),
+    )
+  ) {
+    return [warningDescription(value)].filter(Boolean);
   }
   const warnings = [];
   const level = value.level ?? value.severity ?? value.type;
@@ -2567,6 +2825,12 @@ function checkBinding(check, {
       version,
     };
   }
+  if (
+    check.kind === "command" &&
+    check.browser_execution !== undefined
+  ) {
+    return structuredClone(check.browser_execution);
+  }
   return undefined;
 }
 
@@ -2596,6 +2860,12 @@ function expectedCheckBinding(check) {
     return {
       version: check.expected_version,
     };
+  }
+  if (
+    check.kind === "command" &&
+    check.browser_execution !== undefined
+  ) {
+    return structuredClone(check.browser_execution);
   }
   return undefined;
 }
@@ -2954,6 +3224,43 @@ export async function qualifyCypressCandidate(
                 check,
                 observation.repository.revision,
                 JSON.stringify(provenance),
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        } catch (error) {
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "fail",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                error.message,
+                startedAt,
+                completedAt,
+              ),
+            ],
+          };
+        }
+      } else if (check.kind === "browser-launch-overlay") {
+        const startedAt = new Date().toISOString();
+        try {
+          const overlay = await installReviewedBrowserLaunchOverlay(
+            check,
+            workspaceRoot,
+          );
+          const completedAt = new Date().toISOString();
+          raw = {
+            status: "pass",
+            warnings: [],
+            evidence: [
+              commandEvidence(
+                check,
+                observation.repository.revision,
+                JSON.stringify(overlay),
                 startedAt,
                 completedAt,
               ),
