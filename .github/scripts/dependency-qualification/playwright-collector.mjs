@@ -10,6 +10,7 @@ import {
   readdir,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -44,6 +45,16 @@ const PACKAGE_TESTS = [
   "process-runner.test.mjs",
   "reporting.test.mjs",
 ];
+const INSTALL_STAMP = "node_modules/.oculix-package-lock.sha256";
+const EXECUTION_SOURCE_FILES = [
+  "harness.mjs",
+  "playwright.config.mjs",
+  "process-runner.mjs",
+  "reporting.mjs",
+  "result-reporter.mjs",
+  "smoke.spec.mjs",
+  "web-calculator.spec.mjs",
+].map((path) => `${PACKAGE_DIRECTORY}/${path}`);
 const RUNTIME_METADATA_PREFIX = "OCULIX_PLAYWRIGHT_RUNTIME=";
 const RUNTIME_METADATA_SCRIPT = [
   'import { chromium } from "playwright-core";',
@@ -962,37 +973,15 @@ export function createPlaywrightQualificationPlan({
         npm_config_cache: join(packageRoot, ".npm-cache"),
       },
     },
-    preparation: capabilities.flatMap((capability) => [
-      {
-        id: `prepare-packages-${capability.id}`,
-        phase: "prepare",
-        command: "npm",
-        arguments: [
-          "ci",
-          "--ignore-scripts",
-          "--no-audit",
-          "--no-fund",
-        ],
-        cwd: packageRoot,
-        capability_id: capability.id,
-        environment: environmentFor(capability),
-      },
-      {
-        id: `prepare-browser-${capability.id}`,
-        phase: "prepare",
-        command: "npm",
-        arguments: [
-          "exec",
-          "--",
-          "playwright",
-          "install",
-          capability.browser,
-        ],
-        cwd: packageRoot,
-        capability_id: capability.id,
-        environment: environmentFor(capability),
-      },
-    ]),
+    preparation: capabilities.map((capability) => ({
+      id: `prepare-harness-${capability.id}`,
+      phase: "prepare",
+      command: process.execPath,
+      arguments: [harness, "prepare", capability.browser],
+      cwd: packageRoot,
+      capability_id: capability.id,
+      environment: environmentFor(capability),
+    })),
     runtime_metadata: capabilities.map((capability) => ({
       id: `runtime-${capability.id}`,
       phase: "runtime-metadata",
@@ -1250,6 +1239,60 @@ async function verifyAppliedCandidate(workspaceRoot, candidate) {
     packages: applied.packages,
     tarballs: applied.tarballs,
   };
+}
+
+function sha256Hex(contents) {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function preparationStampPath(packageRoot, capability) {
+  return join(
+    packageRoot,
+    "node_modules",
+    `.oculix-playwright-${process.platform}-${process.arch}-` +
+      `${capability.browser}.json`,
+  );
+}
+
+async function verifyHarnessPreparation({
+  workspaceRoot,
+  capability,
+}) {
+  const packageRoot = join(workspaceRoot, PACKAGE_DIRECTORY);
+  const lockPath = join(packageRoot, "package-lock.json");
+  const installStampPath = join(packageRoot, INSTALL_STAMP);
+  const preparationPath = preparationStampPath(packageRoot, capability);
+  await Promise.all([
+    assertConfinedExistingPath(packageRoot, lockPath, { kind: "file" }),
+    assertConfinedExistingPath(packageRoot, installStampPath, {
+      kind: "file",
+    }),
+    assertConfinedExistingPath(packageRoot, preparationPath, {
+      kind: "file",
+    }),
+  ]);
+  const lockHash = sha256Hex(await readFile(lockPath));
+  const installedHash = (await readFile(installStampPath, "utf8")).trim();
+  const preparation = await readJson(preparationPath);
+  const expected = {
+    arch: process.arch,
+    lockHash,
+    operatingSystem: capability.os,
+    platform: process.platform,
+    project: capability.browser,
+  };
+  if (
+    installedHash !== lockHash ||
+    !isObject(preparation) ||
+    !Object.entries(expected).every(
+      ([key, value]) => preparation[key] === value,
+    )
+  ) {
+    throw new Error(
+      `Playwright harness preparation stamp is missing or stale for ` +
+        capability.id,
+    );
+  }
 }
 
 function pathInside(parent, child) {
@@ -1547,12 +1590,129 @@ function validPng(contents) {
   return sawIdat && sawIend;
 }
 
+function ebmlVint(contents, offset, { identifier = false } = {}) {
+  if (offset >= contents.length) {
+    return null;
+  }
+  const first = contents[offset];
+  let width = 1;
+  let marker = 0x80;
+  while (width <= 8 && (first & marker) === 0) {
+    width += 1;
+    marker >>= 1;
+  }
+  if (
+    width > 8 ||
+    (identifier && width > 4) ||
+    offset + width > contents.length
+  ) {
+    return null;
+  }
+  if (identifier) {
+    return {
+      width,
+      value: contents.subarray(offset, offset + width).toString("hex"),
+    };
+  }
+  let value = BigInt(first & (marker - 1));
+  for (let index = 1; index < width; index += 1) {
+    value = (value << 8n) | BigInt(contents[offset + index]);
+  }
+  const unknown = value === (1n << BigInt(width * 7)) - 1n;
+  return { width, value: unknown ? null : value };
+}
+
+function ebmlElement(contents, offset, limit = contents.length) {
+  const identifier = ebmlVint(contents, offset, { identifier: true });
+  if (identifier === null) {
+    return null;
+  }
+  const sizeOffset = offset + identifier.width;
+  const size = ebmlVint(contents, sizeOffset);
+  if (size === null) {
+    return null;
+  }
+  const dataStart = sizeOffset + size.width;
+  let end = limit;
+  if (size.value !== null) {
+    if (size.value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return null;
+    }
+    end = dataStart + Number(size.value);
+  }
+  if (dataStart > limit || end > limit || end < dataStart) {
+    return null;
+  }
+  return {
+    dataStart,
+    end,
+    id: identifier.value,
+    unknownSize: size.value === null,
+  };
+}
+
+function ebmlChildren(contents, start, end) {
+  const children = [];
+  let offset = start;
+  while (offset < end) {
+    const child = ebmlElement(contents, offset, end);
+    if (child === null || child.end <= offset) {
+      return null;
+    }
+    children.push(child);
+    offset = child.end;
+    if (child.unknownSize && offset !== end) {
+      return null;
+    }
+  }
+  return offset === end ? children : null;
+}
+
 function validWebm(contents) {
-  return contents.length > 8 &&
-    contents.subarray(0, 4).equals(
-      Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
-    ) &&
-    contents.subarray(0, 4096).includes(Buffer.from("webm"));
+  const header = ebmlElement(contents, 0);
+  if (
+    header === null ||
+    header.id !== "1a45dfa3" ||
+    header.unknownSize
+  ) {
+    return false;
+  }
+  const headerChildren = ebmlChildren(
+    contents,
+    header.dataStart,
+    header.end,
+  );
+  if (
+    headerChildren === null ||
+    !headerChildren.some(
+      (child) =>
+        child.id === "4282" &&
+        contents.subarray(child.dataStart, child.end).toString("ascii") ===
+          "webm",
+    )
+  ) {
+    return false;
+  }
+  const segment = ebmlElement(contents, header.end);
+  if (
+    segment === null ||
+    segment.id !== "18538067" ||
+    segment.end !== contents.length ||
+    segment.dataStart === segment.end
+  ) {
+    return false;
+  }
+  const segmentChildren = ebmlChildren(
+    contents,
+    segment.dataStart,
+    segment.end,
+  );
+  if (segmentChildren === null) {
+    return false;
+  }
+  const childIds = new Set(segmentChildren.map(({ id }) => id));
+  return ["1549a966", "1654ae6b", "1f43b675"].every((id) =>
+    childIds.has(id));
 }
 
 async function validateArtifactSemantics(workspaceRoot, path) {
@@ -1695,21 +1855,41 @@ function validateResultReport(
   return problems;
 }
 
-function nativeReportFiles(suites) {
+function nativeReportFiles(suites, { specificationsOnly = false } = {}) {
   return suites.flatMap((suite) => [
-    ...(typeof suite?.file === "string" ? [suite.file] : []),
-    ...nativeReportFiles(Array.isArray(suite?.suites) ? suite.suites : []),
+    ...(!specificationsOnly &&
+      typeof suite?.file === "string" &&
+      suite.file.length > 0
+      ? [suite.file]
+      : []),
+    ...nativeReportFiles(
+      Array.isArray(suite?.suites) ? suite.suites : [],
+      { specificationsOnly },
+    ),
     ...(Array.isArray(suite?.specs)
       ? suite.specs.flatMap((specification) =>
-          typeof specification?.file === "string"
+          typeof specification?.file === "string" &&
+            specification.file.length > 0
             ? [specification.file]
             : [])
       : []),
   ]);
 }
 
+function nativeFileMatchesScenario(file, expectedSpecification) {
+  const normalized = file.replaceAll("\\", "/");
+  return normalized === expectedSpecification ||
+    normalized.endsWith(`/${expectedSpecification}`);
+}
+
 function validateNativeReport(report, path, scenario) {
   const expectedSpecification = `${scenario}.spec.mjs`;
+  const reportFiles = Array.isArray(report?.suites)
+    ? nativeReportFiles(report.suites)
+    : [];
+  const specificationFiles = Array.isArray(report?.suites)
+    ? nativeReportFiles(report.suites, { specificationsOnly: true })
+    : [];
   if (
     !isObject(report) ||
     !isObject(report.config) ||
@@ -1724,12 +1904,10 @@ function validateNativeReport(report, path, scenario) {
     ) ||
     report.stats.expected === 0 ||
     report.stats.unexpected !== 0 ||
-    !nativeReportFiles(report.suites).some(
-      (file) =>
-        file === expectedSpecification ||
-        file.endsWith(`/${expectedSpecification}`) ||
-        file.endsWith(`\\${expectedSpecification}`),
-    )
+    specificationFiles.length === 0 ||
+    reportFiles.length === 0 ||
+    !reportFiles.every((file) =>
+      nativeFileMatchesScenario(file, expectedSpecification))
   ) {
     return [`native Playwright report ${path} is invalid or unsuccessful`];
   }
@@ -1774,11 +1952,71 @@ const EXPECTED_ACCESSIBILITY_POLICY = {
   ],
 };
 
+function normalizedAccessibilityFinding(rule) {
+  return {
+    description: rule.description,
+    help: rule.help,
+    helpUrl: rule.helpUrl,
+    id: rule.id,
+    impact: rule.impact,
+    nodes: rule.nodes.map((node) => ({
+      failureSummary: node.failureSummary,
+      html: node.html,
+      impact: node.impact,
+      target: node.target,
+    })),
+    tags: rule.tags,
+  };
+}
+
+function accessibilityFindingMarkdown(title, findings) {
+  const lines = [`## ${title}`, ""];
+  if (findings.length === 0) {
+    lines.push("None.", "");
+    return lines;
+  }
+  for (const item of findings) {
+    lines.push(
+      `- \`${item.id}\` (${item.impact ?? "impact unknown"}): ` +
+        `${item.help} — ${item.nodes.length} node(s)`,
+    );
+  }
+  lines.push("");
+  return lines;
+}
+
+function expectedAccessibilityMarkdown(summary) {
+  return [
+    "# Playwright accessibility audit",
+    "",
+    `- Status: **${summary.status}**`,
+    `- Policy: ${summary.policy.automatedStandard}`,
+    `- Violations: ${summary.counts.violations.rules} rule(s) / ` +
+      `${summary.counts.violations.nodes} affected node(s) (blocking)`,
+    `- Incomplete/manual review: ${summary.counts.incomplete.rules} ` +
+      `rule(s) / ${summary.counts.incomplete.nodes} affected node(s) ` +
+      "(nonblocking)",
+    `- Passes: ${summary.counts.passes.rules} rule(s) / ` +
+      `${summary.counts.passes.nodes} affected node(s)`,
+    `- Inapplicable: ${summary.counts.inapplicable.rules} rule(s) / ` +
+      `${summary.counts.inapplicable.nodes} affected node(s)`,
+    "",
+    ...accessibilityFindingMarkdown("Violations", summary.violations),
+    ...accessibilityFindingMarkdown(
+      "Incomplete findings requiring manual review",
+      summary.incomplete,
+    ),
+    "Automated auditing supplements rather than replaces manual accessibility review.",
+    "",
+  ].join("\n");
+}
+
 function validateAccessibility(
   raw,
   summary,
   markdown,
   resultAccessibility,
+  scenarioTimestamps,
 ) {
   const problems = [];
   const computedCounts = Object.fromEntries(
@@ -1787,6 +2025,17 @@ function validateAccessibility(
       findingCounts(raw?.[key]),
     ]),
   );
+  const normalizedIncomplete = Array.isArray(raw?.incomplete) &&
+      raw.incomplete.every((finding) => Array.isArray(finding?.nodes))
+    ? raw.incomplete.map(normalizedAccessibilityFinding)
+    : null;
+  const normalizedViolations = Array.isArray(raw?.violations) &&
+      raw.violations.every((finding) => Array.isArray(finding?.nodes))
+    ? raw.violations.map(normalizedAccessibilityFinding)
+    : null;
+  const auditTime = Date.parse(raw?.timestamp);
+  const scenarioStart = Date.parse(scenarioTimestamps?.startedAt);
+  const scenarioEnd = Date.parse(scenarioTimestamps?.completedAt);
   if (
     !isObject(raw) ||
     !isObject(raw.testEngine) ||
@@ -1797,9 +2046,16 @@ function validateAccessibility(
     !["violations", "incomplete", "passes", "inapplicable"].every(
       (key) => Array.isArray(raw[key]),
     ) ||
-    raw.violations.length !== 0
+    raw.violations.length !== 0 ||
+    !Number.isFinite(auditTime) ||
+    !Number.isFinite(scenarioStart) ||
+    !Number.isFinite(scenarioEnd) ||
+    auditTime < scenarioStart ||
+    auditTime > scenarioEnd
   ) {
-    problems.push("raw accessibility report is invalid or has violations");
+    problems.push(
+      "raw accessibility report is invalid, outside its scenario, or has violations",
+    );
   }
   if (
     !isObject(summary) ||
@@ -1819,7 +2075,9 @@ function validateAccessibility(
     summary.url !== raw.url ||
     !Array.isArray(summary.violations) ||
     summary.violations.length !== 0 ||
-    !Array.isArray(summary.incomplete)
+    !Array.isArray(summary.incomplete) ||
+    stableJson(summary.violations) !== stableJson(normalizedViolations) ||
+    stableJson(summary.incomplete) !== stableJson(normalizedIncomplete)
   ) {
     problems.push(
       "accessibility summary is invalid or reports blocking violations",
@@ -1832,10 +2090,12 @@ function validateAccessibility(
   }
   if (
     typeof markdown !== "string" ||
-    !/Status:\s+\*\*passed\*\*/iu.test(markdown) ||
-    !/Violations:\s+0 rule\(s\)\s+\/\s+0 affected node\(s\)/iu.test(markdown)
+    markdown.replaceAll("\r\n", "\n") !==
+      expectedAccessibilityMarkdown(summary)
   ) {
-    problems.push("accessibility Markdown summary does not report zero violations");
+    problems.push(
+      "accessibility Markdown summary contradicts its counts or findings",
+    );
   }
   return problems;
 }
@@ -1934,6 +2194,23 @@ async function defaultInspectCapability({
       }
     }
   }
+  const expectedNativePaths = new Set(
+    capability.scenarios.map(
+      (scenario) =>
+        `${PACKAGE_DIRECTORY}/test-results/${scenario}/` +
+          "playwright-report.json",
+    ),
+  );
+  const nativePaths = allFiles.filter((path) =>
+    path.endsWith("/playwright-report.json"));
+  if (
+    nativePaths.length !== expectedNativePaths.size ||
+    nativePaths.some((path) => !expectedNativePaths.has(path))
+  ) {
+    problems.push(
+      "native Playwright reports do not map one-to-one to scenarios",
+    );
+  }
   for (const scenario of capability.scenarios) {
     if (!observedScenarios.has(scenario)) {
       problems.push(`missing passing result for scenario ${scenario}`);
@@ -1965,6 +2242,7 @@ async function defaultInspectCapability({
             "utf8",
           ),
           reportsByScenario.get("web-calculator")?.accessibility,
+          reportsByScenario.get("web-calculator")?.timestamps,
         ),
       );
     } catch (error) {
@@ -2136,6 +2414,53 @@ async function verifyWorkspaceRevision(workspaceRoot, trackedFiles) {
   }
 }
 
+async function executionSourceBindings(trackedFiles) {
+  const bindings = new Map();
+  for (const path of EXECUTION_SOURCE_FILES) {
+    const expectedDigest = trackedFiles.get(path);
+    if (expectedDigest === undefined) {
+      throw new Error(`Repository revision is missing execution file ${path}`);
+    }
+    bindings.set(path, expectedDigest);
+  }
+  return bindings;
+}
+
+async function bindAppliedCandidateFiles(
+  workspaceRoot,
+  bindings,
+) {
+  for (const path of [PACKAGE_PATH, LOCK_PATH]) {
+    const absolutePath = join(workspaceRoot, path);
+    await assertConfinedExistingPath(
+      join(workspaceRoot, PACKAGE_DIRECTORY),
+      absolutePath,
+      { kind: "file" },
+    );
+    bindings.set(path, digest(await readFile(absolutePath)));
+  }
+}
+
+async function verifyExecutionBindings(workspaceRoot, bindings) {
+  for (const [path, expectedDigest] of bindings) {
+    const absolutePath = join(workspaceRoot, path);
+    try {
+      await assertConfinedExistingPath(
+        join(workspaceRoot, PACKAGE_DIRECTORY),
+        absolutePath,
+        { kind: "file" },
+      );
+      if (digest(await readFile(absolutePath)) !== expectedDigest) {
+        throw new Error("digest mismatch");
+      }
+    } catch {
+      throw new Error(
+        `Candidate execution evidence changed after binding: ${path}`,
+      );
+    }
+  }
+}
+
 async function snapshotTree(root) {
   return new Map(
     await Promise.all(
@@ -2196,14 +2521,40 @@ async function snapshotSource(repositoryRoot) {
   );
 }
 
+async function assertRestoreParentDirectories(repositoryRoot, path) {
+  const segments = path.split("/");
+  let current = repositoryRoot;
+  for (const segment of segments.slice(0, -1)) {
+    current = join(current, segment);
+    const status = await lstat(current);
+    if (!status.isDirectory() || status.isSymbolicLink()) {
+      throw new Error(
+        `Refusing to restore through a non-directory or symlink: ${current}`,
+      );
+    }
+  }
+}
+
 async function restoreChangedSource(repositoryRoot, snapshot) {
   const changed = [];
   for (const [path, original] of snapshot) {
     const absolutePath = join(repositoryRoot, path);
+    await assertRestoreParentDirectories(repositoryRoot, path);
     let current;
     try {
-      current = await readFile(absolutePath);
-    } catch {
+      const status = await lstat(absolutePath);
+      if (status.isSymbolicLink()) {
+        current = null;
+        await unlink(absolutePath);
+      } else if (status.isFile()) {
+        current = await readFile(absolutePath);
+      } else {
+        current = null;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
       current = null;
     }
     if (current === null || !current.equals(original)) {
@@ -2335,12 +2686,19 @@ export async function qualifyPlaywrightCandidate({
   let sourceSnapshot = null;
   let sourceAccepted = false;
   let workspaceBaseline = null;
+  let executionBindings = null;
 
   async function execute(step) {
     let result;
     try {
       await validateStepConfinement(workspace.root, step);
+      if (executionBindings !== null) {
+        await verifyExecutionBindings(workspace.root, executionBindings);
+      }
       result = normalizeStepResult(await runStep(step));
+      if (executionBindings !== null) {
+        await verifyExecutionBindings(workspace.root, executionBindings);
+      }
     } catch (error) {
       result = {
         exitCode: 1,
@@ -2354,6 +2712,10 @@ export async function qualifyPlaywrightCandidate({
         )
       ) {
         globalFailures.push("WORKSPACE_BOUNDARY_VIOLATION");
+      } else if (/execution evidence changed after binding/iu.test(
+        error.message,
+      )) {
+        globalFailures.push("CANDIDATE_EVIDENCE_MUTATED");
       }
     }
     transcript.push({ id: step.id, ...result });
@@ -2412,6 +2774,9 @@ export async function qualifyPlaywrightCandidate({
             sourceInspection.trackedFiles,
           );
           workspaceBaseline = await snapshotTree(workspace.root);
+          executionBindings = await executionSourceBindings(
+            sourceInspection.trackedFiles,
+          );
         } catch {
           globalFailures.push("WORKSPACE_REVISION_MISMATCH");
         }
@@ -2437,6 +2802,14 @@ export async function qualifyPlaywrightCandidate({
           transcript.find(
             (step) => step.id === plan.apply.id,
           ).installMetadata = installMetadata;
+          await bindAppliedCandidateFiles(
+            workspace.root,
+            executionBindings,
+          );
+          await verifyExecutionBindings(
+            workspace.root,
+            executionBindings,
+          );
         } catch {
           globalFailures.push("APPLICATION_FAILED");
         }
@@ -2450,6 +2823,18 @@ export async function qualifyPlaywrightCandidate({
           capabilityFailures.get(step.capability_id).push(
             "PREPARATION_FAILED",
           );
+        } else {
+          try {
+            await verifyHarnessPreparation({
+              workspaceRoot: workspace.root,
+              capability: selectedPlaywrightCapabilities(catalog)
+                .find(({ id }) => id === step.capability_id),
+            });
+          } catch {
+            capabilityFailures.get(step.capability_id).push(
+              "PREPARATION_FAILED",
+            );
+          }
         }
       }
 
@@ -2523,12 +2908,27 @@ export async function qualifyPlaywrightCandidate({
               "ARTIFACT_VALIDATION_FAILED",
             );
           }
+          try {
+            await verifyExecutionBindings(
+              workspace.root,
+              executionBindings,
+            );
+          } catch {
+            globalFailures.push("CANDIDATE_EVIDENCE_MUTATED");
+          }
         }
       }
     }
   } catch {
     globalFailures.push("QUALIFICATION_INFRASTRUCTURE_FAILED");
   } finally {
+    if (workspace !== null && executionBindings !== null) {
+      try {
+        await verifyExecutionBindings(workspace.root, executionBindings);
+      } catch {
+        globalFailures.push("CANDIDATE_EVIDENCE_MUTATED");
+      }
+    }
     const changedSource = sourceSnapshot === null
       ? []
       : await restoreChangedSource(repositoryRoot, sourceSnapshot);

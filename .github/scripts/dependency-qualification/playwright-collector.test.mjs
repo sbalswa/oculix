@@ -36,6 +36,19 @@ const CAPABILITY_SOURCE = new URL(
   "../../../tests/e2e/capabilities.json",
   import.meta.url,
 );
+const PLAYWRIGHT_SOURCE = new URL(
+  "../../../tests/e2e/playwright/",
+  import.meta.url,
+);
+const EXECUTION_SOURCE_FILES = [
+  "harness.mjs",
+  "playwright.config.mjs",
+  "process-runner.mjs",
+  "reporting.mjs",
+  "result-reporter.mjs",
+  "smoke.spec.mjs",
+  "web-calculator.spec.mjs",
+];
 const REVISION = "d460a7e8ce751eb772d1b3120e5508bbecaa7bff";
 const GENERATED_AT = "2026-10-21T17:00:00Z";
 
@@ -53,6 +66,9 @@ async function createRepository() {
     join(packageRoot, "package-lock.json"),
   );
   await cp(CAPABILITY_SOURCE, join(root, "tests/e2e/capabilities.json"));
+  for (const path of EXECUTION_SOURCE_FILES) {
+    await cp(new URL(path, PLAYWRIGHT_SOURCE), join(packageRoot, path));
+  }
   return {
     root,
     async cleanup() {
@@ -123,6 +139,9 @@ async function testRepositoryInspection(repository, overrides = {}) {
     "tests/e2e/capabilities.json",
     "tests/e2e/playwright/package-lock.json",
     "tests/e2e/playwright/package.json",
+    ...EXECUTION_SOURCE_FILES.map(
+      (path) => `tests/e2e/playwright/${path}`,
+    ),
   ];
   return {
     root: resolve(repository.root),
@@ -182,6 +201,27 @@ async function prepareRuntime(step, { revision = "1200" } = {}) {
     `${JSON.stringify(browserMetadata["1.65.0"])}\n`,
   );
   await writeFile(executable, "browser\n");
+  const lockHash = createHash("sha256")
+    .update(await readFile(join(step.cwd, "package-lock.json")))
+    .digest("hex");
+  await writeFile(
+    join(step.cwd, "node_modules/.oculix-package-lock.sha256"),
+    `${lockHash}\n`,
+  );
+  await writeFile(
+    join(
+      step.cwd,
+      "node_modules",
+      `.oculix-playwright-${process.platform}-${process.arch}-chromium.json`,
+    ),
+    `${JSON.stringify({
+      arch: process.arch,
+      lockHash,
+      operatingSystem: "ubuntu",
+      platform: process.platform,
+      project: "chromium",
+    })}\n`,
+  );
 }
 
 function runtimeResult(step, { revision = "1200" } = {}) {
@@ -254,13 +294,99 @@ async function qualifyWithArtifacts(repository, mutateArtifacts) {
   });
 }
 
+function ebmlElement(identifier, payload) {
+  assert.ok(payload.length < 127);
+  return Buffer.concat([
+    Buffer.from(identifier, "hex"),
+    Buffer.from([0x80 | payload.length]),
+    payload,
+  ]);
+}
+
+function validWebmFixture() {
+  const header = ebmlElement(
+    "1a45dfa3",
+    Buffer.concat([
+      ebmlElement("4286", Buffer.from([1])),
+      ebmlElement("42f7", Buffer.from([1])),
+      ebmlElement("42f2", Buffer.from([4])),
+      ebmlElement("42f3", Buffer.from([8])),
+      ebmlElement("4282", Buffer.from("webm")),
+      ebmlElement("4287", Buffer.from([4])),
+      ebmlElement("4285", Buffer.from([2])),
+    ]),
+  );
+  const information = ebmlElement(
+    "1549a966",
+    Buffer.concat([
+      ebmlElement("2ad7b1", Buffer.from([0x0f, 0x42, 0x40])),
+      ebmlElement("4d80", Buffer.from("test")),
+      ebmlElement("5741", Buffer.from("test")),
+    ]),
+  );
+  const video = ebmlElement(
+    "e0",
+    Buffer.concat([
+      ebmlElement("b0", Buffer.from([1])),
+      ebmlElement("ba", Buffer.from([1])),
+    ]),
+  );
+  const track = ebmlElement(
+    "ae",
+    Buffer.concat([
+      ebmlElement("d7", Buffer.from([1])),
+      ebmlElement("73c5", Buffer.from([1])),
+      ebmlElement("83", Buffer.from([1])),
+      ebmlElement("86", Buffer.from("V_VP8")),
+      video,
+    ]),
+  );
+  const tracks = ebmlElement("1654ae6b", track);
+  const cluster = ebmlElement(
+    "1f43b675",
+    Buffer.concat([
+      ebmlElement("e7", Buffer.from([0])),
+      ebmlElement("a3", Buffer.from([0x81, 0, 0, 0x80, 0])),
+    ]),
+  );
+  return Buffer.concat([
+    header,
+    ebmlElement(
+      "18538067",
+      Buffer.concat([information, tracks, cluster]),
+    ),
+  ]);
+}
+
 async function writePassingArtifacts(packageRoot) {
+  const incompleteFinding = {
+    description: "Ensure text has sufficient color contrast",
+    help: "Elements must meet minimum color contrast ratio thresholds",
+    helpUrl: "https://example.invalid/color-contrast",
+    id: "color-contrast",
+    impact: "serious",
+    nodes: [
+      {
+        failureSummary: "Fix the foreground or background color",
+        html: "<button>Calculate</button>",
+        impact: "serious",
+        target: ["button"],
+      },
+      {
+        failureSummary: "Review the muted result text",
+        html: "<output>0</output>",
+        impact: "serious",
+        target: ["output"],
+      },
+    ],
+    tags: ["wcag2aa", "wcag143"],
+  };
   const accessibilitySummary = {
     status: "passed",
     testEngine: { name: "axe-core", version: "4.15.0" },
     testEnvironment: { orientationAngle: 0 },
     testRunner: { name: "axe" },
-    timestamp: "2026-10-21T17:00:00.000Z",
+    timestamp: "2026-10-21T17:00:02.500Z",
     url: "http://127.0.0.1/",
     policy: {
       automatedStandard: "WCAG 2.0, 2.1, and 2.2 Level A/AA",
@@ -276,12 +402,12 @@ async function writePassingArtifacts(packageRoot) {
       ],
     },
     counts: {
-      incomplete: { rules: 0, nodes: 0 },
+      incomplete: { rules: 1, nodes: 2 },
       inapplicable: { rules: 0, nodes: 0 },
       passes: { rules: 0, nodes: 0 },
       violations: { rules: 0, nodes: 0 },
     },
-    incomplete: [],
+    incomplete: [incompleteFinding],
     violations: [],
   };
   for (const scenario of ["smoke", "web-calculator"]) {
@@ -314,10 +440,7 @@ async function writePassingArtifacts(packageRoot) {
     );
     await writeFile(
       join(resultRoot, "artifacts/video.webm"),
-      Buffer.concat([
-        Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
-        Buffer.from("webm-video"),
-      ]),
+      validWebmFixture(),
     );
     const scenarioRoot =
       `tests/e2e/playwright/test-results/${scenario}`;
@@ -397,13 +520,13 @@ async function writePassingArtifacts(packageRoot) {
   await writeFile(
     join(calculatorRoot, "accessibility.json"),
     `${JSON.stringify({
-      incomplete: [],
+      incomplete: [incompleteFinding],
       inapplicable: [],
       passes: [],
       testEngine: { name: "axe-core", version: "4.15.0" },
       testEnvironment: { orientationAngle: 0 },
       testRunner: { name: "axe" },
-      timestamp: "2026-10-21T17:00:00.000Z",
+      timestamp: "2026-10-21T17:00:02.500Z",
       url: "http://127.0.0.1/",
       violations: [],
     })}\n`,
@@ -414,8 +537,20 @@ async function writePassingArtifacts(packageRoot) {
   );
   await writeFile(
     join(calculatorRoot, "accessibility-summary.md"),
-    "# Accessibility\n\n- Status: **passed**\n" +
-      "- Violations: 0 rule(s) / 0 affected node(s) (blocking)\n",
+    "# Playwright accessibility audit\n\n" +
+      "- Status: **passed**\n" +
+      "- Policy: WCAG 2.0, 2.1, and 2.2 Level A/AA\n" +
+      "- Violations: 0 rule(s) / 0 affected node(s) (blocking)\n" +
+      "- Incomplete/manual review: 1 rule(s) / 2 affected node(s) " +
+        "(nonblocking)\n" +
+      "- Passes: 0 rule(s) / 0 affected node(s)\n" +
+      "- Inapplicable: 0 rule(s) / 0 affected node(s)\n\n" +
+      "## Violations\n\nNone.\n\n" +
+      "## Incomplete findings requiring manual review\n\n" +
+      "- `color-contrast` (serious): Elements must meet minimum color " +
+        "contrast ratio thresholds — 2 node(s)\n\n" +
+      "Automated auditing supplements rather than replaces manual " +
+        "accessibility review.\n",
   );
   await writeFile(
     join(calculatorRoot, "final.png"),
@@ -641,10 +776,14 @@ test("qualification plan confines mutation and orders tests before scenarios", a
     assert.match(plan.apply.cwd, /^\/ephemeral\/repository\//u);
     assert.deepEqual(plan.capabilities, ["playwright-ubuntu-chromium"]);
     assert.equal(plan.package_tests.phase, "package-test");
-    assert.equal(plan.preparation.length, 2);
+    assert.equal(plan.preparation.length, 1);
     assert.ok(
       plan.preparation.every(
         (step) =>
+          step.command === process.execPath &&
+          step.arguments[0].endsWith("/harness.mjs") &&
+          step.arguments[1] === "prepare" &&
+          step.arguments[2] === "chromium" &&
           step.cwd.startsWith(
             "/ephemeral/repository/tests/e2e/playwright",
           ) &&
@@ -699,7 +838,6 @@ test("warning-free all-capability evidence independently qualifies", async () =>
     assert.deepEqual(phases, [
       "apply",
       "prepare",
-      "prepare",
       "runtime-metadata",
       "package-test",
       "capability",
@@ -739,6 +877,37 @@ test("preparation failure cannot qualify, run scenarios, or mutate source state"
     assert.equal(validation.results[0].status, "fail");
     assert.ok(!executed.some((id) => id.endsWith("-smoke")));
     assert.deepEqual(await packageState(repository), before);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("successful prepare command without real harness stamps cannot qualify", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collect(repository);
+    const executed = [];
+    const validation = await qualifyPlaywrightCandidate({
+      observation,
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        executed.push(step.phase);
+        await applyCandidate(step);
+        return {
+          exitCode: 0,
+          warnings: [],
+          ...runtimeResult(step),
+        };
+      },
+      async inspectCapability() {
+        assert.fail("unstamped preparation cannot reach artifact admission");
+      },
+    });
+
+    assert.deepEqual(validation.disposition.reason_codes, [
+      "PREPARATION_FAILED",
+    ]);
+    assert.ok(!executed.includes("capability"));
   } finally {
     await repository.cleanup();
   }
@@ -861,6 +1030,136 @@ test("source mutation is restored and reported as a qualification failure", asyn
   }
 });
 
+test("source restoration unlinks replacement symlinks without touching targets", async () => {
+  const repository = await createRepository();
+  const externalRoot = await mkdtemp(
+    join(tmpdir(), "playwright-restore-target-"),
+  );
+  try {
+    const observation = await collect(repository);
+    const before = await packageState(repository);
+    const externalTarget = join(externalRoot, "package.json");
+    const sourcePackage = join(
+      repository.root,
+      "tests/e2e/playwright/package.json",
+    );
+    await writeFile(externalTarget, "external target must remain unchanged\n");
+    const validation = await qualifyPlaywrightCandidate({
+      observation,
+      ...qualificationOptions(repository),
+      async runStep(step) {
+        const result = await passingStep(step);
+        if (step.phase === "prepare") {
+          await rm(sourcePackage);
+          await symlink(externalTarget, sourcePackage);
+        }
+        return result;
+      },
+      async inspectCapability() {
+        return passingInspection();
+      },
+    });
+
+    assert.ok(
+      validation.disposition.reason_codes.includes("PACKAGE_STATE_MUTATED"),
+    );
+    assert.deepEqual(await packageState(repository), before);
+    assert.equal(
+      await readFile(externalTarget, "utf8"),
+      "external target must remain unchanged\n",
+    );
+  } finally {
+    await repository.cleanup();
+    await rm(externalRoot, { force: true, recursive: true });
+  }
+});
+
+test("candidate lock and execution files remain bound through final state", async (t) => {
+  const cases = [
+    {
+      name: "lock changed after preparation",
+      phase: "prepare",
+      path: "package-lock.json",
+    },
+    {
+      name: "harness changed after package tests",
+      phase: "package-test",
+      path: "harness.mjs",
+    },
+    {
+      name: "reporter changed after final scenario",
+      phase: "capability",
+      scenario: "web-calculator",
+      path: "result-reporter.mjs",
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const repository = await createRepository();
+      try {
+        const observation = await collect(repository);
+        const validation = await qualifyPlaywrightCandidate({
+          observation,
+          ...qualificationOptions(repository),
+          async runStep(step) {
+            const result = await passingStep(step);
+            if (
+              step.phase === testCase.phase &&
+              (testCase.scenario === undefined ||
+                step.scenario === testCase.scenario)
+            ) {
+              await writeFile(
+                join(step.cwd, testCase.path),
+                "post-command tampering\n",
+              );
+            }
+            return result;
+          },
+          async inspectCapability() {
+            return passingInspection();
+          },
+        });
+        assert.ok(
+          validation.disposition.reason_codes.includes(
+            "CANDIDATE_EVIDENCE_MUTATED",
+          ),
+        );
+      } finally {
+        await repository.cleanup();
+      }
+    });
+  }
+
+  await t.test("lock changed after artifact verification", async () => {
+    const repository = await createRepository();
+    try {
+      const observation = await collect(repository);
+      const validation = await qualifyPlaywrightCandidate({
+        observation,
+        ...qualificationOptions(repository),
+        async runStep(step) {
+          return passingStep(step);
+        },
+        async inspectCapability({ workspaceRoot }) {
+          await writeFile(
+            join(workspaceRoot, "tests/e2e/playwright/package-lock.json"),
+            "post-verification tampering\n",
+          );
+          return passingInspection();
+        },
+      });
+      assert.ok(
+        validation.disposition.reason_codes.includes(
+          "CANDIDATE_EVIDENCE_MUTATED",
+        ),
+      );
+    } finally {
+      await repository.cleanup();
+    }
+  });
+});
+
 test("artifact admission rejects semantically invalid evidence", async (t) => {
   const cases = [
     [
@@ -900,6 +1199,17 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
           join(packageRoot, "test-results/smoke/artifacts/video.webm"),
           "not actually webm\n",
         );
+      },
+    ],
+    [
+      "truncated WebM declared payload",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/smoke/artifacts/video.webm",
+        );
+        const contents = await readFile(path);
+        await writeFile(path, contents.subarray(0, contents.length - 1));
       },
     ],
     [
@@ -968,6 +1278,32 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
       },
     ],
     [
+      "combined native scenario report",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/smoke/playwright-report.json",
+        );
+        const report = JSON.parse(await readFile(path, "utf8"));
+        report.suites.push({
+          file: "web-calculator.spec.mjs",
+          specs: [{ file: "web-calculator.spec.mjs" }],
+        });
+        await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+    [
+      "unrelated extra native report",
+      async (packageRoot) => {
+        const root = join(packageRoot, "test-results/unrelated");
+        await mkdir(root, { recursive: true });
+        await writeFile(
+          join(root, "playwright-report.json"),
+          '{"config":{},"suites":[],"errors":[],"stats":{}}\n',
+        );
+      },
+    ],
+    [
       "nonmonotonic timestamps",
       async (packageRoot) => {
         const path = join(
@@ -1026,6 +1362,61 @@ test("artifact admission rejects semantically invalid evidence", async (t) => {
         const report = JSON.parse(await readFile(path, "utf8"));
         report.accessibility.status = "failed";
         await writeFile(path, `${JSON.stringify(report)}\n`);
+      },
+    ],
+    [
+      "incomplete finding details contradict raw audit",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility-summary.json",
+        );
+        const summary = JSON.parse(await readFile(path, "utf8"));
+        summary.incomplete[0].help = "different finding";
+        await writeFile(path, `${JSON.stringify(summary)}\n`);
+      },
+    ],
+    [
+      "Markdown incomplete counts contradict summary",
+      async (packageRoot) => {
+        const path = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility-summary.md",
+        );
+        const markdown = await readFile(path, "utf8");
+        await writeFile(
+          path,
+          markdown.replace(
+            "1 rule(s) / 2 affected node(s)",
+            "0 rule(s) / 0 affected node(s)",
+          ),
+        );
+      },
+    ],
+    [
+      "accessibility audit timestamp outside scenario",
+      async (packageRoot) => {
+        const rawPath = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility.json",
+        );
+        const summaryPath = join(
+          packageRoot,
+          "test-results/web-calculator/accessibility-summary.json",
+        );
+        const resultPath = join(
+          packageRoot,
+          "test-results/web-calculator/result.json",
+        );
+        const raw = JSON.parse(await readFile(rawPath, "utf8"));
+        const summary = JSON.parse(await readFile(summaryPath, "utf8"));
+        const result = JSON.parse(await readFile(resultPath, "utf8"));
+        raw.timestamp = "2026-10-21T17:00:01.999Z";
+        summary.timestamp = raw.timestamp;
+        result.accessibility.timestamp = raw.timestamp;
+        await writeFile(rawPath, `${JSON.stringify(raw)}\n`);
+        await writeFile(summaryPath, `${JSON.stringify(summary)}\n`);
+        await writeFile(resultPath, `${JSON.stringify(result)}\n`);
       },
     ],
   ];
