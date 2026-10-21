@@ -9,6 +9,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -37,11 +38,6 @@ const FIXTURE_ROOT = new URL(
   import.meta.url,
 );
 const GENERATED_AT = "2026-10-21T18:00:00Z";
-const REVISION = "a".repeat(40);
-const REPOSITORY = {
-  name: "sbalswa/oculix",
-  revision: REVISION,
-};
 const execFileAsync = promisify(execFile);
 
 function digest(value) {
@@ -54,8 +50,15 @@ async function fixture(name) {
 
 async function createRepository() {
   const root = await mkdtemp(join(tmpdir(), "selenium-collector-"));
+  const executableRoot = await mkdtemp(
+    join(tmpdir(), "selenium-runner-bin-"),
+  );
   const packageRoot = join(root, "tests", "e2e", "selenium");
   await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, ".gitignore"),
+    ".runtime/\ndiagnostics/\nnode_modules/\n",
+  );
   for (const name of ["package.json", "package-lock.json"]) {
     await cp(new URL(name, FIXTURE_ROOT), join(packageRoot, name));
   }
@@ -64,8 +67,6 @@ async function createRepository() {
     join(root, "tests", "e2e", "capabilities.json"),
   );
   await writeFile(join(root, "README.md"), "unchanged\n", "utf8");
-  const executableRoot = join(root, "runner-bin");
-  await mkdir(executableRoot);
   const browserPath = join(executableRoot, "chromium");
   const driverPath = join(executableRoot, "chromedriver");
   const browserContent = "#!/bin/sh\nprintf 'Chromium 141.0.7390.54\\n'\n";
@@ -74,6 +75,23 @@ async function createRepository() {
     writeFile(browserPath, browserContent, { mode: 0o755 }),
     writeFile(driverPath, driverContent, { mode: 0o755 }),
   ]);
+  await execFileAsync("git", ["init", "--quiet"], { cwd: root });
+  await execFileAsync(
+    "git",
+    ["config", "user.email", "selenium-collector@example.invalid"],
+    { cwd: root },
+  );
+  await execFileAsync(
+    "git",
+    ["config", "user.name", "Selenium Collector Tests"],
+    { cwd: root },
+  );
+  await execFileAsync("git", ["add", "--all"], { cwd: root });
+  await execFileAsync(
+    "git",
+    ["commit", "--quiet", "-m", "fixture"],
+    { cwd: root },
+  );
   return {
     root,
     runnerEvidence: {
@@ -100,16 +118,27 @@ async function createRepository() {
       },
     },
     async cleanup() {
-      await rm(root, { force: true, recursive: true });
+      await Promise.all([
+        rm(root, { force: true, recursive: true }),
+        rm(executableRoot, { force: true, recursive: true }),
+      ]);
     },
   };
 }
 
 async function candidateInputs(repositoryRoot, overrides = {}) {
   const npmCandidates = await fixture("npm-candidates.json");
+  const { stdout: revision } = await execFileAsync(
+    "git",
+    ["rev-parse", "--verify", "HEAD"],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
   return {
     repositoryRoot,
-    repository: REPOSITORY,
+    repository: {
+      name: "sbalswa/oculix",
+      revision: revision.trim(),
+    },
     generatedAt: GENERATED_AT,
     npm: async (packageName) =>
       structuredClone(npmCandidates[packageName]),
@@ -487,7 +516,6 @@ async function qualify(
       catalog,
       generatedAt: "2026-10-21T18:20:00Z",
       now: deterministicClock(),
-      readGitState: async () => " M pre-existing-change\n",
       ...overrides,
     },
   );
@@ -631,7 +659,7 @@ test("uses actual runner components without provider path collisions", async () 
               {
                 type: "repository-file",
                 locator: "mise/mise.web-e2e.lock",
-                revision: REVISION,
+                revision: observation.repository.revision,
                 digest: `sha256:${"b".repeat(64)}`,
                 observed_at: GENERATED_AT,
               },
@@ -764,6 +792,20 @@ test("strictly rejects malformed semantic versions and ranges", async () => {
   );
   assert.equal(
     semverRangeSatisfies("1.2.4-beta.1", ">=1.2.3"),
+    false,
+  );
+  assert.equal(
+    semverRangeSatisfies(
+      "1.0.0-90071992547409931234567891",
+      ">1.0.0-90071992547409931234567890 <1.0.0",
+    ),
+    true,
+  );
+  assert.equal(
+    semverRangeSatisfies(
+      "1.0.0-90071992547409931234567889",
+      ">1.0.0-90071992547409931234567890 <1.0.0",
+    ),
     false,
   );
   assert.equal(
@@ -940,6 +982,67 @@ test("qualification plan installs immutable tarballs and binds executables", asy
     );
   } finally {
     await repository.cleanup();
+  }
+});
+
+test("qualification requires the exact clean source checkout", async () => {
+  const headRepository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(headRepository);
+    await writeFile(join(headRepository.root, "post-observation.txt"), "new\n");
+    await execFileAsync("git", ["add", "--all"], { cwd: headRepository.root });
+    await execFileAsync(
+      "git",
+      ["commit", "--quiet", "-m", "advance head"],
+      { cwd: headRepository.root },
+    );
+    await assert.rejects(
+      qualify(headRepository, observation),
+      /HEAD must exactly match/u,
+    );
+  } finally {
+    await headRepository.cleanup();
+  }
+
+  for (const [name, mutate] of [
+    [
+      "tracked",
+      (repository) =>
+        writeFile(join(repository.root, "README.md"), "dirty tracked\n"),
+    ],
+    [
+      "untracked",
+      (repository) =>
+        writeFile(join(repository.root, "untracked.txt"), "dirty untracked\n"),
+    ],
+    [
+      "ignored",
+      async (repository) => {
+        const path = join(
+          repository.root,
+          "tests",
+          "e2e",
+          "selenium",
+          "diagnostics",
+          "ignored.txt",
+        );
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, "dirty ignored\n");
+      },
+    ],
+  ]) {
+    const repository = await createRepository();
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      await mutate(repository);
+      await assert.rejects(
+        qualify(repository, observation),
+        /clean across tracked, untracked, and ignored/u,
+        name,
+      );
+    } finally {
+      await repository.cleanup();
+    }
   }
 });
 
@@ -1292,7 +1395,16 @@ test("captured warnings prevent independent admission", async () => {
       runCommand: passingRunner([], {
         result: (step) =>
           step.id === "test-selenium-package"
-            ? { stderr: "WARNING: package emitted a warning\n" }
+            ? {
+                stderr: [
+                  "WARNING: package emitted a warning",
+                  "npm WaRn deprecated package",
+                  "Warnings: plural form",
+                  "(node:1) DeprecationWarning: deprecated API",
+                  "(node:1) ExperimentalWarning: experimental API",
+                  "(node:1) MaxListenersExceededWarning: listener leak",
+                ].join("\n"),
+              }
             : {},
       }),
     });
@@ -1304,7 +1416,7 @@ test("captured warnings prevent independent admission", async () => {
     assert.ok(
       result.validation.results.every(
         ({ status, warnings }) =>
-          status === "pass" && warnings.length === 1,
+          status === "pass" && warnings.length === 6,
       ),
     );
   } finally {
@@ -1338,6 +1450,57 @@ test("missing artifacts prevent independent admission", async () => {
         ({ status }) => status === "fail",
       ),
     );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("report and evidence artifacts cannot escape through symlinks", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    for (const artifactPath of [
+      "tests/e2e/selenium/diagnostics/web-calculator/result.png",
+      "tests/e2e/selenium/diagnostics/web-calculator/result.json",
+    ]) {
+      const runner = passingRunner([]);
+      const result = await qualify(repository, observation, {
+        runCommand: async (step, context) => {
+          const raw = await runner(step, context);
+          if (
+            step.id ===
+            "selenium-ubuntu-chromium-artifact-contracts"
+          ) {
+            const artifact = join(context.workspaceRoot, artifactPath);
+            const outside = join(
+              dirname(context.workspaceRoot),
+              `outside-${artifactPath.endsWith(".json") ? "report.json" : "evidence.png"}`,
+            );
+            await writeFile(
+              outside,
+              artifactPath.endsWith(".json")
+                ? await readFile(artifact)
+                : "outside evidence\n",
+            );
+            await rm(artifact, { force: true });
+            await symlink(outside, artifact);
+          }
+          return raw;
+        },
+      });
+
+      assert.ok(
+        result.validation.disposition.reason_codes.includes(
+          "ARTIFACT_VALIDATION_FAILED",
+        ),
+      );
+      assert.equal(
+        result.validation.results.find(
+          ({ capability_id: id }) => id === "selenium-ubuntu-chromium",
+        ).status,
+        "fail",
+      );
+    }
   } finally {
     await repository.cleanup();
   }
@@ -1393,7 +1556,7 @@ test("reports must bijectively cover the selected scenario set", async () => {
   }
 });
 
-test("workspace boundary and source Git-state mutations fail closed", async () => {
+test("workspace boundary and source mutations fail closed", async () => {
   const repository = await createRepository();
   try {
     const observation = await collectQualificationCandidate(repository);
@@ -1413,22 +1576,6 @@ test("workspace boundary and source Git-state mutations fail closed", async () =
         },
       }),
       /outside its package boundary/u,
-    );
-
-    let gitState = "clean\n";
-    const sourceRunner = passingRunner([]);
-    await assert.rejects(
-      qualify(repository, observation, {
-        readGitState: async () => gitState,
-        runCommand: async (step, context) => {
-          const raw = await sourceRunner(step, context);
-          if (step.id === "test-selenium-package") {
-            gitState = "changed\n";
-          }
-          return raw;
-        },
-      }),
-      /changed source Git state/u,
     );
 
     const ignoredRunner = passingRunner([]);
