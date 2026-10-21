@@ -22,6 +22,7 @@ import {
   collectSeleniumObservation,
   createSeleniumExecutorAttestation,
   createSeleniumQualificationPlan,
+  createSeleniumTrustedInputManifest,
   normalizeSemverRange,
   parseExactSemver,
   qualifySeleniumCandidate,
@@ -76,6 +77,20 @@ async function createRepository() {
     new URL("capabilities.json", FIXTURE_ROOT),
     join(root, "tests", "e2e", "capabilities.json"),
   );
+  for (const path of [
+    ".github/scripts/validate-e2e-reports.mjs",
+    "tests/e2e/fixtures/web-calculator/lifecycle.mjs",
+    "tests/e2e/selenium/browser-selection.test.mjs",
+    "tests/e2e/selenium/harness.test.mjs",
+    "tests/e2e/selenium/reporting.test.mjs",
+    "tests/e2e/selenium/setup.mjs",
+    "tests/e2e/selenium/smoke.mjs",
+    "tests/e2e/selenium/web-calculator.mjs",
+  ]) {
+    const target = join(root, path);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, `// trusted fixture: ${path}\n`);
+  }
   await writeFile(join(root, "README.md"), "unchanged\n", "utf8");
   const browserPath = join(executableRoot, "chromium");
   const driverPath = join(executableRoot, "chromedriver");
@@ -170,6 +185,16 @@ async function collectQualificationCandidate(repository, overrides = {}) {
   });
 }
 
+async function qualificationPlanInputs(repository, observation) {
+  return {
+    executorTools: (await localExecutorIdentity()).tools,
+    trustedInputManifest: await createSeleniumTrustedInputManifest(
+      repository.root,
+      observation.repository.revision,
+    ),
+  };
+}
+
 function component(observation, id) {
   return observation.components.find((entry) => entry.id === id);
 }
@@ -202,22 +227,58 @@ let localExecutorIdentityPromise;
 async function localExecutorIdentity() {
   localExecutorIdentityPromise ??= (async () => {
     const nodeRealpath = await realpath(process.execPath);
-    const npmExecutable = join(
-      dirname(process.execPath),
-      process.platform === "win32" ? "npm.cmd" : "npm",
-    );
-    const npmRealpath = await realpath(npmExecutable);
+    const npmCandidates = process.platform === "win32"
+      ? [
+          join(
+            dirname(process.execPath),
+            "node_modules",
+            "npm",
+            "bin",
+            "npm-cli.js",
+          ),
+        ]
+      : [
+          join(
+            dirname(process.execPath),
+            "..",
+            "lib",
+            "node_modules",
+            "npm",
+            "bin",
+            "npm-cli.js",
+          ),
+          join(
+            dirname(process.execPath),
+            "node_modules",
+            "npm",
+            "bin",
+            "npm-cli.js",
+          ),
+        ];
+    let npmRealpath;
+    for (const candidate of npmCandidates) {
+      try {
+        await access(candidate);
+        npmRealpath = await realpath(candidate);
+        break;
+      } catch {
+        // Try the next platform layout.
+      }
+    }
+    assert.ok(npmRealpath, "npm CLI entrypoint must be discoverable");
     const { stdout: npmVersion } = await execFileAsync(
-      npmExecutable,
-      ["--version"],
+      nodeRealpath,
+      [npmRealpath, "--version"],
       { encoding: "utf8" },
     );
+    const authority = {
+      github_api_permission: "none",
+      identity_digest: digest(TEST_EXECUTOR_PUBLIC_KEY),
+      kind: "ed25519",
+      public_key: TEST_EXECUTOR_PUBLIC_KEY,
+    };
     return {
-      authority: {
-        identity_digest: digest("test-disposable-executor-v1"),
-        kind: "ed25519",
-        public_key: TEST_EXECUTOR_PUBLIC_KEY,
-      },
+      authority,
       path: [
         ...new Set([
           dirname(nodeRealpath),
@@ -227,14 +288,14 @@ async function localExecutorIdentity() {
       ],
       tools: {
         node: {
-          command: "node",
           digest: digest(await readFile(nodeRealpath)),
+          path: process.execPath,
           realpath: nodeRealpath,
           version: process.version.slice(1),
         },
         npm: {
-          command: "npm",
           digest: digest(await readFile(npmRealpath)),
+          path: npmRealpath,
           realpath: npmRealpath,
           version: npmVersion.trim(),
         },
@@ -595,6 +656,14 @@ function passingRunner(observed, overrides = {}) {
     if (step.id === "install-selenium-candidate") {
       await materializeInstalledPackages(context.packageRoot);
     }
+    if (step.kind === "node-identity") {
+      return rawResult({ stdout: `${process.version}\n` });
+    }
+    if (step.kind === "npm-identity") {
+      return rawResult({
+        stdout: `${context.execution.policy.tools.npm.version}\n`,
+      });
+    }
     if (step.kind === "browser-identity") {
       return rawResult({
         stdout: "Chromium 141.0.7390.54\n",
@@ -653,13 +722,17 @@ async function qualify(
     attestation: mutateAttestation,
     environment,
     executor,
+    requestConsumer,
+    requestFreshness,
     runCommand = async () => rawResult({ exitCode: 1 }),
+    trustedAuthority,
     ...qualificationOverrides
   } = overrides;
+  const identity = await localExecutorIdentity();
   const isolatedExecutor =
     executor ??
     {
-      ...(await localExecutorIdentity()),
+      ...identity,
       id: "test-disposable-executor",
       async execute(step, context) {
         const result = await runCommand(step, context);
@@ -689,11 +762,31 @@ async function qualify(
     },
     {
       catalog,
+      consumeExecutionRequest:
+        requestConsumer ??
+        (() => {
+          const consumed = new Set();
+          return (request) => {
+            if (consumed.has(request.request_digest)) {
+              return false;
+            }
+            consumed.add(request.request_digest);
+            return true;
+          };
+        })(),
       environmentOverrides: environment ?? {},
-      executionChallenge: "c".repeat(64),
+      executionRequestFreshness:
+        requestFreshness ?? {
+          challenge: "c".repeat(64),
+          run_id: "workflow-123-attempt-1-selenium",
+          issued_at: "2026-10-21T18:09:00.000Z",
+          expires_at: "2026-10-21T18:24:00.000Z",
+        },
       executor: isolatedExecutor,
       generatedAt: "2026-10-21T18:20:00Z",
       now: deterministicClock(),
+      trustedExecutorAuthority:
+        trustedAuthority ?? identity.authority,
       ...qualificationOverrides,
     },
   );
@@ -1079,9 +1172,14 @@ test("qualification plan installs immutable tarballs and binds executables", asy
   const repository = await createRepository();
   try {
     const observation = await collectCandidate(repository.root);
+    const planInputs = await qualificationPlanInputs(
+      repository,
+      observation,
+    );
     const plan = createSeleniumQualificationPlan({
       observation,
       catalog: await fixture("capabilities.json"),
+      ...planInputs,
     });
     const apply = plan.steps.find(
       ({ id }) => id === "apply-selenium-tarballs",
@@ -1090,22 +1188,32 @@ test("qualification plan installs immutable tarballs and binds executables", asy
       ({ id }) => id.startsWith("cache-selenium-"),
     );
 
-    assert.deepEqual(plan.workspace, {
-      kind: "isolated-executor",
-      immutable_inputs: {
-        kind: "repository-source-manifest",
-        access: "read-only",
-      },
-      mutable_paths: [
+    assert.equal(plan.workspace.kind, "isolated-executor");
+    assert.equal(plan.workspace.github_api_permission, "none");
+    assert.equal(plan.workspace.immutable_inputs.access, "read-only");
+    assert.equal(
+      plan.workspace.immutable_inputs.manifest.repository_revision,
+      observation.repository.revision,
+    );
+    assert.equal(
+      plan.workspace.immutable_inputs.manifest.github_api_permission,
+      "none",
+    );
+    assert.ok(
+      plan.workspace.immutable_inputs.manifest.files.every(
+        ({ digest: fileDigest }) =>
+          /^sha256:[0-9a-f]{64}$/u.test(fileDigest),
+      ),
+    );
+    assert.deepEqual(plan.workspace.mutable_paths, [
         "tests/e2e/selenium/package.json",
         "tests/e2e/selenium/package-lock.json",
         "tests/e2e/selenium/.npm-cache",
         "tests/e2e/selenium/.runtime",
         "tests/e2e/selenium/diagnostics",
         "tests/e2e/selenium/node_modules",
-      ],
-      managed_paths: SELENIUM_MANAGED_PATHS,
-    });
+    ]);
+    assert.deepEqual(plan.workspace.managed_paths, SELENIUM_MANAGED_PATHS);
     assert.equal(cacheSteps.length, 3);
     assert.ok(
       [
@@ -1119,8 +1227,8 @@ test("qualification plan installs immutable tarballs and binds executables", asy
     assert.ok(
       cacheSteps.every(
         ({ arguments: arguments_ }) =>
-          arguments_[0] === "cache" &&
-          arguments_[1] === "add" &&
+          arguments_[1] === "cache" &&
+          arguments_[2] === "add" &&
           arguments_.includes("--cache") &&
           arguments_.includes(".npm-cache"),
       ),
@@ -1161,6 +1269,42 @@ test("qualification plan installs immutable tarballs and binds executables", asy
       "/usr/bin/chromium",
     );
     assert.ok(
+      plan.steps.every(
+        ({ command }) => command !== "node" && command !== "npm",
+      ),
+    );
+    const installIndex = plan.steps.findIndex(
+      ({ id }) => id === "install-selenium-candidate",
+    );
+    assert.ok(installIndex >= 0);
+    assert.ok(
+      plan.steps
+        .slice(installIndex + 1)
+        .every(({ tool }) => tool !== "npm"),
+    );
+    assert.deepEqual(
+      plan.steps.find(({ id }) => id === "test-selenium-package")
+        .arguments,
+      [
+        "--test",
+        "tests/e2e/selenium/browser-selection.test.mjs",
+        "tests/e2e/selenium/harness.test.mjs",
+        "tests/e2e/selenium/reporting.test.mjs",
+      ],
+    );
+    assert.deepEqual(
+      plan.steps.find(
+        ({ id }) => id === "selenium-ubuntu-chromium-smoke",
+      ).arguments,
+      [
+        "tests/e2e/selenium/smoke.mjs",
+        "--browser",
+        "chromium",
+        "--os",
+        "ubuntu",
+      ],
+    );
+    assert.ok(
       plan.steps
         .filter(({ capability_id: id }) => id !== null)
         .every(
@@ -1178,6 +1322,7 @@ test("qualification plan installs immutable tarballs and binds executables", asy
         createSeleniumQualificationPlan({
           observation: tampered,
           catalog,
+          ...planInputs,
         }),
     );
 
@@ -1200,10 +1345,25 @@ test("qualification plan installs immutable tarballs and binds executables", asy
           createSeleniumQualificationPlan({
             observation: redirected,
             catalog,
+            ...planInputs,
           }),
         /relations do not exactly bind/u,
       );
     }
+    const tamperedManifest = structuredClone(
+      planInputs.trustedInputManifest,
+    );
+    tamperedManifest.repository_revision = "0".repeat(40);
+    assert.throws(
+      () =>
+        createSeleniumQualificationPlan({
+          observation,
+          catalog,
+          executorTools: planInputs.executorTools,
+          trustedInputManifest: tamperedManifest,
+        }),
+      /trusted-input manifest/u,
+    );
     assert.deepEqual(
       plan.selected_capabilities.find(
         ({ id }) => id === "selenium-ubuntu-chromium",
@@ -1349,6 +1509,37 @@ test("source and materialized workspace symlinks cannot escape their roots", asy
   }
 });
 
+test("materialization cannot substitute a trusted repository file", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    let calls = 0;
+    await assert.rejects(
+      qualify(repository, observation, {
+        materializeWorkspace: async (source, destination) => {
+          await cp(source, destination, {
+            recursive: true,
+            filter: (path) =>
+              !relative(source, path).split("/").includes(".git"),
+          });
+          await writeFile(
+            join(destination, "README.md"),
+            "substituted before measurement\n",
+          );
+        },
+        runCommand: async () => {
+          calls += 1;
+          return rawResult();
+        },
+      }),
+      /does not exactly match the trusted-input manifest/u,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
 test("controlled ephemeral execution independently qualifies all capabilities", async () => {
   const repository = await createRepository();
   let temporaryRoot;
@@ -1441,8 +1632,21 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
       ),
     );
     assert.equal(result.executor.policy.environment.inherit_host, false);
+    assert.equal(
+      result.executor.plan.workspace.github_api_permission,
+      "none",
+    );
+    assert.equal(
+      result.executor.trusted_inputs.github_api_permission,
+      "none",
+    );
+    assert.equal(
+      result.executor.policy.authority.github_api_permission,
+      "none",
+    );
     assert.deepEqual(result.executor.policy.isolation, {
       disposable: true,
+      github_api_access: false,
       network: "candidate-registry-only",
       privileges: "unprivileged",
       repository_write_access: false,
@@ -1454,10 +1658,7 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
     );
     assert.deepEqual(
       result.executor.policy.filesystem.mutable_paths.repository,
-      createSeleniumQualificationPlan({
-        observation,
-        catalog: await fixture("capabilities.json"),
-      }).workspace.mutable_paths,
+      result.executor.plan.workspace.mutable_paths,
     );
     assert.ok(result.executor.attestations.length > 0);
     assert.ok(
@@ -1488,6 +1689,62 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
       ),
     );
   } finally {
+    await repository.cleanup();
+  }
+});
+
+test("candidate-mutated package scripts are never invoked", async () => {
+  const repository = await createRepository();
+  const markerRoot = await mkdtemp(join(tmpdir(), "selenium-script-attack-"));
+  const marker = join(markerRoot, "executed");
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const observed = [];
+    const runner = passingRunner(observed);
+    const result = await qualify(repository, observation, {
+      runCommand: async (step, context) => {
+        const raw = await runner(step, context);
+        if (step.id === "test-selenium-package") {
+          const manifestPath = join(context.packageRoot, "package.json");
+          const manifest = JSON.parse(
+            await readFile(manifestPath, "utf8"),
+          );
+          manifest.scripts = {
+            setup: `node -e "require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'setup')"`,
+            smoke: `node -e "require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'smoke')"`,
+            "web-calculator":
+              `node -e "require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'calculator')"`,
+          };
+          await writeFile(
+            manifestPath,
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
+        }
+        return raw;
+      },
+    });
+
+    assert.equal(
+      result.validation.disposition.state,
+      "independently-qualified",
+    );
+    const packageTestIndex = observed.findIndex(
+      ({ step }) => step.id === "test-selenium-package",
+    );
+    assert.ok(packageTestIndex >= 0);
+    assert.ok(
+      observed
+        .slice(packageTestIndex)
+        .every(
+          ({ step }) =>
+            step.tool !== "npm" &&
+            step.command !== "node" &&
+            step.command !== "npm",
+        ),
+    );
+    await assert.rejects(access(marker));
+  } finally {
+    await rm(markerRoot, { force: true, recursive: true });
     await repository.cleanup();
   }
 });
@@ -1547,17 +1804,201 @@ test("qualification has no implicit executor and rejects host environment input"
   }
 });
 
+test("unknown executor authorities fail before execution", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const identity = await localExecutorIdentity();
+    const rogueKeys = generateKeyPairSync("ed25519");
+    const roguePublicKey = rogueKeys.publicKey.export({
+      format: "pem",
+      type: "spki",
+    }).toString();
+    let calls = 0;
+    await assert.rejects(
+      qualify(repository, observation, {
+        executor: {
+          ...identity,
+          authority: {
+            github_api_permission: "none",
+            identity_digest: digest(roguePublicKey),
+            kind: "ed25519",
+            public_key: roguePublicKey,
+          },
+          id: "rogue-disposable-executor",
+          async execute() {
+            calls += 1;
+            throw new Error("must not execute");
+          },
+        },
+      }),
+      /not caller-trusted/u,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("stale and replayed executor requests fail closed", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    for (const requestFreshness of [
+      {
+        challenge: "a".repeat(64),
+        run_id: "workflow-123-attempt-1-stale",
+        issued_at: "2026-10-21T17:00:00.000Z",
+        expires_at: "2026-10-21T17:10:00.000Z",
+      },
+      {
+        challenge: "b".repeat(64),
+        run_id: "workflow-123-attempt-1-future",
+        issued_at: "2026-10-21T19:00:00.000Z",
+        expires_at: "2026-10-21T19:10:00.000Z",
+      },
+    ]) {
+      await assert.rejects(
+        qualify(repository, observation, { requestFreshness }),
+        /stale or not yet valid/u,
+      );
+    }
+
+    const consumedChallenges = new Set();
+    const requestConsumer = (request) => {
+      if (consumedChallenges.has(request.challenge)) {
+        return false;
+      }
+      consumedChallenges.add(request.challenge);
+      return true;
+    };
+    await qualify(repository, observation, {
+      requestConsumer,
+      runCommand: async () => rawResult({ exitCode: 1 }),
+    });
+    await assert.rejects(
+      qualify(repository, observation, {
+        requestConsumer,
+        runCommand: async () => rawResult({ exitCode: 1 }),
+      }),
+      /already consumed/u,
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("prior-run executor attestations cannot be replayed", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const first = await qualify(repository, observation, {
+      runCommand: async (step, context) =>
+        step.kind === "node-identity"
+          ? rawResult({ stdout: `${process.version}\n` })
+          : rawResult({ exitCode: 1 }),
+    });
+    const replayed = first.executor.attestations[0];
+    assert.ok(replayed);
+    const second = await qualify(repository, observation, {
+      requestConsumer: () => true,
+      requestFreshness: {
+        challenge: "d".repeat(64),
+        run_id: "workflow-123-attempt-2-selenium",
+        issued_at: "2026-10-21T18:09:00.000Z",
+        expires_at: "2026-10-21T18:24:00.000Z",
+      },
+      executor: {
+        ...(await localExecutorIdentity()),
+        id: "test-disposable-executor",
+        async execute(step) {
+          return {
+            attestation: structuredClone(replayed),
+            result:
+              step.kind === "node-identity"
+                ? rawResult({ stdout: `${process.version}\n` })
+                : rawResult({ exitCode: 1 }),
+          };
+        },
+      },
+    });
+    assert.deepEqual(second.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["APPLICATION_FAILED"],
+    });
+    assert.equal(second.executor.attestations.length, 0);
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("Node and npm shims or forged identities cannot intercept execution", async () => {
+  for (const toolName of ["node", "npm"]) {
+    for (const mutation of ["path", "digest", "version"]) {
+      const repository = await createRepository();
+      const shimRoot = await mkdtemp(
+        join(tmpdir(), `selenium-${toolName}-shim-`),
+      );
+      try {
+        const observation = await collectQualificationCandidate(repository);
+        const identity = await localExecutorIdentity();
+        const tools = structuredClone(identity.tools);
+        if (mutation === "path") {
+          const shim = join(
+            shimRoot,
+            process.platform === "win32" ? `${toolName}.cmd` : toolName,
+          );
+          await writeFile(
+            shim,
+            process.platform === "win32"
+              ? "@echo off\r\nexit /b 99\r\n"
+              : "#!/bin/sh\nexit 99\n",
+            { mode: 0o755 },
+          );
+          tools[toolName].path = shim;
+        } else if (mutation === "digest") {
+          tools[toolName].digest = `sha256:${"0".repeat(64)}`;
+        } else {
+          tools[toolName].version = "0.0.1";
+        }
+        let calls = 0;
+        await assert.rejects(
+          qualify(repository, observation, {
+            executor: {
+              ...identity,
+              id: "test-disposable-executor",
+              tools,
+              async execute() {
+                calls += 1;
+                throw new Error("must not execute");
+              },
+            },
+          }),
+          /executable|version|realpath/u,
+          `${toolName}/${mutation}`,
+        );
+        assert.equal(calls, 0, `${toolName}/${mutation}`);
+      } finally {
+        await rm(shimRoot, { force: true, recursive: true });
+        await repository.cleanup();
+      }
+    }
+  }
+});
+
 test("missing or forged executor attestations fail closed", async () => {
   for (const mutation of [
     "missing",
     "candidate",
     "challenge",
     "environment",
+    "expires",
     "executable",
     "isolation",
     "payload",
     "signature",
     "tools",
+    "run",
   ]) {
     const repository = await createRepository();
     try {
@@ -1575,6 +2016,8 @@ test("missing or forged executor attestations fail closed", async () => {
             forged.challenge = "d".repeat(64);
           } else if (mutation === "environment") {
             forged.environment_digest = `sha256:${"0".repeat(64)}`;
+          } else if (mutation === "expires") {
+            forged.expires_at = "2026-10-21T18:23:00.000Z";
           } else if (mutation === "executable") {
             forged.executable_identity_digest = `sha256:${"0".repeat(64)}`;
           } else if (mutation === "payload") {
@@ -1585,6 +2028,8 @@ test("missing or forged executor attestations fail closed", async () => {
               forged.signature.slice(1);
           } else if (mutation === "tools") {
             forged.tools_digest = `sha256:${"0".repeat(64)}`;
+          } else if (mutation === "run") {
+            forged.run_id = "workflow-123-attempt-2-selenium";
           } else {
             forged.isolation.repository_write_access = true;
           }
@@ -1635,6 +2080,12 @@ test("real npm creates and installs the candidate manifest and lock", async () =
       },
       runCommand: async (step, context) => {
         observed.push({ step, context });
+        if (
+          step.kind === "node-identity" ||
+          step.kind === "npm-identity"
+        ) {
+          return executeRaw(step, context);
+        }
         if (
           step.id.startsWith("cache-selenium-") ||
           step.id === "apply-selenium-tarballs" ||
@@ -2294,6 +2745,7 @@ test("collection and planning never mutate source package state", async () => {
     createSeleniumQualificationPlan({
       observation,
       catalog: await fixture("capabilities.json"),
+      ...(await qualificationPlanInputs(repository, observation)),
     });
     const after = await Promise.all(
       [

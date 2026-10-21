@@ -51,6 +51,27 @@ const LOCK_PATH = SELENIUM_MANAGED_PATHS[1];
 const CATALOG_PATH = "tests/e2e/capabilities.json";
 const BROWSER_POLICY_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/configuration.mjs`;
 const DRIVER_POLICY_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/setup.mjs`;
+const SELENIUM_SETUP_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/setup.mjs`;
+const SELENIUM_SMOKE_PATH = `${SELENIUM_PACKAGE_DIRECTORY}/smoke.mjs`;
+const SELENIUM_WEB_CALCULATOR_PATH =
+  `${SELENIUM_PACKAGE_DIRECTORY}/web-calculator.mjs`;
+const SELENIUM_PACKAGE_TEST_PATHS = Object.freeze([
+  `${SELENIUM_PACKAGE_DIRECTORY}/browser-selection.test.mjs`,
+  `${SELENIUM_PACKAGE_DIRECTORY}/harness.test.mjs`,
+  `${SELENIUM_PACKAGE_DIRECTORY}/reporting.test.mjs`,
+]);
+const WEB_CALCULATOR_LIFECYCLE_PATH =
+  "tests/e2e/fixtures/web-calculator/lifecycle.mjs";
+const REPORT_VALIDATOR_PATH =
+  ".github/scripts/validate-e2e-reports.mjs";
+const TRUSTED_EXECUTION_PATHS = Object.freeze([
+  REPORT_VALIDATOR_PATH,
+  SELENIUM_SETUP_PATH,
+  SELENIUM_SMOKE_PATH,
+  SELENIUM_WEB_CALCULATOR_PATH,
+  ...SELENIUM_PACKAGE_TEST_PATHS,
+  WEB_CALCULATOR_LIFECYCLE_PATH,
+]);
 const AXE_PACKAGE = "@axe-core/webdriverjs";
 const AXE_CORE_PACKAGE = "axe-core";
 const SELENIUM_PACKAGE = "selenium-webdriver";
@@ -77,6 +98,8 @@ const BROWSER_VERSION_PATTERN =
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const CHALLENGE_PATTERN = /^[0-9a-f]{64}$/u;
 const EXECUTOR_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+const RUN_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$/u;
+const MAX_REQUEST_LIFETIME_MS = 15 * 60 * 1000;
 const SELENIUM_MUTABLE_PATHS = Object.freeze([
   ...SELENIUM_MANAGED_PATHS,
   `${SELENIUM_PACKAGE_DIRECTORY}/.npm-cache`,
@@ -87,6 +110,7 @@ const SELENIUM_MUTABLE_PATHS = Object.freeze([
 const SAFE_ENVIRONMENT_OVERRIDES = new Set([
   "NPM_CONFIG_STRICT_SSL",
 ]);
+const executableDigestCache = new Map();
 
 class MetadataError extends Error {
   constructor(reasonCode, message, state = "unavailable") {
@@ -160,6 +184,14 @@ function timestamp(value) {
     throw new Error(`Invalid timestamp: ${value}`);
   }
   return date.toISOString();
+}
+
+function timestampMilliseconds(value, name) {
+  const canonical = timestamp(value);
+  if (canonical !== value) {
+    throw new Error(`${name} must be a canonical ISO-8601 timestamp`);
+  }
+  return Date.parse(canonical);
 }
 
 function assertObject(value, name) {
@@ -616,6 +648,69 @@ function runnerEvidence(identity, observedAt) {
     digest: hash(identity),
     observed_at: observedAt,
   };
+}
+
+function immutableExecutorToolIdentity(name, raw) {
+  const value = assertObject(raw, `Selenium executor tool ${name}`);
+  assertExactObjectKeys(
+    value,
+    new Set([
+      "digest",
+      ...("name" in value ? ["name"] : []),
+      "path",
+      "realpath",
+      "version",
+    ]),
+    `Selenium executor tool ${name}`,
+  );
+  if ("name" in value && value.name !== name) {
+    throw new Error(`Selenium executor tool ${name} name must match`);
+  }
+  const path = assertString(
+    value.path,
+    `Selenium executor tool ${name} path`,
+  );
+  const resolvedPath = assertString(
+    value.realpath,
+    `Selenium executor tool ${name} realpath`,
+  );
+  if (!isAbsolute(path) || !isAbsolute(resolvedPath)) {
+    throw new Error(
+      `Selenium executor tool ${name} paths must be absolute`,
+    );
+  }
+  return {
+    name,
+    path,
+    realpath: resolvedPath,
+    digest: assertDigest(
+      value.digest,
+      `Selenium executor tool ${name} digest`,
+    ),
+    version: parseExactSemver(
+      value.version,
+      `Selenium executor tool ${name} version`,
+    ).value,
+  };
+}
+
+function normalizeExecutorTools(raw) {
+  assertExactObjectKeys(
+    raw,
+    new Set(["node", "npm"]),
+    "Selenium executor tools",
+  );
+  const tools = {
+    node: immutableExecutorToolIdentity("node", raw.node),
+    npm: immutableExecutorToolIdentity("npm", raw.npm),
+  };
+  if (
+    tools.node.path === tools.npm.path ||
+    tools.node.realpath === tools.npm.realpath
+  ) {
+    throw new Error("Selenium executor Node and npm paths must differ");
+  }
+  return tools;
 }
 
 function readCurrentPackages(packageJson, packageLock) {
@@ -1411,6 +1506,7 @@ function relativeStep({
   kind,
   phase,
   scenario = null,
+  tool = null,
 }) {
   return {
     id,
@@ -1420,6 +1516,7 @@ function relativeStep({
     scenario,
     command,
     arguments: arguments_,
+    tool,
     cwd,
     environment: Object.fromEntries(
       Object.entries(environment).sort(([left], [right]) =>
@@ -1453,24 +1550,33 @@ function capabilityEnvironment(capability, candidate) {
   };
 }
 
-function capabilitySteps(capability, candidate) {
+function nodeStep(tools, properties) {
+  return relativeStep({
+    ...properties,
+    command: tools.node.realpath,
+    tool: "node",
+  });
+}
+
+function npmStep(tools, properties) {
+  return relativeStep({
+    ...properties,
+    command: tools.node.realpath,
+    arguments: [tools.npm.realpath, ...properties.arguments],
+    tool: "npm",
+  });
+}
+
+function capabilitySteps(capability, candidate, tools) {
   const environment = capabilityEnvironment(capability, candidate);
-  const common = [
-    "--prefix",
-    SELENIUM_PACKAGE_DIRECTORY,
-    "run",
-  ];
   const steps = [
-    relativeStep({
+    nodeStep(tools, {
       id: `${capability.id}-setup`,
       kind: "command",
       phase: "capability",
       capabilityId: capability.id,
-      command: "npm",
       arguments: [
-        ...common,
-        "setup",
-        "--",
+        SELENIUM_SETUP_PATH,
         "--browser",
         capability.browser,
         "--os",
@@ -1497,16 +1603,13 @@ function capabilitySteps(capability, candidate) {
     }
     if (scenario === "smoke") {
       steps.push(
-        relativeStep({
+        nodeStep(tools, {
           id: `${capability.id}-smoke`,
           kind: "command",
           phase: "capability",
           capabilityId: capability.id,
-          command: "npm",
           arguments: [
-            ...common,
-            "smoke",
-            "--",
+            SELENIUM_SMOKE_PATH,
             "--browser",
             capability.browser,
             "--os",
@@ -1518,20 +1621,15 @@ function capabilitySteps(capability, candidate) {
       );
     } else if (scenario === "web-calculator") {
       steps.push(
-        relativeStep({
+        nodeStep(tools, {
           id: `${capability.id}-web-calculator`,
           kind: "command",
           phase: "capability",
           capabilityId: capability.id,
-          command: "node",
           arguments: [
-            "tests/e2e/fixtures/web-calculator/lifecycle.mjs",
-            "npm",
-            "--prefix",
-            SELENIUM_PACKAGE_DIRECTORY,
-            "run",
-            "web-calculator",
-            "--",
+            WEB_CALCULATOR_LIFECYCLE_PATH,
+            tools.node.realpath,
+            SELENIUM_WEB_CALCULATOR_PATH,
             "--browser",
             capability.browser,
             "--os",
@@ -1563,13 +1661,12 @@ function capabilitySteps(capability, candidate) {
     }
   }
   steps.push(
-    relativeStep({
+    nodeStep(tools, {
       id: `${capability.id}-artifact-contracts`,
       kind: "command",
       phase: "evidence",
       capabilityId: capability.id,
-      command: "node",
-      arguments: [".github/scripts/validate-e2e-reports.mjs"],
+      arguments: [REPORT_VALIDATOR_PATH],
       environment: {
         ...environment,
         E2E_CAPABILITY_ID: capability.id,
@@ -1616,9 +1713,116 @@ function qualificationCapability(capability) {
   };
 }
 
+function validateTrustedInputManifest(manifest, repositoryRevision) {
+  assertExactObjectKeys(
+    manifest,
+    new Set([
+      "files",
+      "github_api_permission",
+      "kind",
+      "repository_revision",
+      "schema_version",
+    ]),
+    "Selenium trusted-input manifest",
+  );
+  if (
+    manifest.schema_version !== 1 ||
+    manifest.kind !== "repository-source-manifest" ||
+    manifest.repository_revision !== repositoryRevision ||
+    manifest.github_api_permission !== "none" ||
+    !Array.isArray(manifest.files) ||
+    manifest.files.length === 0
+  ) {
+    throw new Error(
+      "Selenium trusted-input manifest must bind the repository revision, files, and no GitHub API permission",
+    );
+  }
+  const paths = new Set();
+  for (const [index, entry] of manifest.files.entries()) {
+    assertExactObjectKeys(
+      entry,
+      new Set(["digest", "mode", "path", "type"]),
+      `Selenium trusted-input manifest file[${index}]`,
+    );
+    if (
+      typeof entry.path !== "string" ||
+      entry.path.length === 0 ||
+      entry.path.startsWith("/") ||
+      entry.path.split("/").includes("..") ||
+      paths.has(entry.path) ||
+      entry.type !== "file" ||
+      !Number.isInteger(entry.mode) ||
+      entry.mode < 0 ||
+      entry.mode > 0o777
+    ) {
+      throw new Error(
+        "Selenium trusted-input manifest must contain unique repository files",
+      );
+    }
+    assertDigest(
+      entry.digest,
+      `Selenium trusted-input manifest file[${index}].digest`,
+    );
+    paths.add(entry.path);
+  }
+  if (
+    stableJson([...manifest.files].sort(({ path: left }, { path: right }) =>
+      compareText(left, right))) !== stableJson(manifest.files)
+  ) {
+    throw new Error("Selenium trusted-input manifest files must be sorted");
+  }
+  for (const path of TRUSTED_EXECUTION_PATHS) {
+    if (!paths.has(path)) {
+      throw new Error(
+        `Selenium trusted-input manifest lacks executable input ${path}`,
+      );
+    }
+  }
+  return structuredClone(manifest);
+}
+
+export async function createSeleniumTrustedInputManifest(
+  repositoryRoot,
+  repositoryRevision,
+) {
+  if (!REVISION_PATTERN.test(repositoryRevision ?? "")) {
+    throw new Error(
+      "Selenium trusted-input manifest repository revision must be a full lowercase commit SHA",
+    );
+  }
+  const entries = await treeEntries(repositoryRoot, repositoryRoot, {
+    excludeRootNames: new Set([".git"]),
+  });
+  if (entries.some(([, entry]) => entry.type !== "file")) {
+    throw new Error(
+      "Selenium trusted-input manifest does not permit repository symlinks",
+    );
+  }
+  return validateTrustedInputManifest(
+    {
+      schema_version: 1,
+      kind: "repository-source-manifest",
+      repository_revision: repositoryRevision,
+      github_api_permission: "none",
+      files: entries
+        .map(([path, entry]) => ({
+          path,
+          type: "file",
+          mode: entry.mode,
+          digest: entry.digest,
+        }))
+        .sort(({ path: left }, { path: right }) =>
+          compareText(left, right)),
+    },
+    repositoryRevision,
+  );
+}
+
 export function createSeleniumQualificationPlan({
   observation,
   catalog,
+  executorTools,
+  trustedInputManifest,
 } = {}) {
   validateCatalog(catalog);
   const capabilityDigest = hash(unorderedCanonicalValue(catalog));
@@ -1652,6 +1856,11 @@ export function createSeleniumQualificationPlan({
     );
   }
   const candidate = decodedCandidate(observation);
+  const tools = normalizeExecutorTools(executorTools);
+  const trustedInputs = validateTrustedInputManifest(
+    trustedInputManifest,
+    observation.repository.revision,
+  );
   if (
     candidate.runner.browser.compatibility_key !==
     candidate.runner.driver.compatibility_key
@@ -1680,8 +1889,20 @@ export function createSeleniumQualificationPlan({
   }
   const [registryOrigin] = registryOrigins;
   const steps = [
+    nodeStep(tools, {
+      id: "verify-executor-node",
+      kind: "node-identity",
+      phase: "prepare",
+      arguments: ["--version"],
+    }),
+    npmStep(tools, {
+      id: "verify-executor-npm",
+      kind: "npm-identity",
+      phase: "prepare",
+      arguments: ["--version"],
+    }),
     ...PACKAGE_NAMES.map((name) =>
-      relativeStep({
+      npmStep(tools, {
         id: {
           [AXE_PACKAGE]: "cache-selenium-axe-webdriver-tarball",
           [AXE_CORE_PACKAGE]: "cache-selenium-axe-core-tarball",
@@ -1689,7 +1910,6 @@ export function createSeleniumQualificationPlan({
         }[name],
         kind: "command",
         phase: "prepare",
-        command: "npm",
         cwd: SELENIUM_PACKAGE_DIRECTORY,
         arguments: [
           "cache",
@@ -1699,11 +1919,10 @@ export function createSeleniumQualificationPlan({
           ".npm-cache",
         ],
       })),
-    relativeStep({
+    npmStep(tools, {
       id: "apply-selenium-tarballs",
       kind: "command",
       phase: "prepare",
-      command: "npm",
       cwd: SELENIUM_PACKAGE_DIRECTORY,
       arguments: [
         "install",
@@ -1722,11 +1941,10 @@ export function createSeleniumQualificationPlan({
         ),
       ],
     }),
-    relativeStep({
+    npmStep(tools, {
       id: "install-selenium-candidate",
       kind: "command",
       phase: "prepare",
-      command: "npm",
       cwd: SELENIUM_PACKAGE_DIRECTORY,
       arguments: [
         "ci",
@@ -1752,15 +1970,13 @@ export function createSeleniumQualificationPlan({
       command: candidate.runner.driver.realpath,
       arguments: ["--version"],
     }),
-    relativeStep({
+    nodeStep(tools, {
       id: "test-selenium-package",
       kind: "command",
       phase: "package-test",
-      command: "npm",
       arguments: [
-        "--prefix",
-        SELENIUM_PACKAGE_DIRECTORY,
-        "test",
+        "--test",
+        ...SELENIUM_PACKAGE_TEST_PATHS,
       ],
     }),
     relativeStep({
@@ -1778,7 +1994,7 @@ export function createSeleniumQualificationPlan({
       arguments: ["--version"],
     }),
     ...selectedCapabilities.flatMap((capability) =>
-      capabilitySteps(capability, candidate)),
+      capabilitySteps(capability, candidate, tools)),
   ];
   return {
     schema_version: 1,
@@ -1788,15 +2004,19 @@ export function createSeleniumQualificationPlan({
     repository: structuredClone(observation.repository),
     workspace: {
       kind: "isolated-executor",
+      github_api_permission: "none",
       immutable_inputs: {
         kind: "repository-source-manifest",
         access: "read-only",
+        manifest: trustedInputs,
+        manifest_digest: hash(trustedInputs),
       },
       mutable_paths: [...SELENIUM_MUTABLE_PATHS],
       managed_paths: [...SELENIUM_MANAGED_PATHS],
     },
     packages: PACKAGE_NAMES.map((name) =>
       structuredClone(candidate.packages[name])),
+    tools,
     runner: structuredClone(candidate.runner),
     selected_capabilities: selectedCapabilities,
     steps,
@@ -1916,7 +2136,11 @@ function commandEvidence(
     revision: plan.repository.revision,
     digest: hash({
       candidate_digest: plan.candidate_digest,
+      plan_digest: hash(plan),
       step,
+      tools: plan.tools,
+      trusted_inputs_digest:
+        plan.workspace.immutable_inputs.manifest_digest,
       runner: plan.runner,
       raw,
     }),
@@ -1985,7 +2209,7 @@ function validateEnvironmentOverrides(overrides) {
   );
 }
 
-function validateExecutor(executor) {
+function validateExecutor(executor, trustedAuthority) {
   assertExactObjectKeys(
     executor,
     new Set(["authority", "execute", "id", "path", "tools"]),
@@ -2002,11 +2226,21 @@ function validateExecutor(executor) {
   }
   assertExactObjectKeys(
     executor.authority,
-    new Set(["identity_digest", "kind", "public_key"]),
+    new Set([
+      "github_api_permission",
+      "identity_digest",
+      "kind",
+      "public_key",
+    ]),
     "Selenium executor authority",
   );
-  if (executor.authority.kind !== "ed25519") {
-    throw new Error("Selenium executor authority kind must equal ed25519");
+  if (
+    executor.authority.kind !== "ed25519" ||
+    executor.authority.github_api_permission !== "none"
+  ) {
+    throw new Error(
+      "Selenium executor authority must be Ed25519 with no GitHub API permission",
+    );
   }
   assertDigest(
     executor.authority.identity_digest,
@@ -2028,6 +2262,29 @@ function validateExecutor(executor) {
     throw new Error("Selenium executor authority public_key must be Ed25519");
   }
   if (
+    executor.authority.identity_digest !==
+    hash(executor.authority.public_key)
+  ) {
+    throw new Error(
+      "Selenium executor authority identity_digest must bind its public key",
+    );
+  }
+  assertExactObjectKeys(
+    trustedAuthority,
+    new Set([
+      "github_api_permission",
+      "identity_digest",
+      "kind",
+      "public_key",
+    ]),
+    "Caller-trusted Selenium executor authority",
+  );
+  if (
+    stableJson(executor.authority) !== stableJson(trustedAuthority)
+  ) {
+    throw new Error("Selenium executor authority is not caller-trusted");
+  }
+  if (
     !Array.isArray(executor.path) ||
     executor.path.length === 0 ||
     new Set(executor.path).size !== executor.path.length ||
@@ -2040,30 +2297,11 @@ function validateExecutor(executor) {
       "Selenium executor path must contain unique absolute directories",
     );
   }
-  assertExactObjectKeys(
-    executor.tools,
-    new Set(["node", "npm"]),
-    "Selenium executor tools",
-  );
-  for (const name of ["node", "npm"]) {
-    const tool = executor.tools[name];
-    assertExactObjectKeys(
-      tool,
-      new Set(["command", "digest", "realpath", "version"]),
-      `Selenium executor tool ${name}`,
-    );
-    if (tool.command !== name) {
-      throw new Error(`Selenium executor tool ${name} command must equal ${name}`);
-    }
-    assertDigest(tool.digest, `Selenium executor tool ${name} digest`);
-    assertString(tool.version, `Selenium executor tool ${name} version`);
-    if (!isAbsolute(tool.realpath)) {
-      throw new Error(
-        `Selenium executor tool ${name} realpath must be absolute`,
-      );
-    }
-  }
-  return executor;
+  return {
+    ...executor,
+    authority: structuredClone(executor.authority),
+    tools: normalizeExecutorTools(executor.tools),
+  };
 }
 
 function sanitizedEnvironment(
@@ -2142,6 +2380,7 @@ function executorPolicy({
     repository_revision: plan.repository.revision,
     plan_digest: hash(plan),
     authority: {
+      github_api_permission: executorAuthority.github_api_permission,
       identity_digest: executorAuthority.identity_digest,
       kind: executorAuthority.kind,
       public_key_digest: hash(executorAuthority.public_key),
@@ -2151,6 +2390,7 @@ function executorPolicy({
     runner: structuredClone(plan.runner),
     isolation: {
       disposable: true,
+      github_api_access: false,
       network: "candidate-registry-only",
       privileges: "unprivileged",
       repository_write_access: false,
@@ -2164,6 +2404,9 @@ function executorPolicy({
       immutable_inputs: {
         access: "read-only",
         digest: immutableInputsDigest,
+        manifest_digest:
+          plan.workspace.immutable_inputs.manifest_digest,
+        repository_revision: plan.repository.revision,
       },
       mutable_paths: {
         executor_state: executorStatePaths,
@@ -2177,17 +2420,57 @@ function executorPolicy({
   };
 }
 
-function executionRequest(policy, challenge) {
-  if (typeof challenge !== "string" || !CHALLENGE_PATTERN.test(challenge)) {
+function assertFreshExecutionRequest(request, now) {
+  const issuedAt = timestampMilliseconds(
+    request.issued_at,
+    "Selenium executor request issued_at",
+  );
+  const expiresAt = timestampMilliseconds(
+    request.expires_at,
+    "Selenium executor request expires_at",
+  );
+  const observedAt = now instanceof Date ? now.getTime() : Date.parse(now);
+  if (
+    !Number.isFinite(observedAt) ||
+    issuedAt >= expiresAt ||
+    expiresAt - issuedAt > MAX_REQUEST_LIFETIME_MS ||
+    observedAt < issuedAt ||
+    observedAt >= expiresAt
+  ) {
+    throw new Error("Selenium executor request is stale or not yet valid");
+  }
+}
+
+function executionRequest(policy, freshness, now) {
+  assertExactObjectKeys(
+    freshness,
+    new Set(["challenge", "expires_at", "issued_at", "run_id"]),
+    "Selenium executor request freshness",
+  );
+  if (
+    typeof freshness.challenge !== "string" ||
+    !CHALLENGE_PATTERN.test(freshness.challenge)
+  ) {
     throw new Error(
       "Selenium executor challenge must be 64 lowercase hexadecimal characters",
+    );
+  }
+  if (
+    typeof freshness.run_id !== "string" ||
+    !RUN_ID_PATTERN.test(freshness.run_id)
+  ) {
+    throw new Error(
+      "Selenium executor run_id must be a bounded deterministic identifier",
     );
   }
   const request = {
     schema_version: 1,
     kind: "selenium-executor-request",
     authority_digest: hash(policy.authority),
-    challenge,
+    challenge: freshness.challenge,
+    run_id: freshness.run_id,
+    issued_at: freshness.issued_at,
+    expires_at: freshness.expires_at,
     executor_id: policy.executor_id,
     candidate_digest: policy.candidate_digest,
     repository_revision: policy.repository_revision,
@@ -2195,18 +2478,28 @@ function executionRequest(policy, challenge) {
     policy_digest: hash(policy),
     immutable_inputs_digest:
       policy.filesystem.immutable_inputs.digest,
+    trusted_inputs_digest:
+      policy.filesystem.immutable_inputs.manifest_digest,
     mutable_paths_digest: policy.filesystem.mutable_paths_digest,
     tools_digest: policy.tools_digest,
   };
-  return {
+  const bound = {
     ...request,
     request_digest: hash(request),
   };
+  assertFreshExecutionRequest(bound, now);
+  return bound;
 }
 
 function stepExecutableIdentity(step, policy) {
-  if (step.command === "node" || step.command === "npm") {
-    return policy.tools[step.command];
+  if (step.tool === "node") {
+    return policy.tools.node;
+  }
+  if (step.tool === "npm") {
+    return {
+      node: policy.tools.node,
+      npm: policy.tools.npm,
+    };
   }
   if (step.kind === "browser-identity") {
     return policy.runner.browser;
@@ -2245,6 +2538,9 @@ export function createSeleniumExecutorAttestation({
     kind: "selenium-executor-attestation",
     authority_digest: request.authority_digest,
     challenge: request.challenge,
+    run_id: request.run_id,
+    issued_at: request.issued_at,
+    expires_at: request.expires_at,
     executor_id: request.executor_id,
     candidate_digest: request.candidate_digest,
     repository_revision: request.repository_revision,
@@ -2252,6 +2548,7 @@ export function createSeleniumExecutorAttestation({
     policy_digest: request.policy_digest,
     request_digest: request.request_digest,
     immutable_inputs_digest: request.immutable_inputs_digest,
+    trusted_inputs_digest: request.trusted_inputs_digest,
     mutable_paths_digest: request.mutable_paths_digest,
     tools_digest: request.tools_digest,
     step_id: step.id,
@@ -2299,10 +2596,12 @@ function validateExecutorAttestation(
     "authority_digest",
     "candidate_digest",
     "challenge",
+    "expires_at",
     "environment_digest",
     "executable_identity_digest",
     "executor_id",
     "immutable_inputs_digest",
+    "issued_at",
     "isolation",
     "kind",
     "mutable_paths_digest",
@@ -2311,11 +2610,13 @@ function validateExecutorAttestation(
     "repository_revision",
     "request_digest",
     "result_digest",
+    "run_id",
     "schema_version",
     "signature",
     "step_digest",
     "step_id",
     "tools_digest",
+    "trusted_inputs_digest",
     "working_directory",
   ]);
   assertExactObjectKeys(
@@ -2327,6 +2628,7 @@ function validateExecutorAttestation(
     attestation.isolation,
     new Set([
       "disposable",
+      "github_api_access",
       "network",
       "privileges",
       "repository_write_access",
@@ -2339,6 +2641,9 @@ function validateExecutorAttestation(
     kind: "selenium-executor-attestation",
     authority_digest: request.authority_digest,
     challenge: request.challenge,
+    run_id: request.run_id,
+    issued_at: request.issued_at,
+    expires_at: request.expires_at,
     executor_id: request.executor_id,
     candidate_digest: request.candidate_digest,
     repository_revision: request.repository_revision,
@@ -2346,6 +2651,7 @@ function validateExecutorAttestation(
     policy_digest: request.policy_digest,
     request_digest: request.request_digest,
     immutable_inputs_digest: request.immutable_inputs_digest,
+    trusted_inputs_digest: request.trusted_inputs_digest,
     mutable_paths_digest: request.mutable_paths_digest,
     tools_digest: request.tools_digest,
     step_id: step.id,
@@ -2358,6 +2664,7 @@ function validateExecutorAttestation(
     result_digest: hash(raw),
     isolation: {
       disposable: true,
+      github_api_access: false,
       network: "candidate-registry-only",
       privileges: "unprivileged",
       repository_write_access: false,
@@ -2417,14 +2724,21 @@ function executorAttestationSetEvidence(
           compareText(left, right)),
       candidate_digest: plan.candidate_digest,
       expected_step_ids: plan.steps.map(({ id }) => id).sort(compareText),
+      expires_at: request.expires_at,
+      issued_at: request.issued_at,
       request_digest: request.request_digest,
+      run_id: request.run_id,
+      trusted_inputs_digest: request.trusted_inputs_digest,
     }),
     started_at: startedAt,
     completed_at: completedAt,
   };
 }
 
-async function verifyExecutableIdentity(identity) {
+async function verifyExecutableIdentity(
+  identity,
+  { requireExecutable = true } = {},
+) {
   const observedRealpath = await realpath(identity.path);
   const canonicalRealpath = await realpath(identity.realpath);
   if (
@@ -2436,10 +2750,31 @@ async function verifyExecutableIdentity(identity) {
     );
   }
   const metadata = await lstat(identity.realpath);
-  if (!metadata.isFile() || (metadata.mode & 0o111) === 0) {
-    throw new Error(`${identity.kind} executable must be an executable file`);
+  if (
+    !metadata.isFile() ||
+    (requireExecutable && (metadata.mode & 0o111) === 0)
+  ) {
+    throw new Error(
+      `${identity.kind ?? identity.name} executable identity is invalid`,
+    );
   }
-  if (hash(await readFile(identity.realpath)) !== identity.executable_digest) {
+  const expectedDigest = identity.executable_digest ?? identity.digest;
+  const cacheKey = stableJson({
+    ctime_ms: metadata.ctimeMs,
+    device: metadata.dev,
+    expected_digest: expectedDigest,
+    inode: metadata.ino,
+    mode: metadata.mode,
+    mtime_ms: metadata.mtimeMs,
+    path: identity.realpath,
+    size: metadata.size,
+  });
+  let observedDigest = executableDigestCache.get(cacheKey);
+  if (observedDigest === undefined) {
+    observedDigest = hash(await readFile(identity.realpath));
+    executableDigestCache.set(cacheKey, observedDigest);
+  }
+  if (observedDigest !== expectedDigest) {
     throw new Error(
       `${identity.kind} executable digest does not match runner evidence`,
     );
@@ -2447,6 +2782,14 @@ async function verifyExecutableIdentity(identity) {
 }
 
 function exactExecutableVersion(kind, output, identity) {
+  if (kind === "node") {
+    return output === `v${identity.version}\n` ||
+      output === `v${identity.version}\r\n`;
+  }
+  if (kind === "npm") {
+    return output === `${identity.version}\n` ||
+      output === `${identity.version}\r\n`;
+  }
   const labels = {
     browser: { chromium: "Chromium" },
     driver: { chromedriver: "ChromeDriver" },
@@ -2468,6 +2811,68 @@ function exactExecutableVersion(kind, output, identity) {
   );
 }
 
+async function verifyStepToolBinding(step, policy) {
+  if (step.tool === "node") {
+    if (step.command !== policy.tools.node.realpath) {
+      throw new Error(`${step.id} does not use the measured Node realpath`);
+    }
+    await verifyExecutableIdentity(policy.tools.node);
+    return;
+  }
+  if (step.tool === "npm") {
+    if (
+      step.command !== policy.tools.node.realpath ||
+      step.arguments[0] !== policy.tools.npm.realpath
+    ) {
+      throw new Error(
+        `${step.id} does not use the measured Node and npm realpaths`,
+      );
+    }
+    await Promise.all([
+      verifyExecutableIdentity(policy.tools.node),
+      verifyExecutableIdentity(policy.tools.npm, {
+        requireExecutable: false,
+      }),
+    ]);
+    return;
+  }
+  if (
+    step.kind !== "browser-identity" &&
+    step.kind !== "driver-identity"
+  ) {
+    throw new Error(`${step.id} does not declare a measured executable`);
+  }
+}
+
+async function verifyExecutorToolIdentities(tools, environment) {
+  await Promise.all([
+    verifyExecutableIdentity(tools.node),
+    verifyExecutableIdentity(tools.npm, { requireExecutable: false }),
+  ]);
+  const options = {
+    encoding: "utf8",
+    env: environment,
+    maxBuffer: 1024 * 1024,
+  };
+  const [{ stdout: nodeVersion }, { stdout: npmVersion }] =
+    await Promise.all([
+      execFileAsync(tools.node.realpath, ["--version"], options),
+      execFileAsync(
+        tools.node.realpath,
+        [tools.npm.realpath, "--version"],
+        options,
+      ),
+    ]);
+  if (
+    !exactExecutableVersion("node", nodeVersion, tools.node) ||
+    !exactExecutableVersion("npm", npmVersion, tools.npm)
+  ) {
+    throw new Error(
+      "Selenium executor Node or npm version does not match its measured identity",
+    );
+  }
+}
+
 async function executeControlledStep(
   step,
   plan,
@@ -2481,7 +2886,9 @@ async function executeControlledStep(
     workspaceRoot,
   },
 ) {
-  const startedAt = timestamp(now());
+  const startedValue = now();
+  assertFreshExecutionRequest(request, startedValue);
+  const startedAt = timestamp(startedValue);
   let attestation = null;
   let commandOutput = "";
   let raw;
@@ -2492,6 +2899,7 @@ async function executeControlledStep(
         ? plan.runner.driver
         : null;
   try {
+    await verifyStepToolBinding(step, policy);
     if (identity !== null) {
       if (step.command !== identity.realpath) {
         throw new Error(
@@ -2545,9 +2953,12 @@ async function executeControlledStep(
       stderr: error.message,
     };
   }
-  if (identity !== null && raw.exitCode === 0) {
+  if (raw.exitCode === 0) {
     try {
-      await verifyExecutableIdentity(identity);
+      await verifyStepToolBinding(step, policy);
+      if (identity !== null) {
+        await verifyExecutableIdentity(identity);
+      }
     } catch (error) {
       raw = {
         ...raw,
@@ -2556,9 +2967,28 @@ async function executeControlledStep(
       };
     }
   }
-  const completedAt = timestamp(now());
+  const completedValue = now();
+  try {
+    assertFreshExecutionRequest(request, completedValue);
+  } catch (error) {
+    raw = {
+      ...raw,
+      exitCode: 1,
+      stderr: `${raw.stderr}${error.message}`,
+    };
+  }
+  const completedAt = timestamp(completedValue);
   let identityMatches = true;
-  if (identity !== null && raw.exitCode === 0) {
+  if (
+    raw.exitCode === 0 &&
+    ["node-identity", "npm-identity"].includes(step.kind)
+  ) {
+    identityMatches = exactExecutableVersion(
+      step.kind === "node-identity" ? "node" : "npm",
+      raw.stdout,
+      policy.tools[step.kind === "node-identity" ? "node" : "npm"],
+    );
+  } else if (identity !== null && raw.exitCode === 0) {
     try {
       identityMatches = exactExecutableVersion(
         identity.kind,
@@ -2731,7 +3161,11 @@ function internalCheckEvidence(
           candidate_digest: plan.candidate_digest,
           id,
           message,
+          plan_digest: hash(plan),
           runner: plan.runner,
+          tools: plan.tools,
+          trusted_inputs_digest:
+            plan.workspace.immutable_inputs.manifest_digest,
         }),
         started_at: startedAt,
         completed_at: completedAt,
@@ -3012,14 +3446,6 @@ async function immutableWorkspaceDigest(workspaceRoot, mutablePaths) {
   return hash(entries);
 }
 
-async function sourceState(repositoryRoot) {
-  return hash(
-    (await treeEntries(repositoryRoot, repositoryRoot, {
-      excludeRootNames: new Set([".git"]),
-    })).sort(([left], [right]) => compareText(left, right)),
-  );
-}
-
 function aggregateStatus(checks) {
   return checks.some(({ status }) => status !== "pass") ? "fail" : "pass";
 }
@@ -3054,6 +3480,9 @@ function artifactEvidence(capability, plan, files, startedAt, completedAt) {
       capability_id: capability.id,
       files,
       runner: plan.runner,
+      tools: plan.tools,
+      trusted_inputs_digest:
+        plan.workspace.immutable_inputs.manifest_digest,
     }),
     started_at: startedAt,
     completed_at: completedAt,
@@ -3067,16 +3496,26 @@ export async function qualifySeleniumCandidate(
   },
   {
     catalog,
+    consumeExecutionRequest,
     createWorkspace = defaultCreateWorkspace,
     environmentOverrides = {},
-    executionChallenge,
+    executionRequestFreshness,
     executor,
     generatedAt = new Date().toISOString(),
     materializeWorkspace = copyRepository,
     now = () => new Date(),
+    trustedExecutorAuthority,
   } = {},
 ) {
-  const isolatedExecutor = validateExecutor(executor);
+  const isolatedExecutor = validateExecutor(
+    executor,
+    trustedExecutorAuthority,
+  );
+  if (typeof consumeExecutionRequest !== "function") {
+    throw new Error(
+      "Selenium qualification requires a caller-owned one-time request consumer",
+    );
+  }
   const root = resolve(repositoryRoot);
   const catalogDocument =
     catalog ??
@@ -3096,7 +3535,12 @@ export async function qualifySeleniumCandidate(
     );
   }
   await validateContainedSymlinks(root, "Source repository");
-  const sourceBefore = await sourceState(root);
+  const trustedInputManifest =
+    await createSeleniumTrustedInputManifest(
+      root,
+      observation.repository.revision,
+    );
+  const sourceBefore = hash(trustedInputManifest);
   await verifySourcePackageBinding(observation, root);
   const temporaryRoot = resolve(await createWorkspace());
   if (isWithin(root, temporaryRoot) || isWithin(temporaryRoot, root)) {
@@ -3108,9 +3552,24 @@ export async function qualifySeleniumCandidate(
   try {
     await materializeWorkspace(root, workspaceRoot);
     await validateContainedSymlinks(workspaceRoot, "Ephemeral workspace");
+    const materializedManifest =
+      await createSeleniumTrustedInputManifest(
+        workspaceRoot,
+        observation.repository.revision,
+      );
+    if (
+      stableJson(materializedManifest) !==
+      stableJson(trustedInputManifest)
+    ) {
+      throw new Error(
+        "Ephemeral workspace does not exactly match the trusted-input manifest",
+      );
+    }
     const plan = createSeleniumQualificationPlan({
       observation,
       catalog: catalogDocument,
+      executorTools: isolatedExecutor.tools,
+      trustedInputManifest,
     });
     const immutableBefore = await immutableWorkspaceDigest(
       workspaceRoot,
@@ -3126,6 +3585,10 @@ export async function qualifySeleniumCandidate(
       mkdir(baseEnvironment.HOME, { recursive: true }),
       mkdir(baseEnvironment.TMPDIR, { recursive: true }),
     ]);
+    await verifyExecutorToolIdentities(
+      isolatedExecutor.tools,
+      baseEnvironment,
+    );
     const policy = executorPolicy({
       executorAuthority: isolatedExecutor.authority,
       executorId: isolatedExecutor.id,
@@ -3137,11 +3600,24 @@ export async function qualifySeleniumCandidate(
       temporaryRoot,
       workspaceRoot,
     });
-    const request = executionRequest(policy, executionChallenge);
+    const request = executionRequest(
+      policy,
+      executionRequestFreshness,
+      now(),
+    );
+    if (
+      await consumeExecutionRequest(structuredClone(request)) !== true
+    ) {
+      throw new Error(
+        "Selenium executor request challenge or run binding was already consumed",
+      );
+    }
     const attestations = [];
     const checks = [];
     const failures = [];
     for (const id of [
+      "verify-executor-node",
+      "verify-executor-npm",
       "cache-selenium-axe-webdriver-tarball",
       "cache-selenium-axe-core-tarball",
       "cache-selenium-webdriver-tarball",
@@ -3426,6 +3902,7 @@ export async function qualifySeleniumCandidate(
       policy,
       request,
       results,
+      trustedInputManifest,
     };
   } catch (error) {
     workError = error;
@@ -3434,7 +3911,10 @@ export async function qualifySeleniumCandidate(
   }
 
   const [sourceAfter, checkoutAfter] = await Promise.all([
-    sourceState(root),
+    createSeleniumTrustedInputManifest(
+      root,
+      observation.repository.revision,
+    ).then(hash),
     checkoutState(root),
   ]);
   if (
@@ -3460,6 +3940,11 @@ export async function qualifySeleniumCandidate(
       checkout_after: checkoutAfter,
       source_before: sourceBefore,
       source_after: sourceAfter,
+      plan_digest: hash(execution.plan),
+      policy_digest: hash(execution.policy),
+      request_digest: execution.request.request_digest,
+      trusted_inputs_digest:
+        execution.plan.workspace.immutable_inputs.manifest_digest,
     }),
     started_at: guardStartedAt,
     completed_at: guardCompletedAt,
@@ -3496,8 +3981,10 @@ export async function qualifySeleniumCandidate(
     checks: execution.checks,
     executor: {
       attestations: execution.attestations,
+      plan: execution.plan,
       policy: execution.policy,
       request: execution.request,
+      trusted_inputs: execution.trustedInputManifest,
     },
   };
 }
