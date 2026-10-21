@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  assertCypressTaskPlatformSupported,
+  CleanupError,
   npmInvocation,
+  ProcessStoppedError,
   runCommand,
-  runTaskkill,
-  taskkillExitAccepted,
-  terminateProcessTree,
 } from "./task.mjs";
 
 const PROCESS_TREE_FIXTURE = resolve(
@@ -24,7 +24,7 @@ async function waitForReadyFile(path) {
     try {
       return JSON.parse(await readFile(path, "utf8"));
     } catch (error) {
-      if (error?.code !== "ENOENT") {
+      if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) {
         throw error;
       }
     }
@@ -56,7 +56,7 @@ async function waitForProcessExit(processId) {
   return true;
 }
 
-test("uses cmd.exe explicitly for npm.cmd on Windows", () => {
+test("keeps a deterministic Windows npm invocation for a future hosted row", () => {
   assert.deepEqual(
     npmInvocation(["ci"], {
       environment: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
@@ -83,194 +83,78 @@ test("uses npm directly on non-Windows hosts", () => {
   });
 });
 
-test("accepts the taskkill already-gone exit code", () => {
-  assert.equal(taskkillExitAccepted(0), true);
-  assert.equal(taskkillExitAccepted(128), true);
-  assert.equal(taskkillExitAccepted(1), false);
-});
+test("fails closed on Windows before spawning a Cypress task process", async () => {
+  let spawned = false;
 
-test("bounds taskkill.exe execution and helper reaping", async () => {
-  const taskkill = new EventEmitter();
-  taskkill.exitCode = null;
-  taskkill.signalCode = null;
-  taskkill.kill = (signal) => {
-    taskkill.killedWith = signal;
-    return true;
-  };
-  const waitDurations = [];
-  const waitResults = [
-    null,
-    {
-      code: null,
-      signal: "SIGKILL",
-    },
-  ];
-  let invocation;
-
-  const accepted = await runTaskkill(4321, {
-    force: true,
-    forceStopGraceMilliseconds: 100,
-    spawnImplementation: (command, arguments_, options) => {
-      invocation = { arguments_, command, options };
-      return taskkill;
-    },
-    timeoutMilliseconds: 250,
-    waitForExitResultWithinImplementation: async (
-      _child,
-      timeoutMilliseconds,
-    ) => {
-      waitDurations.push(timeoutMilliseconds);
-      return waitResults.shift();
-    },
-  });
-
-  assert.equal(accepted, false);
-  assert.deepEqual(invocation.arguments_, ["/pid", "4321", "/t", "/f"]);
-  assert.equal(invocation.command, "taskkill.exe");
-  assert.equal(taskkill.killedWith, "SIGKILL");
-  assert.deepEqual(waitDurations, [250, 100]);
-});
-
-test("fails after the bounded taskkill.exe helper reap window", async () => {
-  const taskkill = new EventEmitter();
-  taskkill.exitCode = null;
-  taskkill.signalCode = null;
-  taskkill.kill = () => true;
-  const waitDurations = [];
-
-  await assert.rejects(
-    runTaskkill(4321, {
-      forceStopGraceMilliseconds: 25,
-      spawnImplementation: () => taskkill,
-      timeoutMilliseconds: 50,
-      waitForExitResultWithinImplementation: async (
-        _child,
-        timeoutMilliseconds,
-      ) => {
-        waitDurations.push(timeoutMilliseconds);
-        return null;
-      },
-    }),
-    /did not exit after SIGKILL/,
+  assert.doesNotThrow(() =>
+    assertCypressTaskPlatformSupported({ platform: "linux" }),
   );
-  assert.deepEqual(waitDurations, [50, 25]);
-});
-
-test("runs taskkill for an already-exited direct parent", async () => {
-  const taskkillCalls = [];
-  const child = {
-    exitCode: 1,
-    pid: 1234,
-    signalCode: null,
-  };
-
-  await terminateProcessTree(child, {
-    platform: "win32",
-    runTaskkillImplementation: async (processId, options) => {
-      taskkillCalls.push({
-        force: options.force,
-        processId,
-        timeoutMilliseconds: options.timeoutMilliseconds,
-      });
-      return true;
-    },
-    taskkillTimeoutMilliseconds: 250,
-  });
-
-  assert.deepEqual(taskkillCalls, [
-    {
-      force: false,
-      processId: 1234,
-      timeoutMilliseconds: 250,
-    },
-  ]);
-});
-
-test("bounds Windows graceful and forced process-tree waits", async () => {
-  const taskkillCalls = [];
-  const waitDurations = [];
-  const child = {
-    exitCode: null,
-    pid: 1234,
-    signalCode: null,
-  };
-  const waitResults = [false, true];
-
-  await terminateProcessTree(child, {
-    platform: "win32",
-    runTaskkillImplementation: async (processId, options) => {
-      taskkillCalls.push({
-        force: options.force,
-        processId,
-        timeoutMilliseconds: options.timeoutMilliseconds,
-      });
-      return true;
-    },
-    taskkillTimeoutMilliseconds: 250,
-    timeoutMilliseconds: 5_000,
-    waitForExitWithinImplementation: async (_child, timeoutMilliseconds) => {
-      waitDurations.push(timeoutMilliseconds);
-      return waitResults.shift();
-    },
-  });
-
-  assert.deepEqual(taskkillCalls, [
-    { force: false, processId: 1234, timeoutMilliseconds: 250 },
-    { force: true, processId: 1234, timeoutMilliseconds: 250 },
-  ]);
-  assert.deepEqual(waitDurations, [5_000, 1_000]);
-});
-
-test("fails after the bounded forced Windows process-tree wait", async () => {
-  const child = {
-    exitCode: null,
-    pid: 1234,
-    signalCode: null,
-  };
-
+  assert.throws(
+    () => assertCypressTaskPlatformSupported({ platform: "win32" }),
+    /disabled until a hosted Windows row proves process-tree ownership/,
+  );
   await assert.rejects(
-    terminateProcessTree(child, {
+    runCommand("example.exe", [], {
       platform: "win32",
-      runTaskkillImplementation: async () => true,
-      timeoutMilliseconds: 50,
-      waitForExitWithinImplementation: async () => false,
+      spawnImplementation: () => {
+        spawned = true;
+      },
     }),
-    /did not exit after forced taskkill/,
+    /disabled until a hosted Windows row proves process-tree ownership/,
   );
+  assert.equal(spawned, false);
 });
 
-for (const exitCode of [0, 1]) {
-  test(`runs Windows residual cleanup after child exit ${exitCode}`, async () => {
-    const cleanupCalls = [];
-    const command = runCommand(
-      process.execPath,
-      ["-e", `process.exit(${exitCode})`],
-      {
-        platform: "win32",
-        terminateProcessTreeImplementation: async (child, options) => {
-          cleanupCalls.push({
-            exitCode: child.exitCode,
-            pid: child.pid,
-            platform: options.platform,
-            timeoutMilliseconds: options.timeoutMilliseconds,
-          });
-        },
-        timeoutMilliseconds: 250,
-      },
-    );
+test("readiness parsing retries a partially visible JSON write", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cypress-readiness-"));
+  const readyFile = join(directory, "ready.json");
 
-    if (exitCode === 0) {
-      await command;
-    } else {
-      await assert.rejects(command, /exited with status 1/);
-    }
-    assert.equal(cleanupCalls.length, 1);
-    assert.equal(cleanupCalls[0].exitCode, exitCode);
-    assert.equal(cleanupCalls[0].platform, "win32");
-    assert.equal(cleanupCalls[0].timeoutMilliseconds, 250);
-    assert.equal(Number.isInteger(cleanupCalls[0].pid), true);
-  });
-}
+  try {
+    await writeFile(readyFile, "{", "utf8");
+    const readiness = waitForReadyFile(readyFile);
+    const completeWrite = new Promise((resolveWrite, rejectWrite) => {
+      setTimeout(() => {
+        writeFile(readyFile, '{"ready":true}\n', "utf8").then(
+          resolveWrite,
+          rejectWrite,
+        );
+      }, 30);
+    });
+    assert.deepEqual(await readiness, { ready: true });
+    await completeWrite;
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test("surfaces cancellation cleanup failure without awaiting a stuck child", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.pid = 1234;
+  child.signalCode = null;
+  const abortController = new AbortController();
+  abortController.abort();
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    runCommand("stuck.exe", [], {
+      abortSignal: abortController.signal,
+      platform: "linux",
+      spawnImplementation: () => child,
+      terminateProcessTreeImplementation: async () => {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+        throw new CleanupError("bounded cleanup failed");
+      },
+    }),
+    (error) =>
+      error instanceof CleanupError &&
+      error.message === "bounded cleanup failed",
+  );
+  assert.ok(
+    Date.now() - startedAt < 500,
+    "cleanup failure must not wait for the stuck child",
+  );
+});
 
 test(
   "aborting the process runner terminates its entire process group",
@@ -293,7 +177,12 @@ test(
       processIds = await waitForReadyFile(readyFile);
       abortController.abort();
 
-      await assert.rejects(command, /terminated with signal SIGKILL/);
+      await assert.rejects(
+        command,
+        (error) =>
+          error instanceof ProcessStoppedError &&
+          error.signal === "SIGTERM",
+      );
       assert.equal(
         await waitForProcessExit(processIds.childPid),
         true,

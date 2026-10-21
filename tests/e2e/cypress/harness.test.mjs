@@ -115,6 +115,18 @@ test("accepts explicit matrix operating systems compatible with the host", () =>
       operatingSystemSource: "local default",
     },
   );
+  assert.deepEqual(
+    resolveOperatingSystemSelection({
+      environment: { E2E_OS: "windows" },
+      platform: "win32",
+    }),
+    {
+      hostDistribution: null,
+      hostPlatform: "win32",
+      operatingSystem: "windows",
+      operatingSystemSource: "E2E_OS",
+    },
+  );
 });
 
 test("rejects unknown and host-incompatible operating systems", () => {

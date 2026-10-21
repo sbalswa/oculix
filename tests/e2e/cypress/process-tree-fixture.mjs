@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 
 const readyFile = process.argv[2];
 const mode = process.argv[3];
@@ -19,14 +19,16 @@ const grandchild = spawn(
 process.on("SIGINT", () => {});
 process.on("SIGTERM", () => {});
 
+const temporaryReadyFile = `${readyFile}.${process.pid}.tmp`;
 await writeFile(
-  readyFile,
+  temporaryReadyFile,
   `${JSON.stringify({
     childPid: process.pid,
     grandchildPid: grandchild.pid,
   })}\n`,
   "utf8",
 );
+await rename(temporaryReadyFile, readyFile);
 
 if (mode === "exit") {
   process.exit(1);
