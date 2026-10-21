@@ -3,12 +3,14 @@ import { createHash } from "node:crypto";
 import {
   cp,
   glob,
+  lstat,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
+  realpath,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
@@ -211,11 +213,15 @@ export function parseExactSemver(value, name = "version") {
   }
   validateSemverIdentifiers(match[4], name, { prerelease: true });
   validateSemverIdentifiers(match[5], name);
+  const numeric = match.slice(1, 4).map(Number);
+  if (numeric.some((part) => !Number.isSafeInteger(part))) {
+    throw new Error(`${name} contains an unsafe semantic version number`);
+  }
   return {
     value,
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
+    major: numeric[0],
+    minor: numeric[1],
+    patch: numeric[2],
     prerelease: match[4]?.split(".") ?? [],
   };
 }
@@ -272,45 +278,25 @@ function compareSemver(left, right) {
   );
 }
 
-function normalizePartialVersion(value, name, { wildcard = true } = {}) {
-  const match =
-    /^(0|[1-9]\d*|[xX*])(?:\.(0|[1-9]\d*|[xX*]))?(?:\.(0|[1-9]\d*|[xX*]))?(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u
-      .exec(value);
-  if (match === null) {
-    throw new Error(`${name} contains an invalid semantic version`);
-  }
-  const core = match.slice(1, 4).filter((part) => part !== undefined);
-  const wildcardIndex = core.findIndex((part) => /^(?:[xX*])$/u.test(part));
-  if (
-    (!wildcard && wildcardIndex !== -1) ||
-    (wildcardIndex !== -1 &&
-      core.slice(wildcardIndex).some((part) => !/^(?:[xX*])$/u.test(part))) ||
-    ((match[4] !== undefined || match[5] !== undefined) &&
-      (core.length !== 3 || wildcardIndex !== -1))
-  ) {
-    throw new Error(`${name} contains an invalid semantic version`);
-  }
-  validateSemverIdentifiers(match[4], name, { prerelease: true });
-  validateSemverIdentifiers(match[5], name);
-  const normalizedCore = core.map((part) =>
-    /^(?:[xX*])$/u.test(part) ? "x" : part);
-  return [
-    normalizedCore.join("."),
-    match[4] === undefined ? "" : `-${match[4]}`,
-    match[5] === undefined ? "" : `+${match[5]}`,
-  ].join("");
-}
-
 function normalizeRangeToken(token, name) {
   const match = /^(>=|<=|>|<|=|\^|~)?(.+)$/u.exec(token);
   const operator = match[1] ?? "";
-  const version = normalizePartialVersion(match[2], name);
-  if (
-    version.includes("x") &&
-    !["", "="].includes(operator)
-  ) {
-    throw new Error(`${name} uses a wildcard with an invalid comparator`);
+  const rawVersion = match[2];
+  if (/^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?$/u.test(rawVersion)) {
+    if (operator !== ">=") {
+      throw new Error(
+        `${name} uses an unsupported partial semantic version`,
+      );
+    }
+    const parts = rawVersion.split(".");
+    while (parts.length < 3) {
+      parts.push("0");
+    }
+    const version = parts.join(".");
+    parseExactSemver(version, name);
+    return `${operator}${version}`;
   }
+  const version = parseExactSemver(rawVersion, name).value;
   return `${operator}${version}`;
 }
 
@@ -323,14 +309,10 @@ function normalizeRangeClauses(value, name) {
   return clauses.map((clause) => {
     const hyphen = /^(\S+)\s+-\s+(\S+)$/u.exec(clause);
     if (hyphen !== null) {
-      return [
-        normalizePartialVersion(hyphen[1], name, { wildcard: false }),
-        "-",
-        normalizePartialVersion(hyphen[2], name, { wildcard: false }),
-      ].join(" ");
+      throw new Error(`${name} uses an unsupported hyphen range`);
     }
     const compact = clause.replace(
-      /(>=|<=|>|<|=|\^|~)\s+(?=[0-9xX*])/gu,
+      /(>=|<=|>|<|=|\^|~)\s+(?=[0-9])/gu,
       "$1",
     );
     const tokens = compact.split(/\s+/u).filter(Boolean);
@@ -356,18 +338,9 @@ function intersectSemverRanges(...ranges) {
 }
 
 function comparatorMatches(version, operator, expected) {
-  const actual = parseExactSemver(version, version);
-  const expectedParts = expected
-    .split(/[+-]/u, 1)[0]
-    .split(".")
-    .map(Number);
-  while (expectedParts.length < 3) {
-    expectedParts.push(0);
-  }
-  const comparison = compareSemver(
-    version,
-    `${expectedParts.join(".")}`,
-  );
+  parseExactSemver(version, version);
+  parseExactSemver(expected, expected);
+  const comparison = compareSemver(version, expected);
   switch (operator) {
     case ">":
       return comparison > 0;
@@ -379,32 +352,15 @@ function comparatorMatches(version, operator, expected) {
       return comparison <= 0;
     case "":
     case "=":
-      return (
-        actual.major === expectedParts[0] &&
-        (expected.split(".").length < 2 ||
-          actual.minor === expectedParts[1]) &&
-        (expected.split(".").length < 3 ||
-          actual.patch === expectedParts[2])
-      );
+      return comparison === 0;
     default:
       return false;
   }
 }
 
-function wildcardMatches(version, expected) {
-  const actual = parseExactSemver(version, version);
-  const parts = expected.split(".");
-  const values = [actual.major, actual.minor, actual.patch];
-  return parts.every(
-    (part, index) => part === "x" || Number(part) === values[index],
-  );
-}
-
 function caretUpperBound(version) {
-  const parts = version.split(".").map(Number);
-  while (parts.length < 3) {
-    parts.push(0);
-  }
+  const parsed = parseExactSemver(version, version);
+  const parts = [parsed.major, parsed.minor, parsed.patch];
   if (parts[0] > 0) {
     return `${parts[0] + 1}.0.0`;
   }
@@ -415,26 +371,16 @@ function caretUpperBound(version) {
 }
 
 function tildeUpperBound(version) {
-  const parts = version.split(".").map(Number);
-  if (parts.length === 1) {
-    return `${parts[0] + 1}.0.0`;
-  }
-  return `${parts[0]}.${parts[1] + 1}.0`;
+  const parsed = parseExactSemver(version, version);
+  return `${parsed.major}.${parsed.minor + 1}.0`;
 }
 
 function rangeTokenMatches(version, token) {
   const match = /^(>=|<=|>|<|=|\^|~)?(.+)$/u.exec(token);
   const operator = match[1] ?? "";
   const expected = match[2];
-  if (expected.includes("x")) {
-    return wildcardMatches(version, expected);
-  }
   if (operator === "^" || operator === "~") {
-    const lowerParts = expected.split(".").map(Number);
-    while (lowerParts.length < 3) {
-      lowerParts.push(0);
-    }
-    const lower = lowerParts.join(".");
+    const lower = parseExactSemver(expected, expected).value;
     const upper =
       operator === "^"
         ? caretUpperBound(expected)
@@ -448,34 +394,28 @@ function rangeTokenMatches(version, token) {
 }
 
 export function semverRangeSatisfies(version, range) {
-  parseExactSemver(version, "version");
+  const parsedVersion = parseExactSemver(version, "version");
   return normalizeRangeClauses(range, "range").some((clause) => {
-    const hyphen = /^(\S+)\s+-\s+(\S+)$/u.exec(clause);
-    if (hyphen !== null) {
-      const lower = normalizePartialVersion(
-        hyphen[1],
-        "range",
-        { wildcard: false },
-      );
-      const upper = normalizePartialVersion(
-        hyphen[2],
-        "range",
-        { wildcard: false },
-      );
-      const lowerParts = lower.split(".").map(Number);
-      const upperParts = upper.split(".").map(Number);
-      while (lowerParts.length < 3) {
-        lowerParts.push(0);
-      }
-      while (upperParts.length < 3) {
-        upperParts.push(Number.MAX_SAFE_INTEGER);
-      }
-      return (
-        compareSemver(version, lowerParts.join(".")) >= 0 &&
-        compareSemver(version, upperParts.join(".")) <= 0
-      );
+    const tokens = clause.split(/\s+/u);
+    if (
+      parsedVersion.prerelease.length > 0 &&
+      !tokens.some((token) => {
+        const expected = /^(?:>=|<=|>|<|=|\^|~)?(.+)$/u.exec(token)?.[1];
+        if (expected === undefined) {
+          return false;
+        }
+        const parsedExpected = parseExactSemver(expected, "range");
+        return (
+          parsedExpected.prerelease.length > 0 &&
+          parsedExpected.major === parsedVersion.major &&
+          parsedExpected.minor === parsedVersion.minor &&
+          parsedExpected.patch === parsedVersion.patch
+        );
+      })
+    ) {
+      return false;
     }
-    return clause.split(/\s+/u).every((token) =>
+    return tokens.every((token) =>
       rangeTokenMatches(version, token));
   });
 }
@@ -561,6 +501,26 @@ function npmEvidence(record, observedAt) {
   };
 }
 
+function packageBoundaryEvidence(
+  rootNodeRange,
+  packageContent,
+  lockContent,
+  observedAt,
+) {
+  const identity = {
+    root_node_range: rootNodeRange,
+    package_digest: hash(packageContent),
+    lock_digest: hash(lockContent),
+  };
+  return {
+    type: "selenium-package-boundary",
+    locator: PACKAGE_PATH,
+    revision: stableJson(identity),
+    digest: hash(identity),
+    observed_at: observedAt,
+  };
+}
+
 function immutableRunnerIdentity(kind, raw) {
   const value = assertObject(raw, `runnerEvidence.${kind}`);
   if (value.kind !== undefined && value.kind !== kind) {
@@ -571,21 +531,28 @@ function immutableRunnerIdentity(kind, raw) {
     value.version,
     `runnerEvidence.${kind}.version`,
   );
-  const compatibilityKey = parseExactSemver(
+  const compatibilityKey = parseBrowserVersion(
     value.compatibility_key,
     `runnerEvidence.${kind}.compatibility_key`,
-  ).value;
+  );
   if (
-    version !== compatibilityKey &&
-    !version.startsWith(`${compatibilityKey}.`)
+    compatibilityKey.split(".").length !== 3 ||
+    version.split(".").slice(0, 3).join(".") !== compatibilityKey
   ) {
     throw new Error(
-      `runnerEvidence.${kind}.version must begin with its compatibility key`,
+      `runnerEvidence.${kind}.version must exactly match its three-part compatibility key`,
     );
   }
   const path = assertString(value.path, `runnerEvidence.${kind}.path`);
   if (!isAbsolute(path)) {
     throw new Error(`runnerEvidence.${kind}.path must be absolute`);
+  }
+  const resolvedPath = assertString(
+    value.realpath,
+    `runnerEvidence.${kind}.realpath`,
+  );
+  if (!isAbsolute(resolvedPath)) {
+    throw new Error(`runnerEvidence.${kind}.realpath must be absolute`);
   }
   return {
     kind,
@@ -593,6 +560,11 @@ function immutableRunnerIdentity(kind, raw) {
     version,
     compatibility_key: compatibilityKey,
     path,
+    realpath: resolvedPath,
+    executable_digest: assertDigest(
+      value.executable_digest,
+      `runnerEvidence.${kind}.executable_digest`,
+    ),
     source_locator: assertHttpsUrl(
       value.source_locator ?? value.locator,
       `runnerEvidence.${kind}.locator`,
@@ -748,6 +720,9 @@ function normalizeRunner(raw, capabilities) {
   }
   if (browser.path === driver.path) {
     throw new Error("browser and driver executable paths must differ");
+  }
+  if (browser.realpath === driver.realpath) {
+    throw new Error("browser and driver executable realpaths must differ");
   }
   return { runner, browser, driver };
 }
@@ -1029,6 +1004,12 @@ export async function collectSeleniumObservation({
           ? null
           : packageRecord(candidateCohort[SELENIUM_PACKAGE], [
               npmEvidence(candidateCohort[SELENIUM_PACKAGE], observedAt),
+              packageBoundaryEvidence(
+                current.rootNodeRange,
+                packageContent,
+                lockContent,
+                observedAt,
+              ),
             ]),
       current: packageRecord(
         current.packages[SELENIUM_PACKAGE],
@@ -1166,6 +1147,34 @@ function decodeEvidenceRecord(record, type, name) {
   return value;
 }
 
+function decodePackageBoundary(record) {
+  const name = `${SELENIUM_COMPONENT} package boundary`;
+  const evidence = record.evidence.find(
+    (entry) => entry.type === "selenium-package-boundary",
+  );
+  if (evidence === undefined) {
+    throw new Error(`${name} lacks selenium-package-boundary evidence`);
+  }
+  const value = parseJson(evidence.revision, `${name} evidence`);
+  const rootNodeRange = normalizeSemverRange(
+    value.root_node_range,
+    `${name}.root_node_range`,
+  );
+  assertDigest(value.package_digest, `${name}.package_digest`);
+  assertDigest(value.lock_digest, `${name}.lock_digest`);
+  if (
+    evidence.locator !== PACKAGE_PATH ||
+    hash(value) !== evidence.digest
+  ) {
+    throw new Error(`${name} evidence does not bind its immutable identity`);
+  }
+  return {
+    rootNodeRange,
+    packageDigest: value.package_digest,
+    lockDigest: value.lock_digest,
+  };
+}
+
 function decodedCandidate(observation) {
   const axe = immutableNpmRecord(
     AXE_PACKAGE,
@@ -1199,6 +1208,9 @@ function decodedCandidate(observation) {
       DRIVER_COMPONENT,
     ),
   );
+  const packageBoundary = decodePackageBoundary(
+    candidateComponent(observation, SELENIUM_COMPONENT),
+  );
   for (const [componentId, record] of [
     [AXE_COMPONENT, axe],
     [SELENIUM_COMPONENT, selenium],
@@ -1225,8 +1237,36 @@ function decodedCandidate(observation) {
       [AXE_PACKAGE]: axe,
       [SELENIUM_PACKAGE]: selenium,
     },
+    packageBoundary,
     runner: { browser, driver },
   };
+}
+
+async function verifySourcePackageBinding(observation, repositoryRoot) {
+  const candidate = decodedCandidate(observation);
+  const [packageContent, lockContent] = await Promise.all([
+    readFile(resolve(repositoryRoot, PACKAGE_PATH)),
+    readFile(resolve(repositoryRoot, LOCK_PATH)),
+  ]);
+  if (
+    hash(packageContent) !== candidate.packageBoundary.packageDigest ||
+    hash(lockContent) !== candidate.packageBoundary.lockDigest
+  ) {
+    throw new Error(
+      "Selenium observation does not bind the source package boundary",
+    );
+  }
+  const current = readCurrentPackages(
+    parseJson(packageContent, PACKAGE_PATH),
+    parseJson(lockContent, LOCK_PATH),
+  );
+  if (
+    current.rootNodeRange !== candidate.packageBoundary.rootNodeRange
+  ) {
+    throw new Error(
+      "Selenium observation Node range does not bind the source package boundary",
+    );
+  }
 }
 
 function sameStrings(left, right) {
@@ -1266,8 +1306,8 @@ function relativeStep({
 function capabilityEnvironment(capability, candidate) {
   return {
     E2E_BROWSER: capability.browser,
-    E2E_BROWSER_BINARY: candidate.runner.browser.path,
-    E2E_DRIVER_BINARY: candidate.runner.driver.path,
+    E2E_BROWSER_BINARY: candidate.runner.browser.realpath,
+    E2E_DRIVER_BINARY: candidate.runner.driver.realpath,
     E2E_OS: capability.os,
     E2E_SELENIUM_ALLOW_DOWNLOADS: "false",
     MISE_ENV: capability.environment,
@@ -1377,6 +1417,37 @@ function capabilitySteps(capability, candidate) {
   return steps;
 }
 
+function qualificationCapability(capability) {
+  const scenarios = [...capability.scenarios];
+  if (
+    scenarios.length === 0 ||
+    new Set(scenarios).size !== scenarios.length
+  ) {
+    throw new Error(
+      `${capability.id} must select a nonempty unique scenario set`,
+    );
+  }
+  const resultReports = scenarios.map(
+    (scenario) =>
+      `${SELENIUM_PACKAGE_DIRECTORY}/diagnostics/${scenario}/result.json`,
+  );
+  return {
+    id: capability.id,
+    browser: capability.browser,
+    os: capability.os,
+    runner: capability.runner,
+    scenarios,
+    diagnostics: capability.diagnostics,
+    evidence: capability.evidence,
+    required_files: sortedUnique([
+      ...capability.required_files,
+      ...resultReports,
+    ]),
+    result_reports: resultReports,
+    require_accessibility: capability.require_accessibility,
+  };
+}
+
 export function createSeleniumQualificationPlan({
   observation,
   catalog,
@@ -1419,34 +1490,45 @@ export function createSeleniumQualificationPlan({
   ) {
     throw new Error("Runner browser and driver evidence must match");
   }
-  const relations = new Map(
-    observation.relations.map((relation) => [relation.id, relation]),
+  const expectedRelations = relationsFor({
+    candidate: candidate.packages,
+    current: null,
+    rootNodeRange: candidate.packageBoundary.rootNodeRange,
+    runner: candidate.runner,
+  });
+  if (stableJson(observation.relations) !== stableJson(expectedRelations)) {
+    throw new Error(
+      "Selenium relations do not exactly bind package and runner evidence",
+    );
+  }
+  const selectedCapabilities = capabilities.map(qualificationCapability);
+  const registryOrigins = new Set(
+    PACKAGE_NAMES.map(
+      (name) => new URL(candidate.packages[name].dist.tarball).origin,
+    ),
   );
-  const match = relations.get("selenium-runner-browser-driver");
-  if (
-    match?.from !== BROWSER_COMPONENT ||
-    match?.to !== DRIVER_COMPONENT ||
-    match.type !== "must-match" ||
-    match.hard !== true ||
-    match.constraint !==
-      `=${candidate.runner.browser.compatibility_key}`
-  ) {
-    throw new Error("Browser-driver relation does not bind runner evidence");
+  if (registryOrigins.size !== 1) {
+    throw new Error("Candidate npm tarballs must share one registry origin");
   }
-  const axeRelation = relations.get("selenium-axe-policy-alignment");
-  if (
-    axeRelation?.hard !== false ||
-    axeRelation.type !== "policy-align" ||
-    axeRelation.constraint !==
-      candidate.packages[AXE_PACKAGE]
-        .peerDependencies["selenium-webdriver"]
-  ) {
-    throw new Error("Axe advisory relation does not bind npm metadata");
-  }
-  for (const id of ["selenium-axe-node", "selenium-webdriver-node"]) {
-    normalizeSemverRange(relations.get(id)?.constraint, `${id}.constraint`);
-  }
+  const [registryOrigin] = registryOrigins;
   const steps = [
+    ...PACKAGE_NAMES.map((name) =>
+      relativeStep({
+        id:
+          name === AXE_PACKAGE
+            ? "cache-selenium-axe-tarball"
+            : "cache-selenium-webdriver-tarball",
+        kind: "command",
+        phase: "prepare",
+        command: "npm",
+        arguments: [
+          "cache",
+          "add",
+          candidate.packages[name].dist.tarball,
+          "--cache",
+          ".npm-cache",
+        ],
+      })),
     relativeStep({
       id: "apply-selenium-tarballs",
       kind: "command",
@@ -1455,12 +1537,17 @@ export function createSeleniumQualificationPlan({
       arguments: [
         "install",
         "--package-lock-only",
+        "--save-exact",
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
-        "--no-save",
+        "--cache",
+        ".npm-cache",
+        "--prefer-offline",
+        "--registry",
+        registryOrigin,
         ...PACKAGE_NAMES.map(
-          (name) => candidate.packages[name].dist.tarball,
+          (name) => `${name}@${candidate.packages[name].version}`,
         ),
       ],
     }),
@@ -1474,20 +1561,23 @@ export function createSeleniumQualificationPlan({
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
+        "--cache",
+        ".npm-cache",
+        "--prefer-offline",
       ],
     }),
     relativeStep({
       id: "verify-runner-browser",
       kind: "browser-identity",
       phase: "prepare",
-      command: candidate.runner.browser.path,
+      command: candidate.runner.browser.realpath,
       arguments: ["--version"],
     }),
     relativeStep({
       id: "verify-runner-driver",
       kind: "driver-identity",
       phase: "prepare",
-      command: candidate.runner.driver.path,
+      command: candidate.runner.driver.realpath,
       arguments: ["--version"],
     }),
     relativeStep({
@@ -1501,7 +1591,7 @@ export function createSeleniumQualificationPlan({
         "test",
       ],
     }),
-    ...capabilities.flatMap((capability) =>
+    ...selectedCapabilities.flatMap((capability) =>
       capabilitySteps(capability, candidate)),
   ];
   return {
@@ -1518,18 +1608,7 @@ export function createSeleniumQualificationPlan({
     packages: PACKAGE_NAMES.map((name) =>
       structuredClone(candidate.packages[name])),
     runner: structuredClone(candidate.runner),
-    selected_capabilities: capabilities.map((capability) => ({
-      id: capability.id,
-      browser: capability.browser,
-      os: capability.os,
-      runner: capability.runner,
-      scenarios: [...capability.scenarios],
-      diagnostics: capability.diagnostics,
-      evidence: capability.evidence,
-      required_files: [...capability.required_files],
-      result_reports: [...capability.result_reports],
-      require_accessibility: capability.require_accessibility,
-    })),
+    selected_capabilities: selectedCapabilities,
     steps,
   };
 }
@@ -1580,6 +1659,8 @@ async function runRawCommand(step, { environment, workspaceRoot }) {
   return new Promise((resolvePromise) => {
     const child = spawn(step.command, step.arguments, {
       cwd:
+        step.id === "cache-selenium-axe-tarball" ||
+        step.id === "cache-selenium-webdriver-tarball" ||
         step.id === "apply-selenium-tarballs" ||
         step.id === "install-selenium-candidate"
           ? resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY)
@@ -1587,6 +1668,7 @@ async function runRawCommand(step, { environment, workspaceRoot }) {
       env: {
         ...environment,
         ...step.environment,
+        GITHUB_WORKSPACE: workspaceRoot,
       },
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
@@ -1675,6 +1757,50 @@ function assertRawCommandResult(raw, stepId) {
   };
 }
 
+async function verifyExecutableIdentity(identity) {
+  const observedRealpath = await realpath(identity.path);
+  const canonicalRealpath = await realpath(identity.realpath);
+  if (
+    observedRealpath !== identity.realpath ||
+    canonicalRealpath !== identity.realpath
+  ) {
+    throw new Error(
+      `${identity.kind} executable realpath does not match runner evidence`,
+    );
+  }
+  const metadata = await lstat(identity.realpath);
+  if (!metadata.isFile() || (metadata.mode & 0o111) === 0) {
+    throw new Error(`${identity.kind} executable must be an executable file`);
+  }
+  if (hash(await readFile(identity.realpath)) !== identity.executable_digest) {
+    throw new Error(
+      `${identity.kind} executable digest does not match runner evidence`,
+    );
+  }
+}
+
+function exactExecutableVersion(kind, output, identity) {
+  const labels = {
+    browser: { chromium: "Chromium" },
+    driver: { chromedriver: "ChromeDriver" },
+  };
+  const label = labels[kind]?.[identity.name];
+  if (label === undefined) {
+    throw new Error(`Unsupported ${kind} executable identity ${identity.name}`);
+  }
+  const match = new RegExp(
+    `^${label.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")} ([0-9]+(?:\\.[0-9]+){2,3})\\r?\\n?$`,
+    "u",
+  ).exec(output);
+  if (match === null) {
+    throw new Error(`${kind} executable version output is not exact`);
+  }
+  return (
+    parseBrowserVersion(match[1], `${kind} executable version`) ===
+    identity.version
+  );
+}
+
 async function executeControlledStep(
   step,
   plan,
@@ -1687,13 +1813,29 @@ async function executeControlledStep(
 ) {
   const startedAt = timestamp(now());
   let raw;
+  const identity =
+    step.kind === "browser-identity"
+      ? plan.runner.browser
+      : step.kind === "driver-identity"
+        ? plan.runner.driver
+        : null;
   try {
+    if (identity !== null) {
+      if (step.command !== identity.realpath) {
+        throw new Error(
+          `${identity.kind} command does not match observed executable realpath`,
+        );
+      }
+      await verifyExecutableIdentity(identity);
+    }
+    const controlledEnvironment = {
+      ...environment,
+      ...step.environment,
+      GITHUB_WORKSPACE: workspaceRoot,
+    };
     raw = assertRawCommandResult(
       await runCommand(structuredClone(step), {
-        environment: {
-          ...environment,
-          ...step.environment,
-        },
+        environment: controlledEnvironment,
         packageRoot: resolve(workspaceRoot, SELENIUM_PACKAGE_DIRECTORY),
         workspaceRoot,
       }),
@@ -1707,17 +1849,30 @@ async function executeControlledStep(
       stderr: error.message,
     };
   }
+  if (identity !== null && raw.exitCode === 0) {
+    try {
+      await verifyExecutableIdentity(identity);
+    } catch (error) {
+      raw = {
+        ...raw,
+        exitCode: 1,
+        stderr: `${raw.stderr}${error.message}`,
+      };
+    }
+  }
   const completedAt = timestamp(now());
   const output = `${raw.stdout}${raw.stderr}`;
   let identityMatches = true;
-  if (step.kind === "browser-identity") {
-    identityMatches =
-      output.toLowerCase().includes(plan.runner.browser.name.toLowerCase()) &&
-      output.includes(plan.runner.browser.version);
-  } else if (step.kind === "driver-identity") {
-    identityMatches =
-      output.toLowerCase().includes("chromedriver") &&
-      output.includes(plan.runner.driver.version);
+  if (identity !== null && raw.exitCode === 0) {
+    try {
+      identityMatches = exactExecutableVersion(
+        identity.kind,
+        raw.stdout,
+        identity,
+      );
+    } catch {
+      identityMatches = false;
+    }
   }
   return {
     id: step.id,
@@ -1731,16 +1886,6 @@ async function executeControlledStep(
       commandEvidence(step, plan, raw, startedAt, completedAt),
     ],
   };
-}
-
-async function applyCandidateManifest(plan, workspaceRoot) {
-  const path = resolve(workspaceRoot, PACKAGE_PATH);
-  const manifest = parseJson(await readFile(path, "utf8"), PACKAGE_PATH);
-  manifest.dependencies ??= {};
-  for (const record of plan.packages) {
-    manifest.dependencies[record.name] = record.version;
-  }
-  await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
 
 function lockPackage(lock, name) {
@@ -1938,7 +2083,33 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     await nonemptyFile(capability.evidence, workspaceRoot);
     paths.add(capability.evidence);
   }
-  for (const reportPath of capability.result_reports) {
+  if (
+    capability.result_reports.length !== capability.scenarios.length ||
+    new Set(capability.result_reports).size !== capability.result_reports.length
+  ) {
+    throw new Error(
+      `${capability.id} must provide exactly one distinct report per scenario`,
+    );
+  }
+  const actualReportPaths = await filesForPattern(
+    `${SELENIUM_PACKAGE_DIRECTORY}/diagnostics/*/result.json`,
+    workspaceRoot,
+  );
+  if (!sameStrings(actualReportPaths, capability.result_reports)) {
+    throw new Error(
+      `${capability.id} produced reports outside its exact selected scenario set`,
+    );
+  }
+  const observedScenarios = new Set();
+  for (const [index, reportPath] of capability.result_reports.entries()) {
+    const expectedScenario = capability.scenarios[index];
+    const expectedPath =
+      `${SELENIUM_PACKAGE_DIRECTORY}/diagnostics/${expectedScenario}/result.json`;
+    if (reportPath !== expectedPath) {
+      throw new Error(
+        `Result report ${reportPath} does not match scenario ${expectedScenario}`,
+      );
+    }
     const report = parseJson(
       await nonemptyFile(reportPath, workspaceRoot),
       reportPath,
@@ -1946,6 +2117,7 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     if (
       report.schemaVersion !== 1 ||
       reportCapabilityId(report) !== capability.id ||
+      report.scenario !== expectedScenario ||
       report.status !== "passed" ||
       report.assertion?.status !== "passed"
     ) {
@@ -1953,6 +2125,12 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
         `Result report ${reportPath} did not pass for ${capability.id}`,
       );
     }
+    if (observedScenarios.has(report.scenario)) {
+      throw new Error(
+        `Scenario ${report.scenario} has more than one result report`,
+      );
+    }
+    observedScenarios.add(report.scenario);
     if (
       capability.require_accessibility &&
       report.scenario === "web-calculator" &&
@@ -1965,6 +2143,11 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     }
     paths.add(reportPath);
   }
+  if (!sameStrings(observedScenarios, capability.scenarios)) {
+    throw new Error(
+      `${capability.id} result reports do not exactly cover selected scenarios`,
+    );
+  }
   const files = [];
   for (const path of [...paths].sort(compareText)) {
     files.push({
@@ -1975,15 +2158,42 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
   return files;
 }
 
-async function treeEntries(root, directory = root) {
+async function treeEntries(
+  root,
+  directory = root,
+  { excludeRootNames = new Set() } = {},
+) {
   const entries = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (directory === root && excludeRootNames.has(entry.name)) {
+      continue;
+    }
     const path = join(directory, entry.name);
     const repositoryPath = relative(root, path).split(sep).join("/");
     if (entry.isDirectory()) {
-      entries.push(...(await treeEntries(root, path)));
+      entries.push(
+        ...(await treeEntries(root, path, { excludeRootNames })),
+      );
     } else if (entry.isFile()) {
-      entries.push([repositoryPath, hash(await readFile(path))]);
+      const metadata = await lstat(path);
+      entries.push([
+        repositoryPath,
+        {
+          type: "file",
+          mode: metadata.mode & 0o777,
+          digest: hash(await readFile(path)),
+        },
+      ]);
+    } else if (entry.isSymbolicLink()) {
+      entries.push([
+        repositoryPath,
+        {
+          type: "symlink",
+          target: await readlink(path),
+        },
+      ]);
+    } else {
+      throw new Error(`Unsupported filesystem entry ${repositoryPath}`);
     }
   }
   return entries;
@@ -1999,14 +2209,11 @@ async function outsideBoundaryDigest(workspaceRoot, boundary) {
   return hash(entries);
 }
 
-async function sourceManagedState(repositoryRoot) {
-  return Object.fromEntries(
-    await Promise.all(
-      SELENIUM_MANAGED_PATHS.map(async (path) => [
-        path,
-        hash(await readFile(resolve(repositoryRoot, path))),
-      ]),
-    ),
+async function sourceState(repositoryRoot) {
+  return hash(
+    (await treeEntries(repositoryRoot, repositoryRoot, {
+      excludeRootNames: new Set([".git"]),
+    })).sort(([left], [right]) => compareText(left, right)),
   );
 }
 
@@ -2072,8 +2279,9 @@ export async function qualifySeleniumCandidate(
       await readFile(resolve(root, CATALOG_PATH), "utf8"),
       CATALOG_PATH,
     );
-  const sourceBefore = await sourceManagedState(root);
+  const sourceBefore = await sourceState(root);
   const gitBefore = await readGitState(root);
+  await verifySourcePackageBinding(observation, root);
   const temporaryRoot = resolve(await createWorkspace());
   if (isWithin(root, temporaryRoot) || isWithin(temporaryRoot, root)) {
     throw new Error("Ephemeral workspace must be outside the repository");
@@ -2091,21 +2299,27 @@ export async function qualifySeleniumCandidate(
       workspaceRoot,
       plan.workspace.mutation_boundary,
     );
-    await applyCandidateManifest(plan, workspaceRoot);
     const checks = [];
     const failures = [];
-    const applyStep = plan.steps.find(
-      ({ id }) => id === "apply-selenium-tarballs",
-    );
-    const applyResult = await executeControlledStep(applyStep, plan, {
-      environment,
-      now,
-      runCommand,
-      workspaceRoot,
-    });
-    checks.push(applyResult);
-    if (applyResult.status !== "pass") {
-      failures.push("APPLICATION_FAILED");
+    for (const id of [
+      "cache-selenium-axe-tarball",
+      "cache-selenium-webdriver-tarball",
+      "apply-selenium-tarballs",
+    ]) {
+      if (failures.length > 0) {
+        break;
+      }
+      const step = plan.steps.find((entry) => entry.id === id);
+      const result = await executeControlledStep(step, plan, {
+        environment,
+        now,
+        runCommand,
+        workspaceRoot,
+      });
+      checks.push(result);
+      if (result.status !== "pass") {
+        failures.push("APPLICATION_FAILED");
+      }
     }
 
     if (failures.length === 0) {
@@ -2304,7 +2518,7 @@ export async function qualifySeleniumCandidate(
   }
 
   const [sourceAfter, gitAfter] = await Promise.all([
-    sourceManagedState(root),
+    sourceState(root),
     readGitState(root),
   ]);
   if (
@@ -2327,7 +2541,8 @@ export async function qualifySeleniumCandidate(
       candidate_digest: execution.plan.candidate_digest,
       before: gitBefore,
       after: gitAfter,
-      managed_paths: sourceAfter,
+      source_before: sourceBefore,
+      source_after: sourceAfter,
     }),
     started_at: guardStartedAt,
     completed_at: guardCompletedAt,
