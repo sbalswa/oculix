@@ -2,6 +2,11 @@
 #MISE description="Run all Playwright E2E scenarios in order"
 $ErrorActionPreference = "Stop"
 
+& mise run e2e:playwright:setup @args
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 & mise run e2e:playwright:smoke @args
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -38,6 +38,7 @@ test("interacts with an in-memory page", async ({
       `playwright=${playwrightPackage.version}`,
       `project=${process.env.PLAYWRIGHT_PROJECT}`,
       `browser=${browserName} ${browser.version()}`,
+      `os=${process.env.E2E_OS ?? process.platform}`,
       `platform=${process.platform}/${process.arch}`,
     ].join(" "),
   );

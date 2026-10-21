@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  npmInvocation,
+  ProcessStoppedError,
+  runProcess,
+  signalExitCode,
+} from "./process-runner.mjs";
 
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(HARNESS_DIRECTORY, "../../..");
@@ -17,11 +22,38 @@ const INSTALL_STAMP = resolve(
   HARNESS_DIRECTORY,
   "node_modules/.oculix-package-lock.sha256",
 );
+const RESULTS_DIRECTORY = resolve(HARNESS_DIRECTORY, "test-results");
 const PROJECTS = new Set(["chromium", "firefox", "webkit"]);
+const OPERATING_SYSTEMS = new Map([
+  [
+    "linux",
+    {
+      aliases: ["linux", "ubuntu", "ubuntu-latest"],
+      pattern: /^ubuntu-\d{2}\.\d{2}$/,
+    },
+  ],
+  [
+    "darwin",
+    {
+      aliases: ["macos", "macos-latest"],
+      pattern: /^macos-\d+$/,
+    },
+  ],
+  [
+    "win32",
+    {
+      aliases: ["windows", "windows-latest"],
+      pattern: /^windows-\d{4}$/,
+    },
+  ],
+]);
 const SCENARIOS = new Map([
   ["smoke", "smoke.spec.mjs"],
   ["web-calculator", "web-calculator.spec.mjs"],
 ]);
+const PREPARE_TIMEOUT_MS = 10 * 60_000;
+const TEST_TIMEOUT_MS = 2 * 60_000;
+const FIXTURE_TIMEOUT_MS = 3 * 60_000;
 
 function fail(message) {
   throw new Error(message);
@@ -58,35 +90,67 @@ function selectProject(argument) {
   return selected;
 }
 
-function run(command, arguments_, options = {}) {
-  return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(command, arguments_, {
-      cwd: HARNESS_DIRECTORY,
-      stdio: "inherit",
-      ...options,
-    });
-    child.once("error", rejectRun);
-    child.once("exit", (code, signal) => {
-      if (code === 0) {
-        resolveRun();
-        return;
-      }
-      rejectRun(
-        new Error(
-          `${command} exited with ${signal === null ? `code ${code}` : `signal ${signal}`}`,
-        ),
-      );
-    });
+function selectedOperatingSystem() {
+  const family = OPERATING_SYSTEMS.get(process.platform);
+  if (family === undefined) {
+    fail(`Unsupported host platform "${process.platform}".`);
+  }
+
+  const selected = normalize(process.env.E2E_OS) ?? process.platform;
+  if (
+    !family.aliases.includes(selected) &&
+    !family.pattern.test(selected)
+  ) {
+    fail(
+      `E2E_OS "${selected}" does not describe the current ` +
+        `${process.platform}/${process.arch} host. Expected one of: ` +
+        `${family.aliases.join(", ")} or ${family.pattern}.`,
+    );
+  }
+  return selected;
+}
+
+async function currentLockHash() {
+  const lockContents = await readFile(LOCKFILE);
+  return createHash("sha256").update(lockContents).digest("hex");
+}
+
+async function isUbuntuHost(operatingSystem) {
+  if (operatingSystem.startsWith("ubuntu")) {
+    return true;
+  }
+  if (process.platform !== "linux") {
+    return false;
+  }
+
+  try {
+    const release = await readFile("/etc/os-release", "utf8");
+    return /^ID=ubuntu$/m.test(release);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function preparationStamp(project) {
+  return resolve(
+    HARNESS_DIRECTORY,
+    `node_modules/.oculix-playwright-${process.platform}-${process.arch}-${project}.json`,
+  );
+}
+
+async function runNpm(arguments_, options = {}) {
+  const invocation = npmInvocation(arguments_);
+  await runProcess(invocation.command, invocation.arguments_, {
+    cwd: HARNESS_DIRECTORY,
+    ...options,
   });
 }
 
-function npmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
-}
-
-async function prepare(project) {
-  const lockContents = await readFile(LOCKFILE);
-  const lockHash = createHash("sha256").update(lockContents).digest("hex");
+async function prepare(project, operatingSystem) {
+  const lockHash = await currentLockHash();
   let installedHash = null;
   try {
     installedHash = (await readFile(INSTALL_STAMP, "utf8")).trim();
@@ -97,25 +161,81 @@ async function prepare(project) {
   }
 
   if (installedHash !== lockHash) {
-    await run(npmCommand(), [
+    await runNpm([
       "ci",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
-    ]);
+    ], {
+      timeoutMs: PREPARE_TIMEOUT_MS,
+    });
     await writeFile(INSTALL_STAMP, `${lockHash}\n`);
   }
 
-  await run(npmCommand(), [
-    "exec",
-    "--",
-    "playwright",
-    "install",
-    project,
-  ]);
+  const installArguments = ["exec", "--", "playwright", "install"];
+  if (await isUbuntuHost(operatingSystem)) {
+    installArguments.push("--with-deps");
+  }
+  installArguments.push(project);
+  await runNpm(installArguments, {
+    timeoutMs: PREPARE_TIMEOUT_MS,
+  });
+  await writeFile(
+    preparationStamp(project),
+    `${JSON.stringify({
+      arch: process.arch,
+      lockHash,
+      operatingSystem,
+      platform: process.platform,
+      project,
+    })}\n`,
+  );
 }
 
-async function runTest(scenario, project) {
+export function validatePreparationRecord(record, expected) {
+  if (
+    record === null ||
+    typeof record !== "object" ||
+    Array.isArray(record)
+  ) {
+    return false;
+  }
+  return Object.entries(expected).every(
+    ([key, value]) => record[key] === value,
+  );
+}
+
+async function requirePreparation(project, operatingSystem) {
+  const stamp = preparationStamp(project);
+  try {
+    const record = JSON.parse(await readFile(stamp, "utf8"));
+    const expected = {
+      arch: process.arch,
+      lockHash: await currentLockHash(),
+      operatingSystem,
+      platform: process.platform,
+      project,
+    };
+    if (!validatePreparationRecord(record, expected)) {
+      fail(
+        `Playwright ${project} preparation is stale for ` +
+          `${operatingSystem}/${process.platform}/${process.arch}. Run ` +
+          `"mise run e2e:playwright:setup ${project}" again.`,
+      );
+    }
+  } catch (error) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError) {
+      fail(
+        `Playwright ${project} is not prepared for ` +
+          `${operatingSystem}/${process.platform}/${process.arch}. Run ` +
+          `"mise run e2e:playwright:setup ${project}" before offline scenarios.`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function runTest(scenario, project, operatingSystem) {
   const specification = SCENARIOS.get(scenario);
   if (specification === undefined) {
     fail(
@@ -127,10 +247,10 @@ async function runTest(scenario, project) {
   const environment = {
     ...process.env,
     E2E_BROWSER: project,
+    E2E_OS: operatingSystem,
     PLAYWRIGHT_PROJECT: project,
   };
-  await run(
-    npmCommand(),
+  await runNpm(
     [
       "exec",
       "--",
@@ -139,11 +259,38 @@ async function runTest(scenario, project) {
       specification,
       `--project=${project}`,
     ],
-    { env: environment },
+    {
+      env: environment,
+      timeoutMs: TEST_TIMEOUT_MS,
+    },
   );
 }
 
-async function runScenario(scenario, project) {
+async function writeDiagnostics(scenario, project, operatingSystem, error) {
+  await mkdir(RESULTS_DIRECTORY, {
+    recursive: true,
+  });
+  const path = resolve(RESULTS_DIRECTORY, "harness-diagnostics.json");
+  await writeFile(
+    path,
+    `${JSON.stringify(
+      {
+        arch: process.arch,
+        browser: project,
+        error: error.message,
+        node: process.version,
+        operatingSystem,
+        platform: process.platform,
+        scenario,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  process.stderr.write(`Playwright harness diagnostics: ${path}\n`);
+}
+
+async function runScenario(scenario, project, operatingSystem) {
   if (!SCENARIOS.has(scenario)) {
     fail(
       `Unknown Playwright scenario "${scenario}". ` +
@@ -151,48 +298,88 @@ async function runScenario(scenario, project) {
     );
   }
 
-  await prepare(project);
-  process.stdout.write(
-    `Playwright selection: project=${project} ` +
-      `os=${process.env.E2E_OS ?? process.platform}\n`,
-  );
+  try {
+    await requirePreparation(project, operatingSystem);
+    process.stdout.write(
+      `Playwright selection: project=${project} ` +
+        `os=${operatingSystem} host=${process.platform}/${process.arch}\n`,
+    );
 
-  if (scenario === "web-calculator") {
-    await run(process.execPath, [
-      FIXTURE_LIFECYCLE,
-      process.execPath,
-      fileURLToPath(import.meta.url),
-      "test",
-      scenario,
-      project,
-    ]);
-    return;
+    if (scenario === "web-calculator") {
+      await runProcess(
+        process.execPath,
+        [
+          FIXTURE_LIFECYCLE,
+          process.execPath,
+          fileURLToPath(import.meta.url),
+          "test",
+          scenario,
+          project,
+        ],
+        {
+          cwd: HARNESS_DIRECTORY,
+          timeoutMs: FIXTURE_TIMEOUT_MS,
+        },
+      );
+      return;
+    }
+    await runTest(scenario, project, operatingSystem);
+  } catch (error) {
+    await writeDiagnostics(scenario, project, operatingSystem, error);
+    throw error;
   }
-  await runTest(scenario, project);
 }
 
 async function main() {
-  const [command, scenario, selection, ...extra] = process.argv.slice(2);
-  if (extra.length !== 0) {
-    fail(
-      "Usage: harness.mjs scenario SCENARIO [BROWSER] or " +
-        "harness.mjs test SCENARIO PROJECT",
-    );
-  }
+  const [command, ...arguments_] = process.argv.slice(2);
 
+  const operatingSystem = selectedOperatingSystem();
+  if (command === "prepare") {
+    if (arguments_.length > 1) {
+      fail("Usage: harness.mjs prepare BROWSER");
+    }
+    await prepare(selectProject(arguments_[0]), operatingSystem);
+    return;
+  }
   if (command === "scenario") {
-    await runScenario(scenario, selectProject(selection));
+    if (arguments_.length < 1 || arguments_.length > 2) {
+      fail("Usage: harness.mjs scenario SCENARIO [BROWSER]");
+    }
+    const [scenario, selection] = arguments_;
+    await runScenario(
+      scenario,
+      selectProject(selection),
+      operatingSystem,
+    );
     return;
   }
   if (command === "test") {
+    if (arguments_.length !== 2) {
+      fail("Usage: harness.mjs test SCENARIO PROJECT");
+    }
+    const [scenario, selection] = arguments_;
     const project = selectProject(selection);
-    await runTest(scenario, project);
+    await runTest(scenario, project, operatingSystem);
     return;
   }
-  fail("Usage: harness.mjs scenario SCENARIO [BROWSER]");
+  fail(
+    "Usage: harness.mjs prepare [BROWSER], " +
+      "harness.mjs scenario SCENARIO [BROWSER], or " +
+      "harness.mjs test SCENARIO PROJECT",
+  );
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+const isCli =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isCli) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode =
+      error instanceof ProcessStoppedError &&
+      error.reason.kind === "signal"
+        ? signalExitCode(error.reason.signal)
+        : 1;
+  });
+}
