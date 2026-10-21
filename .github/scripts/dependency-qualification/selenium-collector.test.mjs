@@ -21,7 +21,9 @@ import { promisify } from "node:util";
 import {
   collectSeleniumObservation,
   createSeleniumExecutorAttestation,
+  createSeleniumMutableSeedManifest,
   createSeleniumQualificationPlan,
+  createSeleniumSourceMaterializationManifest,
   createSeleniumTrustedInputManifest,
   normalizeSemverRange,
   parseExactSemver,
@@ -30,6 +32,8 @@ import {
   SELENIUM_MANAGED_PATHS,
   semverRangeSatisfies,
   signSeleniumExecutorAttestation,
+  signSeleniumQualificationEnvelope,
+  validateSeleniumQualificationArtifact,
 } from "./selenium-collector.mjs";
 import {
   canonicalDocument,
@@ -188,6 +192,15 @@ async function collectQualificationCandidate(repository, overrides = {}) {
 async function qualificationPlanInputs(repository, observation) {
   return {
     executorTools: (await localExecutorIdentity()).tools,
+    mutableSeedManifest: await createSeleniumMutableSeedManifest(
+      repository.root,
+      observation.repository.revision,
+    ),
+    sourceMaterializationManifest:
+      await createSeleniumSourceMaterializationManifest(
+        repository.root,
+        observation.repository.revision,
+      ),
     trustedInputManifest: await createSeleniumTrustedInputManifest(
       repository.root,
       observation.repository.revision,
@@ -220,6 +233,13 @@ function rawResult({ stdout = "", stderr = "", exitCode = 0 } = {}) {
     stdout,
     stderr,
   };
+}
+
+function sealQualificationEnvelope(envelope) {
+  return signSeleniumQualificationEnvelope(
+    envelope,
+    TEST_EXECUTOR_KEYS.privateKey,
+  );
 }
 
 let localExecutorIdentityPromise;
@@ -734,6 +754,7 @@ async function qualify(
     {
       ...identity,
       id: "test-disposable-executor",
+      seal: sealQualificationEnvelope,
       async execute(step, context) {
         const result = await runCommand(step, context);
         const attestation = createSeleniumExecutorAttestation({
@@ -1190,6 +1211,18 @@ test("qualification plan installs immutable tarballs and binds executables", asy
 
     assert.equal(plan.workspace.kind, "isolated-executor");
     assert.equal(plan.workspace.github_api_permission, "none");
+    assert.equal(
+      plan.workspace.source_materialization.kind,
+      "repository-source-materialization-manifest",
+    );
+    assert.equal(
+      plan.workspace.mutable_seed.kind,
+      "repository-mutable-seed-manifest",
+    );
+    assert.equal(
+      plan.workspace.immutable_inputs.kind,
+      "repository-trusted-input-manifest",
+    );
     assert.equal(plan.workspace.immutable_inputs.access, "read-only");
     assert.equal(
       plan.workspace.immutable_inputs.manifest.repository_revision,
@@ -1204,6 +1237,32 @@ test("qualification plan installs immutable tarballs and binds executables", asy
         ({ digest: fileDigest }) =>
           /^sha256:[0-9a-f]{64}$/u.test(fileDigest),
       ),
+    );
+    const mutablePath = (path) =>
+      plan.workspace.mutable_paths.some(
+        (root) => path === root || path.startsWith(`${root}/`),
+      );
+    assert.ok(
+      plan.workspace.source_materialization.manifest.files.some(
+        ({ path }) => path === "tests/e2e/selenium/package.json",
+      ),
+    );
+    assert.ok(
+      plan.workspace.mutable_seed.manifest.files.every(
+        ({ path }) => mutablePath(path),
+      ),
+    );
+    assert.ok(
+      plan.workspace.immutable_inputs.manifest.files.every(
+        ({ path }) => !mutablePath(path),
+      ),
+    );
+    assert.deepEqual(
+      plan.workspace.mutable_seed.manifest.files.map(({ path }) => path),
+      [
+        "tests/e2e/selenium/package-lock.json",
+        "tests/e2e/selenium/package.json",
+      ],
     );
     assert.deepEqual(plan.workspace.mutable_paths, [
         "tests/e2e/selenium/package.json",
@@ -1360,6 +1419,9 @@ test("qualification plan installs immutable tarballs and binds executables", asy
           observation,
           catalog,
           executorTools: planInputs.executorTools,
+          mutableSeedManifest: planInputs.mutableSeedManifest,
+          sourceMaterializationManifest:
+            planInputs.sourceMaterializationManifest,
           trustedInputManifest: tamperedManifest,
         }),
       /trusted-input manifest/u,
@@ -1532,7 +1594,7 @@ test("materialization cannot substitute a trusted repository file", async () => 
           return rawResult();
         },
       }),
-      /does not exactly match the trusted-input manifest/u,
+      /does not exactly match the source, seed, and trusted-input manifests/u,
     );
     assert.equal(calls, 0);
   } finally {
@@ -1693,6 +1755,159 @@ test("controlled ephemeral execution independently qualifies all capabilities", 
   }
 });
 
+test("cross-job artifact strictly validates authority, execution, results, and request time", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const catalog = await fixture("capabilities.json");
+    const authority = (await localExecutorIdentity()).authority;
+    const artifact = await qualify(repository, observation, {
+      runCommand: passingRunner([]),
+    });
+    const options = {
+      catalog,
+      observation,
+      trustedExecutorAuthority: authority,
+    };
+    const serializedArtifact = JSON.parse(JSON.stringify(artifact));
+
+    assert.deepEqual(
+      validateSeleniumQualificationArtifact(serializedArtifact, options),
+      serializedArtifact,
+    );
+    assert.equal(artifact.kind, "selenium-qualification-artifact");
+    assert.equal(
+      artifact.envelope.status,
+      "independently-qualified",
+    );
+    assert.deepEqual(artifact.envelope.warnings, []);
+    assert.ok(artifact.executor.executions.length > 0);
+    assert.ok(
+      artifact.executor.executions.every(
+        ({ completed_at: completedAt, started_at: startedAt }) =>
+          startedAt >= artifact.executor.request.issued_at &&
+          completedAt < artifact.executor.request.expires_at,
+      ),
+    );
+
+    const mutations = [
+      ["unknown artifact field", (value) => {
+        value.untrusted = true;
+      }],
+      ["missing request field", (value) => {
+        delete value.executor.request.policy_digest;
+      }],
+      ["tampered authority", (value) => {
+        value.authority.identity_digest = `sha256:${"0".repeat(64)}`;
+      }],
+      ["tampered plan", (value) => {
+        value.executor.plan.workspace.mutable_paths.push("README.md");
+      }],
+      ["read-only mutable seed", (value) => {
+        value.executor.policy.filesystem.mutable_seed.access = "read-only";
+      }],
+      ["execution after expiry", (value) => {
+        value.executor.executions[0].completed_at =
+          value.executor.request.expires_at;
+      }],
+      ["tampered check status", (value) => {
+        value.checks[0].status =
+          value.checks[0].status === "pass" ? "fail" : "pass";
+      }],
+      ["tampered warning", (value) => {
+        value.validation.results[0].warnings.push("forged warning");
+      }],
+      ["tampered evidence", (value) => {
+        value.validation.results[0].evidence.at(-1).digest =
+          `sha256:${"0".repeat(64)}`;
+      }],
+      ["tampered envelope digest", (value) => {
+        value.envelope.checks_digest = `sha256:${"0".repeat(64)}`;
+      }],
+      ["forged envelope signature", (value) => {
+        value.envelope.signature =
+          `${value.envelope.signature.startsWith("A") ? "B" : "A"}` +
+          value.envelope.signature.slice(1);
+      }],
+    ];
+    for (const [name, mutate] of mutations) {
+      const forged = structuredClone(artifact);
+      mutate(forged);
+      assert.throws(
+        () => validateSeleniumQualificationArtifact(forged, options),
+        undefined,
+        name,
+      );
+    }
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("source materialization exactly partitions mutable seed from read-only trusted inputs", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const catalog = await fixture("capabilities.json");
+    const inputs = await qualificationPlanInputs(repository, observation);
+    const plan = createSeleniumQualificationPlan({
+      observation,
+      catalog,
+      ...inputs,
+    });
+    const sourcePaths = new Set(
+      plan.workspace.source_materialization.manifest.files.map(
+        ({ path }) => path,
+      ),
+    );
+    const seedPaths = new Set(
+      plan.workspace.mutable_seed.manifest.files.map(({ path }) => path),
+    );
+    const trustedPaths = new Set(
+      plan.workspace.immutable_inputs.manifest.files.map(
+        ({ path }) => path,
+      ),
+    );
+    assert.equal(sourcePaths.size, seedPaths.size + trustedPaths.size);
+    assert.ok([...seedPaths].every((path) => !trustedPaths.has(path)));
+    assert.ok(
+      [...sourcePaths].every(
+        (path) => seedPaths.has(path) || trustedPaths.has(path),
+      ),
+    );
+
+    const overlap = structuredClone(inputs);
+    overlap.trustedInputManifest.files.push(
+      structuredClone(overlap.mutableSeedManifest.files[0]),
+    );
+    overlap.trustedInputManifest.files.sort(({ path: left }, { path: right }) =>
+      left.localeCompare(right));
+    assert.throws(
+      () =>
+        createSeleniumQualificationPlan({
+          observation,
+          catalog,
+          ...overlap,
+        }),
+      /labels mutable path|overlap/u,
+    );
+
+    const incomplete = structuredClone(inputs);
+    incomplete.mutableSeedManifest.files.pop();
+    assert.throws(
+      () =>
+        createSeleniumQualificationPlan({
+          observation,
+          catalog,
+          ...incomplete,
+        }),
+      /exactly partition/u,
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
 test("candidate-mutated package scripts are never invoked", async () => {
   const repository = await createRepository();
   const markerRoot = await mkdtemp(join(tmpdir(), "selenium-script-attack-"));
@@ -1826,6 +2041,7 @@ test("unknown executor authorities fail before execution", async () => {
             public_key: roguePublicKey,
           },
           id: "rogue-disposable-executor",
+          seal: sealQualificationEnvelope,
           async execute() {
             calls += 1;
             throw new Error("must not execute");
@@ -1911,6 +2127,7 @@ test("prior-run executor attestations cannot be replayed", async () => {
       executor: {
         ...(await localExecutorIdentity()),
         id: "test-disposable-executor",
+        seal: sealQualificationEnvelope,
         async execute(step) {
           return {
             attestation: structuredClone(replayed),
@@ -1967,6 +2184,7 @@ test("Node and npm shims or forged identities cannot intercept execution", async
             executor: {
               ...identity,
               id: "test-disposable-executor",
+              seal: sealQualificationEnvelope,
               tools,
               async execute() {
                 calls += 1;

@@ -107,6 +107,12 @@ const SELENIUM_MUTABLE_PATHS = Object.freeze([
   `${SELENIUM_PACKAGE_DIRECTORY}/diagnostics`,
   `${SELENIUM_PACKAGE_DIRECTORY}/node_modules`,
 ]);
+const SOURCE_MANIFEST_KIND =
+  "repository-source-materialization-manifest";
+const MUTABLE_SEED_MANIFEST_KIND =
+  "repository-mutable-seed-manifest";
+const TRUSTED_INPUT_MANIFEST_KIND =
+  "repository-trusted-input-manifest";
 const SAFE_ENVIRONMENT_OVERRIDES = new Set([
   "NPM_CONFIG_STRICT_SSL",
 ]);
@@ -1713,7 +1719,15 @@ function qualificationCapability(capability) {
   };
 }
 
-function validateTrustedInputManifest(manifest, repositoryRevision) {
+function validateRepositoryFileManifest(
+  manifest,
+  repositoryRevision,
+  {
+    kind,
+    label,
+    requireExecutableInputs = false,
+  },
+) {
   assertExactObjectKeys(
     manifest,
     new Set([
@@ -1723,18 +1737,17 @@ function validateTrustedInputManifest(manifest, repositoryRevision) {
       "repository_revision",
       "schema_version",
     ]),
-    "Selenium trusted-input manifest",
+    label,
   );
   if (
     manifest.schema_version !== 1 ||
-    manifest.kind !== "repository-source-manifest" ||
+    manifest.kind !== kind ||
     manifest.repository_revision !== repositoryRevision ||
     manifest.github_api_permission !== "none" ||
-    !Array.isArray(manifest.files) ||
-    manifest.files.length === 0
+    !Array.isArray(manifest.files)
   ) {
     throw new Error(
-      "Selenium trusted-input manifest must bind the repository revision, files, and no GitHub API permission",
+      `${label} must bind the repository revision, files, and no GitHub API permission`,
     );
   }
   const paths = new Set();
@@ -1742,7 +1755,7 @@ function validateTrustedInputManifest(manifest, repositoryRevision) {
     assertExactObjectKeys(
       entry,
       new Set(["digest", "mode", "path", "type"]),
-      `Selenium trusted-input manifest file[${index}]`,
+      `${label} file[${index}]`,
     );
     if (
       typeof entry.path !== "string" ||
@@ -1756,12 +1769,12 @@ function validateTrustedInputManifest(manifest, repositoryRevision) {
       entry.mode > 0o777
     ) {
       throw new Error(
-        "Selenium trusted-input manifest must contain unique repository files",
+        `${label} must contain unique repository files`,
       );
     }
     assertDigest(
       entry.digest,
-      `Selenium trusted-input manifest file[${index}].digest`,
+      `${label} file[${index}].digest`,
     );
     paths.add(entry.path);
   }
@@ -1769,39 +1782,31 @@ function validateTrustedInputManifest(manifest, repositoryRevision) {
     stableJson([...manifest.files].sort(({ path: left }, { path: right }) =>
       compareText(left, right))) !== stableJson(manifest.files)
   ) {
-    throw new Error("Selenium trusted-input manifest files must be sorted");
+    throw new Error(`${label} files must be sorted`);
   }
-  for (const path of TRUSTED_EXECUTION_PATHS) {
-    if (!paths.has(path)) {
-      throw new Error(
-        `Selenium trusted-input manifest lacks executable input ${path}`,
-      );
+  if (requireExecutableInputs) {
+    for (const path of TRUSTED_EXECUTION_PATHS) {
+      if (!paths.has(path)) {
+        throw new Error(
+          `${label} lacks executable input ${path}`,
+        );
+      }
     }
   }
   return structuredClone(manifest);
 }
 
-export async function createSeleniumTrustedInputManifest(
-  repositoryRoot,
+function manifestFromEntries(
+  entries,
   repositoryRevision,
+  kind,
+  label,
+  options = {},
 ) {
-  if (!REVISION_PATTERN.test(repositoryRevision ?? "")) {
-    throw new Error(
-      "Selenium trusted-input manifest repository revision must be a full lowercase commit SHA",
-    );
-  }
-  const entries = await treeEntries(repositoryRoot, repositoryRoot, {
-    excludeRootNames: new Set([".git"]),
-  });
-  if (entries.some(([, entry]) => entry.type !== "file")) {
-    throw new Error(
-      "Selenium trusted-input manifest does not permit repository symlinks",
-    );
-  }
-  return validateTrustedInputManifest(
+  return validateRepositoryFileManifest(
     {
       schema_version: 1,
-      kind: "repository-source-manifest",
+      kind,
       repository_revision: repositoryRevision,
       github_api_permission: "none",
       files: entries
@@ -1815,13 +1820,165 @@ export async function createSeleniumTrustedInputManifest(
           compareText(left, right)),
     },
     repositoryRevision,
+    { kind, label, ...options },
   );
+}
+
+async function repositoryFileEntries(
+  repositoryRoot,
+  repositoryRevision,
+) {
+  if (!REVISION_PATTERN.test(repositoryRevision ?? "")) {
+    throw new Error(
+      "Selenium repository manifest revision must be a full lowercase commit SHA",
+    );
+  }
+  const entries = await treeEntries(repositoryRoot, repositoryRoot, {
+    excludeRootNames: new Set([".git"]),
+  });
+  if (entries.some(([, entry]) => entry.type !== "file")) {
+    throw new Error(
+      "Selenium trusted-input manifest does not permit repository symlinks",
+    );
+  }
+  return entries;
+}
+
+export async function createSeleniumSourceMaterializationManifest(
+  repositoryRoot,
+  repositoryRevision,
+) {
+  return manifestFromEntries(
+    await repositoryFileEntries(repositoryRoot, repositoryRevision),
+    repositoryRevision,
+    SOURCE_MANIFEST_KIND,
+    "Selenium source materialization manifest",
+  );
+}
+
+export async function createSeleniumMutableSeedManifest(
+  repositoryRoot,
+  repositoryRevision,
+) {
+  const entries = await repositoryFileEntries(
+    repositoryRoot,
+    repositoryRevision,
+  );
+  return manifestFromEntries(
+    entries.filter(([path]) =>
+      pathIsMutable(path, SELENIUM_MUTABLE_PATHS)),
+    repositoryRevision,
+    MUTABLE_SEED_MANIFEST_KIND,
+    "Selenium mutable-seed manifest",
+  );
+}
+
+export async function createSeleniumTrustedInputManifest(
+  repositoryRoot,
+  repositoryRevision,
+) {
+  const entries = await repositoryFileEntries(
+    repositoryRoot,
+    repositoryRevision,
+  );
+  return manifestFromEntries(
+    entries.filter(([path]) =>
+      !pathIsMutable(path, SELENIUM_MUTABLE_PATHS)),
+    repositoryRevision,
+    TRUSTED_INPUT_MANIFEST_KIND,
+    "Selenium trusted-input manifest",
+    { requireExecutableInputs: true },
+  );
+}
+
+function validateWorkspaceManifestPartition({
+  mutableSeedManifest,
+  repositoryRevision,
+  sourceMaterializationManifest,
+  trustedInputManifest,
+}) {
+  const source = validateRepositoryFileManifest(
+    sourceMaterializationManifest,
+    repositoryRevision,
+    {
+      kind: SOURCE_MANIFEST_KIND,
+      label: "Selenium source materialization manifest",
+    },
+  );
+  const seed = validateRepositoryFileManifest(
+    mutableSeedManifest,
+    repositoryRevision,
+    {
+      kind: MUTABLE_SEED_MANIFEST_KIND,
+      label: "Selenium mutable-seed manifest",
+    },
+  );
+  const trusted = validateRepositoryFileManifest(
+    trustedInputManifest,
+    repositoryRevision,
+    {
+      kind: TRUSTED_INPUT_MANIFEST_KIND,
+      label: "Selenium trusted-input manifest",
+      requireExecutableInputs: true,
+    },
+  );
+  const sourceByPath = new Map(
+    source.files.map((entry) => [entry.path, entry]),
+  );
+  const seedPaths = new Set(seed.files.map(({ path }) => path));
+  const trustedPaths = new Set(trusted.files.map(({ path }) => path));
+  for (const path of seedPaths) {
+    if (!pathIsMutable(path, SELENIUM_MUTABLE_PATHS)) {
+      throw new Error(
+        `Selenium mutable-seed manifest contains immutable path ${path}`,
+      );
+    }
+    if (trustedPaths.has(path)) {
+      throw new Error(
+        `Selenium trusted and mutable-seed manifests overlap at ${path}`,
+      );
+    }
+  }
+  for (const path of trustedPaths) {
+    if (pathIsMutable(path, SELENIUM_MUTABLE_PATHS)) {
+      throw new Error(
+        `Selenium trusted-input manifest labels mutable path ${path} read-only`,
+      );
+    }
+  }
+  const partition = [...seed.files, ...trusted.files]
+    .sort(({ path: left }, { path: right }) => compareText(left, right));
+  if (
+    stableJson(partition) !== stableJson(source.files) ||
+    partition.some((entry) =>
+      stableJson(sourceByPath.get(entry.path)) !== stableJson(entry))
+  ) {
+    throw new Error(
+      "Selenium source materialization manifest must exactly partition into mutable seed and immutable trusted inputs",
+    );
+  }
+  return {
+    source,
+    seed,
+    trusted,
+    source_digest: hash(source),
+    seed_digest: hash(seed),
+    trusted_digest: hash(trusted),
+    partition_digest: hash({
+      mutable_paths: SELENIUM_MUTABLE_PATHS,
+      seed_digest: hash(seed),
+      source_digest: hash(source),
+      trusted_digest: hash(trusted),
+    }),
+  };
 }
 
 export function createSeleniumQualificationPlan({
   observation,
   catalog,
   executorTools,
+  mutableSeedManifest,
+  sourceMaterializationManifest,
   trustedInputManifest,
 } = {}) {
   validateCatalog(catalog);
@@ -1857,10 +2014,12 @@ export function createSeleniumQualificationPlan({
   }
   const candidate = decodedCandidate(observation);
   const tools = normalizeExecutorTools(executorTools);
-  const trustedInputs = validateTrustedInputManifest(
+  const manifests = validateWorkspaceManifestPartition({
+    mutableSeedManifest,
+    repositoryRevision: observation.repository.revision,
+    sourceMaterializationManifest,
     trustedInputManifest,
-    observation.repository.revision,
-  );
+  });
   if (
     candidate.runner.browser.compatibility_key !==
     candidate.runner.driver.compatibility_key
@@ -2005,14 +2164,25 @@ export function createSeleniumQualificationPlan({
     workspace: {
       kind: "isolated-executor",
       github_api_permission: "none",
+      source_materialization: {
+        kind: SOURCE_MANIFEST_KIND,
+        manifest: manifests.source,
+        manifest_digest: manifests.source_digest,
+      },
+      mutable_seed: {
+        kind: MUTABLE_SEED_MANIFEST_KIND,
+        manifest: manifests.seed,
+        manifest_digest: manifests.seed_digest,
+      },
       immutable_inputs: {
-        kind: "repository-source-manifest",
+        kind: TRUSTED_INPUT_MANIFEST_KIND,
         access: "read-only",
-        manifest: trustedInputs,
-        manifest_digest: hash(trustedInputs),
+        manifest: manifests.trusted,
+        manifest_digest: manifests.trusted_digest,
       },
       mutable_paths: [...SELENIUM_MUTABLE_PATHS],
       managed_paths: [...SELENIUM_MANAGED_PATHS],
+      partition_digest: manifests.partition_digest,
     },
     packages: PACKAGE_NAMES.map((name) =>
       structuredClone(candidate.packages[name])),
@@ -2123,6 +2293,24 @@ function warningLines(output) {
     .filter((line) => warningPattern.test(line) && line.length > 0);
 }
 
+function workspaceBindingDigests(plan) {
+  return {
+    source_materialization_digest:
+      plan.workspace.source_materialization.manifest_digest,
+    mutable_seed_digest:
+      plan.workspace.mutable_seed.manifest_digest,
+    trusted_inputs_digest:
+      plan.workspace.immutable_inputs.manifest_digest,
+    workspace_partition_digest: plan.workspace.partition_digest,
+  };
+}
+
+function fileManifestContentDigest(manifest) {
+  return hash(
+    manifest.files.map(({ path, ...entry }) => [path, entry]),
+  );
+}
+
 function commandEvidence(
   step,
   plan,
@@ -2139,8 +2327,7 @@ function commandEvidence(
       plan_digest: hash(plan),
       step,
       tools: plan.tools,
-      trusted_inputs_digest:
-        plan.workspace.immutable_inputs.manifest_digest,
+      ...workspaceBindingDigests(plan),
       runner: plan.runner,
       raw,
     }),
@@ -2212,7 +2399,7 @@ function validateEnvironmentOverrides(overrides) {
 function validateExecutor(executor, trustedAuthority) {
   assertExactObjectKeys(
     executor,
-    new Set(["authority", "execute", "id", "path", "tools"]),
+    new Set(["authority", "execute", "id", "path", "seal", "tools"]),
     "Selenium executor",
   );
   if (
@@ -2223,6 +2410,9 @@ function validateExecutor(executor, trustedAuthority) {
   }
   if (typeof executor.execute !== "function") {
     throw new Error("Selenium executor execute must be a function");
+  }
+  if (typeof executor.seal !== "function") {
+    throw new Error("Selenium executor seal must be a function");
   }
   assertExactObjectKeys(
     executor.authority,
@@ -2401,6 +2591,15 @@ function executorPolicy({
       variables: policyEnvironment,
     },
     filesystem: {
+      source_materialization: {
+        digest: plan.workspace.source_materialization.manifest_digest,
+        repository_revision: plan.repository.revision,
+      },
+      mutable_seed: {
+        access: "read-write",
+        digest: plan.workspace.mutable_seed.manifest_digest,
+        repository_revision: plan.repository.revision,
+      },
       immutable_inputs: {
         access: "read-only",
         digest: immutableInputsDigest,
@@ -2408,6 +2607,7 @@ function executorPolicy({
           plan.workspace.immutable_inputs.manifest_digest,
         repository_revision: plan.repository.revision,
       },
+      partition_digest: plan.workspace.partition_digest,
       mutable_paths: {
         executor_state: executorStatePaths,
         repository: [...mutablePaths],
@@ -2478,8 +2678,14 @@ function executionRequest(policy, freshness, now) {
     policy_digest: hash(policy),
     immutable_inputs_digest:
       policy.filesystem.immutable_inputs.digest,
+    source_materialization_digest:
+      policy.filesystem.source_materialization.digest,
+    mutable_seed_digest:
+      policy.filesystem.mutable_seed.digest,
     trusted_inputs_digest:
       policy.filesystem.immutable_inputs.manifest_digest,
+    workspace_partition_digest:
+      policy.filesystem.partition_digest,
     mutable_paths_digest: policy.filesystem.mutable_paths_digest,
     tools_digest: policy.tools_digest,
   };
@@ -2548,7 +2754,11 @@ export function createSeleniumExecutorAttestation({
     policy_digest: request.policy_digest,
     request_digest: request.request_digest,
     immutable_inputs_digest: request.immutable_inputs_digest,
+    source_materialization_digest:
+      request.source_materialization_digest,
+    mutable_seed_digest: request.mutable_seed_digest,
     trusted_inputs_digest: request.trusted_inputs_digest,
+    workspace_partition_digest: request.workspace_partition_digest,
     mutable_paths_digest: request.mutable_paths_digest,
     tools_digest: request.tools_digest,
     step_id: step.id,
@@ -2581,11 +2791,53 @@ export function signSeleniumExecutorAttestation(
   };
 }
 
+function signatureFor(value, privateKey) {
+  return createSignature(
+    null,
+    Buffer.from(stableJson(value)),
+    privateKey,
+  ).toString("base64");
+}
+
+function verifyEd25519Signature(value, signature, publicKey) {
+  if (
+    typeof signature !== "string" ||
+    !/^[A-Za-z0-9+/]+={0,2}$/u.test(signature)
+  ) {
+    return false;
+  }
+  const bytes = Buffer.from(signature, "base64");
+  if (bytes.toString("base64") !== signature) {
+    return false;
+  }
+  return verifySignature(
+    null,
+    Buffer.from(stableJson(value)),
+    createPublicKey(publicKey),
+    bytes,
+  );
+}
+
+export function signSeleniumQualificationEnvelope(
+  envelope,
+  privateKey,
+) {
+  assertObject(envelope, "Selenium qualification envelope");
+  if ("signature" in envelope) {
+    throw new Error("Selenium qualification envelope is already signed");
+  }
+  return {
+    ...structuredClone(envelope),
+    signature: signatureFor(envelope, privateKey),
+  };
+}
+
 function validateExecutorAttestation(
   attestation,
   {
     authority,
     environment,
+    environmentDigest,
     policy,
     raw,
     request,
@@ -2605,6 +2857,7 @@ function validateExecutorAttestation(
     "isolation",
     "kind",
     "mutable_paths_digest",
+    "mutable_seed_digest",
     "plan_digest",
     "policy_digest",
     "repository_revision",
@@ -2613,10 +2866,12 @@ function validateExecutorAttestation(
     "run_id",
     "schema_version",
     "signature",
+    "source_materialization_digest",
     "step_digest",
     "step_id",
     "tools_digest",
     "trusted_inputs_digest",
+    "workspace_partition_digest",
     "working_directory",
   ]);
   assertExactObjectKeys(
@@ -2651,13 +2906,17 @@ function validateExecutorAttestation(
     policy_digest: request.policy_digest,
     request_digest: request.request_digest,
     immutable_inputs_digest: request.immutable_inputs_digest,
+    source_materialization_digest:
+      request.source_materialization_digest,
+    mutable_seed_digest: request.mutable_seed_digest,
     trusted_inputs_digest: request.trusted_inputs_digest,
+    workspace_partition_digest: request.workspace_partition_digest,
     mutable_paths_digest: request.mutable_paths_digest,
     tools_digest: request.tools_digest,
     step_id: step.id,
     step_digest: hash(step),
     working_directory: step.cwd,
-    environment_digest: hash(environment),
+    environment_digest: environmentDigest ?? hash(environment),
     executable_identity_digest: hash(
       stepExecutableIdentity(step, policy),
     ),
@@ -2674,13 +2933,7 @@ function validateExecutorAttestation(
   const { signature, ...unsigned } = attestation;
   if (
     stableJson(unsigned) !== stableJson(expected) ||
-    !/^[A-Za-z0-9+/]+={0,2}$/u.test(signature) ||
-    !verifySignature(
-      null,
-      Buffer.from(stableJson(expected)),
-      createPublicKey(authority.public_key),
-      Buffer.from(signature, "base64"),
-    )
+    !verifyEd25519Signature(expected, signature, authority.public_key)
   ) {
     throw new Error(`${step.id} executor attestation is not exactly bound`);
   }
@@ -2728,7 +2981,12 @@ function executorAttestationSetEvidence(
       issued_at: request.issued_at,
       request_digest: request.request_digest,
       run_id: request.run_id,
+      source_materialization_digest:
+        request.source_materialization_digest,
+      mutable_seed_digest: request.mutable_seed_digest,
       trusted_inputs_digest: request.trusted_inputs_digest,
+      workspace_partition_digest:
+        request.workspace_partition_digest,
     }),
     started_at: startedAt,
     completed_at: completedAt,
@@ -2811,6 +3069,45 @@ function exactExecutableVersion(kind, output, identity) {
   );
 }
 
+function controlledStepPassed(step, raw, policy) {
+  if (raw.exitCode !== 0) {
+    return false;
+  }
+  try {
+    if (step.kind === "node-identity") {
+      return exactExecutableVersion(
+        "node",
+        raw.stdout,
+        policy.tools.node,
+      );
+    }
+    if (step.kind === "npm-identity") {
+      return exactExecutableVersion(
+        "npm",
+        raw.stdout,
+        policy.tools.npm,
+      );
+    }
+    if (step.kind === "browser-identity") {
+      return exactExecutableVersion(
+        "browser",
+        raw.stdout,
+        policy.runner.browser,
+      );
+    }
+    if (step.kind === "driver-identity") {
+      return exactExecutableVersion(
+        "driver",
+        raw.stdout,
+        policy.runner.driver,
+      );
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function verifyStepToolBinding(step, policy) {
   if (step.tool === "node") {
     if (step.command !== policy.tools.node.realpath) {
@@ -2880,6 +3177,7 @@ async function executeControlledStep(
     attestations,
     baseEnvironment,
     executor,
+    executions,
     now,
     policy,
     request,
@@ -2890,6 +3188,7 @@ async function executeControlledStep(
   assertFreshExecutionRequest(request, startedValue);
   const startedAt = timestamp(startedValue);
   let attestation = null;
+  let attestedRaw = null;
   let commandOutput = "";
   let raw;
   const identity =
@@ -2932,6 +3231,7 @@ async function executeControlledStep(
       response.result,
       step.id,
     );
+    attestedRaw = structuredClone(raw);
     commandOutput = `${raw.stdout}${raw.stderr}`;
     attestation = validateExecutorAttestation(
       response.attestation,
@@ -2978,34 +3278,12 @@ async function executeControlledStep(
     };
   }
   const completedAt = timestamp(completedValue);
-  let identityMatches = true;
-  if (
-    raw.exitCode === 0 &&
-    ["node-identity", "npm-identity"].includes(step.kind)
-  ) {
-    identityMatches = exactExecutableVersion(
-      step.kind === "node-identity" ? "node" : "npm",
-      raw.stdout,
-      policy.tools[step.kind === "node-identity" ? "node" : "npm"],
-    );
-  } else if (identity !== null && raw.exitCode === 0) {
-    try {
-      identityMatches = exactExecutableVersion(
-        identity.kind,
-        raw.stdout,
-        identity,
-      );
-    } catch {
-      identityMatches = false;
-    }
-  }
-  return {
+  const check = {
     id: step.id,
     phase: step.phase,
     capability_id: step.capability_id,
     scenario: step.scenario,
-    status:
-      raw.exitCode === 0 && identityMatches ? "pass" : "fail",
+    status: controlledStepPassed(step, raw, policy) ? "pass" : "fail",
     warnings: sortedUnique(warningLines(commandOutput)),
     evidence: [
       commandEvidence(step, plan, raw, startedAt, completedAt),
@@ -3021,6 +3299,18 @@ async function executeControlledStep(
           ]),
     ],
   };
+  executions.push({
+    step_id: step.id,
+    started_at: startedAt,
+    completed_at: completedAt,
+    environment_digest:
+      attestation?.environment_digest ?? null,
+    result: attestedRaw,
+    check_result: structuredClone(raw),
+    attestation:
+      attestation === null ? null : structuredClone(attestation),
+  });
+  return check;
 }
 
 function lockPackage(lock, name) {
@@ -3164,8 +3454,7 @@ function internalCheckEvidence(
           plan_digest: hash(plan),
           runner: plan.runner,
           tools: plan.tools,
-          trusted_inputs_digest:
-            plan.workspace.immutable_inputs.manifest_digest,
+          ...workspaceBindingDigests(plan),
         }),
         started_at: startedAt,
         completed_at: completedAt,
@@ -3481,12 +3770,896 @@ function artifactEvidence(capability, plan, files, startedAt, completedAt) {
       files,
       runner: plan.runner,
       tools: plan.tools,
-      trusted_inputs_digest:
-        plan.workspace.immutable_inputs.manifest_digest,
+      ...workspaceBindingDigests(plan),
     }),
     started_at: startedAt,
     completed_at: completedAt,
   };
+}
+
+function qualificationEnvelope({
+  authority,
+  checks,
+  executions,
+  failures,
+  plan,
+  policy,
+  request,
+  validation,
+}) {
+  const timestamps = checks.flatMap(({ evidence }) =>
+    evidence.flatMap(({ started_at: startedAt, completed_at: completedAt }) =>
+      [startedAt, completedAt]));
+  if (timestamps.length === 0) {
+    throw new Error("Selenium qualification envelope requires check evidence");
+  }
+  const milliseconds = timestamps.map((value) =>
+    timestampMilliseconds(value, "Selenium qualification evidence timestamp"));
+  return {
+    schema_version: 1,
+    kind: "selenium-qualification-result-envelope",
+    authority_digest: hash(authority),
+    candidate_digest: plan.candidate_digest,
+    repository_revision: plan.repository.revision,
+    plan_digest: hash(plan),
+    policy_digest: hash(policy),
+    request_digest: request.request_digest,
+    source_materialization_digest:
+      request.source_materialization_digest,
+    mutable_seed_digest: request.mutable_seed_digest,
+    trusted_inputs_digest: request.trusted_inputs_digest,
+    workspace_partition_digest: request.workspace_partition_digest,
+    executions_digest: hash(executions),
+    checks_digest: hash(checks),
+    failures_digest: hash(failures),
+    validation_digest: hash(validation),
+    evidence_digest: hash(
+      validation.results.map(({ capability_id: capabilityId, evidence }) => ({
+        capability_id: capabilityId,
+        evidence,
+      })),
+    ),
+    status: validation.disposition.state,
+    warnings: sortedUnique(
+      validation.results.flatMap(({ warnings }) => warnings),
+    ),
+    generated_at: validation.generated_at,
+    execution_started_at:
+      new Date(Math.min(...milliseconds)).toISOString(),
+    execution_completed_at:
+      new Date(Math.max(...milliseconds)).toISOString(),
+  };
+}
+
+function validateArtifactAuthority(authority, trustedAuthority) {
+  const keys = new Set([
+    "github_api_permission",
+    "identity_digest",
+    "kind",
+    "public_key",
+  ]);
+  assertExactObjectKeys(
+    authority,
+    keys,
+    "Selenium qualification artifact authority",
+  );
+  assertExactObjectKeys(
+    trustedAuthority,
+    keys,
+    "Caller-trusted Selenium qualification authority",
+  );
+  assertDigest(
+    authority.identity_digest,
+    "Selenium qualification artifact authority identity_digest",
+  );
+  assertString(
+    authority.public_key,
+    "Selenium qualification artifact authority public_key",
+  );
+  let publicKey;
+  try {
+    publicKey = createPublicKey(authority.public_key);
+  } catch (error) {
+    throw new Error(
+      "Selenium qualification artifact authority public_key is invalid",
+      { cause: error },
+    );
+  }
+  if (
+    authority.kind !== "ed25519" ||
+    authority.github_api_permission !== "none" ||
+    publicKey.asymmetricKeyType !== "ed25519" ||
+    authority.identity_digest !== hash(authority.public_key) ||
+    stableJson(authority) !== stableJson(trustedAuthority)
+  ) {
+    throw new Error(
+      "Selenium qualification artifact authority is not exactly caller-trusted",
+    );
+  }
+}
+
+function validateArtifactPolicy(policy, plan, authority) {
+  assertExactObjectKeys(
+    policy,
+    new Set([
+      "authority",
+      "candidate_digest",
+      "environment",
+      "executor_id",
+      "filesystem",
+      "isolation",
+      "kind",
+      "plan_digest",
+      "repository_revision",
+      "runner",
+      "schema_version",
+      "tools",
+      "tools_digest",
+    ]),
+    "Selenium qualification artifact policy",
+  );
+  assertExactObjectKeys(
+    policy.authority,
+    new Set([
+      "github_api_permission",
+      "identity_digest",
+      "kind",
+      "public_key_digest",
+    ]),
+    "Selenium qualification artifact policy authority",
+  );
+  assertExactObjectKeys(
+    policy.isolation,
+    new Set([
+      "disposable",
+      "github_api_access",
+      "network",
+      "privileges",
+      "repository_write_access",
+      "secrets",
+    ]),
+    "Selenium qualification artifact policy isolation",
+  );
+  assertExactObjectKeys(
+    policy.environment,
+    new Set(["inherit_host", "variables"]),
+    "Selenium qualification artifact policy environment",
+  );
+  assertExactObjectKeys(
+    policy.filesystem,
+    new Set([
+      "immutable_inputs",
+      "mutable_paths",
+      "mutable_paths_digest",
+      "mutable_seed",
+      "partition_digest",
+      "source_materialization",
+    ]),
+    "Selenium qualification artifact policy filesystem",
+  );
+  assertExactObjectKeys(
+    policy.filesystem.source_materialization,
+    new Set(["digest", "repository_revision"]),
+    "Selenium qualification artifact source materialization policy",
+  );
+  assertExactObjectKeys(
+    policy.filesystem.mutable_seed,
+    new Set(["access", "digest", "repository_revision"]),
+    "Selenium qualification artifact mutable-seed policy",
+  );
+  assertExactObjectKeys(
+    policy.filesystem.immutable_inputs,
+    new Set([
+      "access",
+      "digest",
+      "manifest_digest",
+      "repository_revision",
+    ]),
+    "Selenium qualification artifact immutable-input policy",
+  );
+  assertExactObjectKeys(
+    policy.filesystem.mutable_paths,
+    new Set(["executor_state", "repository"]),
+    "Selenium qualification artifact mutable-path policy",
+  );
+  const expectedIsolation = {
+    disposable: true,
+    github_api_access: false,
+    network: "candidate-registry-only",
+    privileges: "unprivileged",
+    repository_write_access: false,
+    secrets: "none",
+  };
+  const expectedAuthority = {
+    github_api_permission: authority.github_api_permission,
+    identity_digest: authority.identity_digest,
+    kind: authority.kind,
+    public_key_digest: hash(authority.public_key),
+  };
+  const expectedExecutorState = [
+    "${EXECUTOR_STATE_ROOT}/executor-home",
+    "${EXECUTOR_STATE_ROOT}/executor-tmp",
+  ];
+  const expectedMutablePaths = {
+    executor_state: expectedExecutorState,
+    repository: plan.workspace.mutable_paths,
+  };
+  if (
+    policy.schema_version !== 1 ||
+    policy.kind !== "selenium-isolated-executor-policy" ||
+    typeof policy.executor_id !== "string" ||
+    !EXECUTOR_ID_PATTERN.test(policy.executor_id) ||
+    policy.candidate_digest !== plan.candidate_digest ||
+    policy.repository_revision !== plan.repository.revision ||
+    policy.plan_digest !== hash(plan) ||
+    stableJson(policy.authority) !== stableJson(expectedAuthority) ||
+    stableJson(policy.tools) !== stableJson(plan.tools) ||
+    policy.tools_digest !== hash(plan.tools) ||
+    stableJson(policy.runner) !== stableJson(plan.runner) ||
+    stableJson(policy.isolation) !== stableJson(expectedIsolation) ||
+    policy.environment.inherit_host !== false ||
+    policy.filesystem.source_materialization.digest !==
+      plan.workspace.source_materialization.manifest_digest ||
+    policy.filesystem.source_materialization.repository_revision !==
+      plan.repository.revision ||
+    policy.filesystem.mutable_seed.access !== "read-write" ||
+    policy.filesystem.mutable_seed.digest !==
+      plan.workspace.mutable_seed.manifest_digest ||
+    policy.filesystem.mutable_seed.repository_revision !==
+      plan.repository.revision ||
+    policy.filesystem.immutable_inputs.access !== "read-only" ||
+    policy.filesystem.immutable_inputs.digest !==
+      fileManifestContentDigest(
+        plan.workspace.immutable_inputs.manifest,
+      ) ||
+    policy.filesystem.immutable_inputs.manifest_digest !==
+      plan.workspace.immutable_inputs.manifest_digest ||
+    policy.filesystem.immutable_inputs.repository_revision !==
+      plan.repository.revision ||
+    policy.filesystem.partition_digest !==
+      plan.workspace.partition_digest ||
+    stableJson(policy.filesystem.mutable_paths) !==
+      stableJson(expectedMutablePaths) ||
+    policy.filesystem.mutable_paths_digest !== hash(expectedMutablePaths)
+  ) {
+    throw new Error(
+      "Selenium qualification artifact policy is not exactly bound to its plan and authority",
+    );
+  }
+  assertDigest(
+    policy.filesystem.immutable_inputs.digest,
+    "Selenium qualification artifact immutable workspace digest",
+  );
+  const environmentKeys = new Set([
+    "CI",
+    "E2E_SELENIUM_CACHE",
+    "GITHUB_WORKSPACE",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "NO_COLOR",
+    "NPM_CONFIG_AUDIT",
+    "NPM_CONFIG_CACHE",
+    "NPM_CONFIG_FUND",
+    "PATH",
+    "TMPDIR",
+  ]);
+  if ("NPM_CONFIG_STRICT_SSL" in policy.environment.variables) {
+    environmentKeys.add("NPM_CONFIG_STRICT_SSL");
+  }
+  assertExactObjectKeys(
+    policy.environment.variables,
+    environmentKeys,
+    "Selenium qualification artifact policy environment variables",
+  );
+  const expectedEnvironment = {
+    CI: "true",
+    E2E_SELENIUM_CACHE:
+      "${WORKSPACE_ROOT}/tests/e2e/selenium/.runtime/selenium-cache",
+    GITHUB_WORKSPACE: "${WORKSPACE_ROOT}",
+    HOME: "${EXECUTOR_STATE_ROOT}/executor-home",
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    NO_COLOR: "1",
+    NPM_CONFIG_AUDIT: "false",
+    NPM_CONFIG_CACHE:
+      "${WORKSPACE_ROOT}/tests/e2e/selenium/.npm-cache",
+    NPM_CONFIG_FUND: "false",
+    PATH: policy.environment.variables.PATH,
+    TMPDIR: "${EXECUTOR_STATE_ROOT}/executor-tmp",
+    ...("NPM_CONFIG_STRICT_SSL" in policy.environment.variables
+      ? {
+          NPM_CONFIG_STRICT_SSL:
+            policy.environment.variables.NPM_CONFIG_STRICT_SSL,
+        }
+      : {}),
+  };
+  if (
+    typeof expectedEnvironment.PATH !== "string" ||
+    expectedEnvironment.PATH.length === 0 ||
+    !["true", "false", undefined].includes(
+      expectedEnvironment.NPM_CONFIG_STRICT_SSL,
+    ) ||
+    stableJson(policy.environment.variables) !==
+      stableJson(expectedEnvironment)
+  ) {
+    throw new Error(
+      "Selenium qualification artifact policy environment is not canonical",
+    );
+  }
+}
+
+function assertArtifactTimeWithinRequest(
+  startedAt,
+  completedAt,
+  request,
+  label,
+) {
+  const started = timestampMilliseconds(startedAt, `${label} started_at`);
+  const completed = timestampMilliseconds(
+    completedAt,
+    `${label} completed_at`,
+  );
+  const issued = timestampMilliseconds(
+    request.issued_at,
+    "Selenium qualification artifact request issued_at",
+  );
+  const expires = timestampMilliseconds(
+    request.expires_at,
+    "Selenium qualification artifact request expires_at",
+  );
+  if (
+    started < issued ||
+    completed < started ||
+    completed >= expires
+  ) {
+    throw new Error(`${label} executes outside the request window`);
+  }
+}
+
+function validateArtifactEvidence(evidence, request, label) {
+  assertExactObjectKeys(
+    evidence,
+    new Set([
+      "completed_at",
+      "digest",
+      "locator",
+      "revision",
+      "started_at",
+      "type",
+    ]),
+    label,
+  );
+  assertString(evidence.type, `${label} type`);
+  assertString(evidence.locator, `${label} locator`);
+  if (!REVISION_PATTERN.test(evidence.revision ?? "")) {
+    throw new Error(`${label} revision must be a full lowercase commit SHA`);
+  }
+  assertDigest(evidence.digest, `${label} digest`);
+  assertArtifactTimeWithinRequest(
+    evidence.started_at,
+    evidence.completed_at,
+    request,
+    label,
+  );
+}
+
+function validateArtifactCheck(check, request, label) {
+  assertExactObjectKeys(
+    check,
+    new Set([
+      "capability_id",
+      "evidence",
+      "id",
+      "phase",
+      "scenario",
+      "status",
+      "warnings",
+    ]),
+    label,
+  );
+  assertString(check.id, `${label} id`);
+  assertString(check.phase, `${label} phase`);
+  if (
+    check.capability_id !== null &&
+    (typeof check.capability_id !== "string" ||
+      !EXECUTOR_ID_PATTERN.test(check.capability_id))
+  ) {
+    throw new Error(`${label} capability_id must be null or kebab-case`);
+  }
+  if (
+    check.scenario !== null &&
+    (typeof check.scenario !== "string" || check.scenario.length === 0)
+  ) {
+    throw new Error(`${label} scenario must be null or nonempty`);
+  }
+  if (!["pass", "fail"].includes(check.status)) {
+    throw new Error(`${label} status must be pass or fail`);
+  }
+  if (
+    !Array.isArray(check.warnings) ||
+    check.warnings.some(
+      (warning) => typeof warning !== "string" || warning.length === 0,
+    ) ||
+    stableJson(sortedUnique(check.warnings)) !== stableJson(check.warnings)
+  ) {
+    throw new Error(`${label} warnings must be sorted unique strings`);
+  }
+  if (!Array.isArray(check.evidence) || check.evidence.length === 0) {
+    throw new Error(`${label} evidence must be nonempty`);
+  }
+  check.evidence.forEach((evidence, index) =>
+    validateArtifactEvidence(
+      evidence,
+      request,
+      `${label} evidence[${index}]`,
+    ));
+}
+
+function validateArtifactExecution(
+  execution,
+  {
+    authority,
+    check,
+    plan,
+    policy,
+    request,
+    step,
+  },
+) {
+  assertExactObjectKeys(
+    execution,
+    new Set([
+      "attestation",
+      "check_result",
+      "completed_at",
+      "environment_digest",
+      "result",
+      "started_at",
+      "step_id",
+    ]),
+    `Selenium execution ${step.id}`,
+  );
+  if (execution.step_id !== step.id) {
+    throw new Error("Selenium execution step identity is not exact");
+  }
+  assertArtifactTimeWithinRequest(
+    execution.started_at,
+    execution.completed_at,
+    request,
+    `Selenium execution ${step.id}`,
+  );
+  const checkResult = assertRawCommandResult(
+    execution.check_result,
+    `${step.id} check`,
+  );
+  let attestation = null;
+  let executorResult = null;
+  if (execution.attestation !== null) {
+    assertDigest(
+      execution.environment_digest,
+      `${step.id} environment_digest`,
+    );
+    executorResult = assertRawCommandResult(
+      execution.result,
+      `${step.id} executor`,
+    );
+    attestation = validateExecutorAttestation(
+      execution.attestation,
+      {
+        authority,
+        environment: null,
+        environmentDigest: execution.environment_digest,
+        policy,
+        raw: executorResult,
+        request,
+        step,
+      },
+    );
+  } else if (
+    execution.environment_digest !== null ||
+    (execution.result !== null &&
+      (typeof execution.result !== "object" ||
+        Array.isArray(execution.result)))
+  ) {
+    throw new Error(
+      `${step.id} unsigned execution must not claim an environment digest`,
+    );
+  }
+  const expectedCheck = {
+    id: step.id,
+    phase: step.phase,
+    capability_id: step.capability_id,
+    scenario: step.scenario,
+    status:
+      controlledStepPassed(step, checkResult, policy) ? "pass" : "fail",
+    warnings: sortedUnique(
+      executorResult === null
+        ? []
+        : warningLines(
+            `${executorResult.stdout}${executorResult.stderr}`,
+          ),
+    ),
+    evidence: [
+      commandEvidence(
+        step,
+        plan,
+        checkResult,
+        execution.started_at,
+        execution.completed_at,
+      ),
+      ...(attestation === null
+        ? []
+        : [
+            executorAttestationEvidence(
+              attestation,
+              plan,
+              execution.started_at,
+              execution.completed_at,
+            ),
+          ]),
+    ],
+  };
+  if (stableJson(check) !== stableJson(expectedCheck)) {
+    throw new Error(`${step.id} check does not match its signed execution`);
+  }
+  return attestation;
+}
+
+function validateArtifactEnvelope(artifact) {
+  const expectedUnsigned = qualificationEnvelope({
+    authority: artifact.authority,
+    checks: artifact.checks,
+    executions: artifact.executor.executions,
+    failures: artifact.executor.failures,
+    plan: artifact.executor.plan,
+    policy: artifact.executor.policy,
+    request: artifact.executor.request,
+    validation: artifact.validation,
+  });
+  assertExactObjectKeys(
+    artifact.envelope,
+    new Set([...Object.keys(expectedUnsigned), "signature"]),
+    "Selenium qualification artifact envelope",
+  );
+  const { signature, ...unsigned } = artifact.envelope;
+  if (
+    stableJson(unsigned) !== stableJson(expectedUnsigned) ||
+    !verifyEd25519Signature(
+      expectedUnsigned,
+      signature,
+      artifact.authority.public_key,
+    )
+  ) {
+    throw new Error(
+      "Selenium qualification artifact envelope is missing, tampered, or not signed by the trusted authority",
+    );
+  }
+  assertArtifactTimeWithinRequest(
+    artifact.envelope.execution_started_at,
+    artifact.envelope.execution_completed_at,
+    artifact.executor.request,
+    "Selenium qualification artifact envelope",
+  );
+  const generatedAt = timestampMilliseconds(
+    artifact.envelope.generated_at,
+    "Selenium qualification artifact envelope generated_at",
+  );
+  const completedAt = timestampMilliseconds(
+    artifact.envelope.execution_completed_at,
+    "Selenium qualification artifact envelope execution_completed_at",
+  );
+  const expiresAt = timestampMilliseconds(
+    artifact.executor.request.expires_at,
+    "Selenium qualification artifact request expires_at",
+  );
+  if (generatedAt < completedAt || generatedAt >= expiresAt) {
+    throw new Error(
+      "Selenium qualification artifact envelope was generated outside the request window",
+    );
+  }
+}
+
+export function validateSeleniumQualificationArtifact(
+  artifact,
+  {
+    catalog,
+    observation,
+    trustedExecutorAuthority,
+  } = {},
+) {
+  assertExactObjectKeys(
+    artifact,
+    new Set([
+      "authority",
+      "checks",
+      "envelope",
+      "executor",
+      "kind",
+      "observation_digest",
+      "schema_version",
+      "validation",
+    ]),
+    "Selenium qualification artifact",
+  );
+  if (
+    artifact.schema_version !== 1 ||
+    artifact.kind !== "selenium-qualification-artifact"
+  ) {
+    throw new Error(
+      "Selenium qualification artifact schema and kind are unsupported",
+    );
+  }
+  validateArtifactAuthority(
+    artifact.authority,
+    trustedExecutorAuthority,
+  );
+  assertExactObjectKeys(
+    artifact.executor,
+    new Set([
+      "attestations",
+      "executions",
+      "failures",
+      "mutable_seed",
+      "plan",
+      "policy",
+      "request",
+      "source_materialization",
+      "trusted_inputs",
+    ]),
+    "Selenium qualification artifact executor",
+  );
+  if (
+    artifact.observation_digest !== subjectDigest(observation) ||
+    observation.provider_id !== SELENIUM_PROVIDER_ID ||
+    observation.disposition.state !== "candidate"
+  ) {
+    throw new Error(
+      "Selenium qualification artifact does not bind its candidate observation",
+    );
+  }
+  const expectedPlan = createSeleniumQualificationPlan({
+    observation,
+    catalog,
+    executorTools: artifact.executor.plan?.tools,
+    mutableSeedManifest: artifact.executor.mutable_seed,
+    sourceMaterializationManifest:
+      artifact.executor.source_materialization,
+    trustedInputManifest: artifact.executor.trusted_inputs,
+  });
+  if (stableJson(artifact.executor.plan) !== stableJson(expectedPlan)) {
+    throw new Error(
+      "Selenium qualification artifact plan is missing, unknown, or tampered",
+    );
+  }
+  const plan = artifact.executor.plan;
+  const policy = artifact.executor.policy;
+  validateArtifactPolicy(policy, plan, artifact.authority);
+  const request = artifact.executor.request;
+  assertExactObjectKeys(
+    request,
+    new Set([
+      "authority_digest",
+      "candidate_digest",
+      "challenge",
+      "executor_id",
+      "expires_at",
+      "immutable_inputs_digest",
+      "issued_at",
+      "kind",
+      "mutable_paths_digest",
+      "mutable_seed_digest",
+      "plan_digest",
+      "policy_digest",
+      "repository_revision",
+      "request_digest",
+      "run_id",
+      "schema_version",
+      "source_materialization_digest",
+      "tools_digest",
+      "trusted_inputs_digest",
+      "workspace_partition_digest",
+    ]),
+    "Selenium qualification artifact request",
+  );
+  const expectedRequest = executionRequest(
+    policy,
+    {
+      challenge: request.challenge,
+      expires_at: request.expires_at,
+      issued_at: request.issued_at,
+      run_id: request.run_id,
+    },
+    new Date(request.issued_at),
+  );
+  if (stableJson(request) !== stableJson(expectedRequest)) {
+    throw new Error(
+      "Selenium qualification artifact request is missing, unknown, or tampered",
+    );
+  }
+  if (
+    !Array.isArray(artifact.checks) ||
+    artifact.checks.length === 0 ||
+    !Array.isArray(artifact.executor.executions) ||
+    !Array.isArray(artifact.executor.attestations) ||
+    !Array.isArray(artifact.executor.failures) ||
+    artifact.executor.failures.some(
+      (failure) =>
+        typeof failure !== "string" ||
+        !new Set([
+          "APPLICATION_FAILED",
+          "ARTIFACT_VALIDATION_FAILED",
+          "CAPABILITY_EXECUTION_FAILED",
+          "EXECUTOR_ATTESTATION_INCOMPLETE",
+          "INSTALLATION_FAILED",
+          "INSTALLED_PACKAGE_MISMATCH",
+          "LOCK_VERIFICATION_FAILED",
+          "PACKAGE_TESTS_FAILED",
+          "QUALIFICATION_WARNINGS",
+          "RUNNER_EXECUTABLE_IDENTITY_MISMATCH",
+        ]).has(failure),
+    )
+  ) {
+    throw new Error(
+      "Selenium qualification artifact checks, executions, attestations, and failures must be arrays",
+    );
+  }
+  const checksById = new Map();
+  for (const [index, check] of artifact.checks.entries()) {
+    validateArtifactCheck(
+      check,
+      request,
+      `Selenium qualification artifact check[${index}]`,
+    );
+    if (checksById.has(check.id)) {
+      throw new Error(`Selenium qualification artifact repeats check ${check.id}`);
+    }
+    checksById.set(check.id, check);
+  }
+  const stepsById = new Map(plan.steps.map((step) => [step.id, step]));
+  const executionsById = new Map();
+  const validatedAttestations = [];
+  for (const execution of artifact.executor.executions) {
+    const step = stepsById.get(execution?.step_id);
+    if (step === undefined || executionsById.has(step.id)) {
+      throw new Error(
+        "Selenium qualification artifact execution references an unknown or repeated step",
+      );
+    }
+    const check = checksById.get(step.id);
+    if (check === undefined) {
+      throw new Error(`${step.id} execution lacks its check`);
+    }
+    const attestation = validateArtifactExecution(execution, {
+      authority: artifact.authority,
+      check,
+      plan,
+      policy,
+      request,
+      step,
+    });
+    if (attestation !== null) {
+      validatedAttestations.push(attestation);
+    }
+    executionsById.set(step.id, execution);
+  }
+  if (
+    stableJson(validatedAttestations) !==
+      stableJson(artifact.executor.attestations)
+  ) {
+    throw new Error(
+      "Selenium qualification artifact attestation list does not exactly match signed executions",
+    );
+  }
+  const allowedInternalChecks = new Set([
+    "verify-selenium-lock",
+    "verify-installed-selenium-packages",
+    ...plan.selected_capabilities.map(
+      ({ id }) => `${id}-artifact-inspection`,
+    ),
+  ]);
+  for (const check of artifact.checks) {
+    if (
+      !stepsById.has(check.id) &&
+      !allowedInternalChecks.has(check.id)
+    ) {
+      throw new Error(
+        `Selenium qualification artifact contains unknown check ${check.id}`,
+      );
+    }
+  }
+  const globalChecks = artifact.checks.filter(
+    ({ capability_id: capabilityId }) => capabilityId === null,
+  );
+  const expectedResults = plan.selected_capabilities.map((capability) => {
+    const capabilityChecks = artifact.checks.filter(
+      ({ capability_id: capabilityId }) =>
+        capabilityId === capability.id,
+    );
+    const required = [...globalChecks, ...capabilityChecks];
+    const existing = artifact.validation.results.find(
+      ({ capability_id: capabilityId }) =>
+        capabilityId === capability.id,
+    );
+    if (existing === undefined) {
+      throw new Error(
+        `Selenium qualification artifact lacks result ${capability.id}`,
+      );
+    }
+    const checkEvidence = required.flatMap(({ evidence }) => evidence);
+    const finalEvidence = existing.evidence.slice(checkEvidence.length);
+    if (
+      stableJson(existing.evidence.slice(0, checkEvidence.length)) !==
+      stableJson(checkEvidence) ||
+      finalEvidence.length !== 2 ||
+      finalEvidence[0].type !==
+        "qualification-executor-attestation-set" ||
+      finalEvidence[1].type !== "qualification-git-state" ||
+      existing.status !== aggregateStatus(required) ||
+      stableJson(existing.warnings) !==
+        stableJson(sortedUnique(
+          required.flatMap(({ warnings }) => warnings),
+        ))
+    ) {
+      throw new Error(
+        `Selenium qualification result ${capability.id} does not match its checks, warnings, status, and evidence`,
+      );
+    }
+    const expectedAttestationSet = executorAttestationSetEvidence(
+      artifact.executor.attestations,
+      plan,
+      request,
+      finalEvidence[0].started_at,
+      finalEvidence[0].completed_at,
+    );
+    if (
+      stableJson(finalEvidence[0]) !==
+        stableJson(expectedAttestationSet) ||
+      finalEvidence[1].locator !== "git-checkout:exact-clean" ||
+      finalEvidence[1].revision !== plan.repository.revision
+    ) {
+      throw new Error(
+        `Selenium qualification result ${capability.id} does not bind its signed execution set and source guard`,
+      );
+    }
+    existing.evidence.forEach((evidence, index) =>
+      validateArtifactEvidence(
+        evidence,
+        request,
+        `Selenium qualification result ${capability.id} evidence[${index}]`,
+      ));
+    return existing;
+  });
+  if (
+    stableJson(expectedResults) !==
+      stableJson(artifact.validation.results) ||
+    stableJson(artifact.validation.disposition) !==
+      stableJson(disposition(expectedResults, artifact.executor.failures))
+  ) {
+    throw new Error(
+      "Selenium qualification artifact validation status is not derived from its checks and failures",
+    );
+  }
+  validateDocument(artifact.validation, {
+    capabilityIds: new Set(
+      plan.selected_capabilities.map(({ id }) => id),
+    ),
+    capabilityCatalogDigest: observation.capability_catalog.digest,
+  });
+  if (
+    artifact.validation.provider_id !== SELENIUM_PROVIDER_ID ||
+    artifact.validation.candidate_digest !== plan.candidate_digest ||
+    stableJson(artifact.validation.repository) !==
+      stableJson(observation.repository) ||
+    stableJson(artifact.validation.capability_catalog) !==
+      stableJson(observation.capability_catalog)
+  ) {
+    throw new Error(
+      "Selenium qualification artifact validation does not bind its observation and plan",
+    );
+  }
+  validateArtifactEnvelope(artifact);
+  return structuredClone(artifact);
 }
 
 export async function qualifySeleniumCandidate(
@@ -3535,12 +4708,25 @@ export async function qualifySeleniumCandidate(
     );
   }
   await validateContainedSymlinks(root, "Source repository");
-  const trustedInputManifest =
-    await createSeleniumTrustedInputManifest(
+  const [
+    sourceMaterializationManifest,
+    mutableSeedManifest,
+    trustedInputManifest,
+  ] = await Promise.all([
+    createSeleniumSourceMaterializationManifest(
       root,
       observation.repository.revision,
-    );
-  const sourceBefore = hash(trustedInputManifest);
+    ),
+    createSeleniumMutableSeedManifest(
+      root,
+      observation.repository.revision,
+    ),
+    createSeleniumTrustedInputManifest(
+      root,
+      observation.repository.revision,
+    ),
+  ]);
+  const sourceBefore = hash(sourceMaterializationManifest);
   await verifySourcePackageBinding(observation, root);
   const temporaryRoot = resolve(await createWorkspace());
   if (isWithin(root, temporaryRoot) || isWithin(temporaryRoot, root)) {
@@ -3552,23 +4738,42 @@ export async function qualifySeleniumCandidate(
   try {
     await materializeWorkspace(root, workspaceRoot);
     await validateContainedSymlinks(workspaceRoot, "Ephemeral workspace");
-    const materializedManifest =
-      await createSeleniumTrustedInputManifest(
+    const [
+      materializedSourceManifest,
+      materializedSeedManifest,
+      materializedTrustedManifest,
+    ] = await Promise.all([
+      createSeleniumSourceMaterializationManifest(
         workspaceRoot,
         observation.repository.revision,
-      );
+      ),
+      createSeleniumMutableSeedManifest(
+        workspaceRoot,
+        observation.repository.revision,
+      ),
+      createSeleniumTrustedInputManifest(
+        workspaceRoot,
+        observation.repository.revision,
+      ),
+    ]);
     if (
-      stableJson(materializedManifest) !==
-      stableJson(trustedInputManifest)
+      stableJson(materializedSourceManifest) !==
+        stableJson(sourceMaterializationManifest) ||
+      stableJson(materializedSeedManifest) !==
+        stableJson(mutableSeedManifest) ||
+      stableJson(materializedTrustedManifest) !==
+        stableJson(trustedInputManifest)
     ) {
       throw new Error(
-        "Ephemeral workspace does not exactly match the trusted-input manifest",
+        "Ephemeral workspace does not exactly match the source, seed, and trusted-input manifests",
       );
     }
     const plan = createSeleniumQualificationPlan({
       observation,
       catalog: catalogDocument,
       executorTools: isolatedExecutor.tools,
+      mutableSeedManifest,
+      sourceMaterializationManifest,
       trustedInputManifest,
     });
     const immutableBefore = await immutableWorkspaceDigest(
@@ -3613,6 +4818,7 @@ export async function qualifySeleniumCandidate(
       );
     }
     const attestations = [];
+    const executions = [];
     const checks = [];
     const failures = [];
     for (const id of [
@@ -3631,6 +4837,7 @@ export async function qualifySeleniumCandidate(
         attestations,
         baseEnvironment,
         executor: isolatedExecutor,
+        executions,
         now,
         policy,
         request,
@@ -3663,6 +4870,7 @@ export async function qualifySeleniumCandidate(
         attestations,
         baseEnvironment,
         executor: isolatedExecutor,
+        executions,
         now,
         policy,
         request,
@@ -3697,6 +4905,7 @@ export async function qualifySeleniumCandidate(
           attestations,
           baseEnvironment,
           executor: isolatedExecutor,
+          executions,
           now,
           policy,
           request,
@@ -3717,6 +4926,7 @@ export async function qualifySeleniumCandidate(
         attestations,
         baseEnvironment,
         executor: isolatedExecutor,
+        executions,
         now,
         policy,
         request,
@@ -3738,6 +4948,7 @@ export async function qualifySeleniumCandidate(
           attestations,
           baseEnvironment,
           executor: isolatedExecutor,
+          executions,
           now,
           policy,
           request,
@@ -3763,6 +4974,7 @@ export async function qualifySeleniumCandidate(
             attestations,
             baseEnvironment,
             executor: isolatedExecutor,
+            executions,
             now,
             policy,
             request,
@@ -3896,12 +5108,15 @@ export async function qualifySeleniumCandidate(
     execution = {
       attestations,
       checks,
+      executions,
       failures,
       immutableInputsDigest: immutableBefore,
       plan,
       policy,
       request,
       results,
+      mutableSeedManifest,
+      sourceMaterializationManifest,
       trustedInputManifest,
     };
   } catch (error) {
@@ -3911,7 +5126,7 @@ export async function qualifySeleniumCandidate(
   }
 
   const [sourceAfter, checkoutAfter] = await Promise.all([
-    createSeleniumTrustedInputManifest(
+    createSeleniumSourceMaterializationManifest(
       root,
       observation.repository.revision,
     ).then(hash),
@@ -3943,8 +5158,7 @@ export async function qualifySeleniumCandidate(
       plan_digest: hash(execution.plan),
       policy_digest: hash(execution.policy),
       request_digest: execution.request.request_digest,
-      trusted_inputs_digest:
-        execution.plan.workspace.immutable_inputs.manifest_digest,
+      ...workspaceBindingDigests(execution.plan),
     }),
     started_at: guardStartedAt,
     completed_at: guardCompletedAt,
@@ -3976,15 +5190,61 @@ export async function qualifySeleniumCandidate(
       capabilityCatalogDigest: observation.capability_catalog.digest,
     });
   }
-  return {
+  const unsignedEnvelope = qualificationEnvelope({
+    authority: isolatedExecutor.authority,
+    checks: execution.checks,
+    executions: execution.executions,
+    failures: execution.failures,
+    plan: execution.plan,
+    policy: execution.policy,
+    request: execution.request,
+    validation,
+  });
+  const envelope = await isolatedExecutor.seal(
+    structuredClone(unsignedEnvelope),
+  );
+  assertExactObjectKeys(
+    envelope,
+    new Set([...Object.keys(unsignedEnvelope), "signature"]),
+    "Selenium qualification signed envelope",
+  );
+  const { signature, ...receivedUnsignedEnvelope } = envelope;
+  if (
+    stableJson(receivedUnsignedEnvelope) !== stableJson(unsignedEnvelope) ||
+    !verifyEd25519Signature(
+      unsignedEnvelope,
+      signature,
+      isolatedExecutor.authority.public_key,
+    )
+  ) {
+    throw new Error(
+      "Selenium qualification result envelope is not exactly signed by the trusted executor authority",
+    );
+  }
+  const artifact = {
+    schema_version: 1,
+    kind: "selenium-qualification-artifact",
+    authority: structuredClone(isolatedExecutor.authority),
+    observation_digest: subjectDigest(observation),
     validation,
     checks: execution.checks,
     executor: {
       attestations: execution.attestations,
+      executions: execution.executions,
+      failures: execution.failures,
       plan: execution.plan,
       policy: execution.policy,
       request: execution.request,
+      source_materialization: execution.sourceMaterializationManifest,
+      mutable_seed: execution.mutableSeedManifest,
       trusted_inputs: execution.trustedInputManifest,
     },
+    envelope,
   };
+  validateSeleniumQualificationArtifact(artifact, {
+    catalog: catalogDocument,
+    observation,
+    trustedExecutorAuthority,
+  });
+  return artifact;
 }
