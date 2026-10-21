@@ -29,9 +29,13 @@ import {
   OCULIX_LOCK_PLATFORMS,
   OCULIX_QUALIFICATION_CHECKS,
   OculixJavaRuntimeIncompatibilityError,
+  classifyOculixWarnings,
   collectOculixRcObservation,
   compareOculixRcVersions,
+  createEphemeralOculixWorkspace,
   createOculixRcQualificationPlan,
+  executeOculixQualificationCheck,
+  observeOculixJavaRuntime,
   parseOculixRcTag,
   parseOculixJavaIdentity,
   parseStableOculixVersion,
@@ -106,6 +110,51 @@ async function candidateObservation(overrides = {}) {
 
 function component(observation, id) {
   return observation.components.find((entry) => entry.id === id);
+}
+
+function generatedCandidateLock(lockContents) {
+  return lockContents
+    .replace('version = "4.0.0"', 'version = "4.1.0-rc10"')
+    .replace(
+      'specifiers = ["4.0.0"]',
+      'specifiers = ["4.1.0-rc10"]',
+    )
+    .replaceAll(
+      "releases/download/v4.0.0/oculixide-4.0.0-linux.jar",
+      "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-linux.jar",
+    )
+    .replace(
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .replaceAll(
+      "releases/download/v4.0.0/oculixide-4.0.0-macos.jar",
+      "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-macos.jar",
+    )
+    .replace(
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .replaceAll(
+      "releases/download/v4.0.0/oculixide-4.0.0-windows.jar",
+      "releases/download/v4.1.0-rc10/oculixide-4.1.0-rc10-windows.jar",
+    )
+    .replace(
+      "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+}
+
+function javaRuntimeOutput({
+  vendor = "Eclipse Adoptium",
+  version = "17.0.20.1+1",
+} = {}) {
+  return [
+    "Property settings:",
+    `    java.runtime.version = ${version}`,
+    `    java.vendor = ${vendor}`,
+    'openjdk version "17.0.20.1" 2026-10-20',
+  ].join("\n");
 }
 
 test("strict RC parsing rejects lookalikes and leading zeroes", () => {
@@ -185,9 +234,9 @@ test("no RC newer than stable produces no candidate", async () => {
             "4.0.0",
             "4.1.0",
           )
-        : (await fixture("mise.oculix.lock")).replace(
-            'version = "4.0.0"',
-            'version = "4.1.0"',
+        : (await fixture("mise.oculix.lock")).replaceAll(
+            "4.0.0",
+            "4.1.0",
           ),
   });
   assert.equal(observation.disposition.state, "current");
@@ -215,7 +264,13 @@ test("strictly parses the configured and resolved Temurin identity", async () =>
   assert.equal(identity.specifier, "temurin-17");
   assert.equal(identity.major, "17");
   assert.equal(identity.resolved_version, "17.0.20+101");
+  assert.equal(identity.runtime_version, "17.0.20.1+1");
+  assert.equal(identity.runtime_vendor, "Eclipse Adoptium");
   assert.equal(identity.solver_version, "17.0.20");
+  assert.match(
+    identity.runtime_identity_digest,
+    /^sha256:[0-9a-f]{64}$/u,
+  );
   assert.deepEqual(
     identity.platforms.map(({ platform }) => platform),
     [...OCULIX_LOCK_PLATFORMS].sort(),
@@ -308,7 +363,10 @@ test("Java metadata is strict and never selects a Java candidate", async (contex
     const lock = (await fixture("mise.oculix.lock")).replace(
       /\n\[tools\.java\."platforms\.windows-x64"\][\s\S]*$/u,
       "",
-    );
+    ) +
+      '\n# [tools.java."platforms.windows-x64"]\n' +
+      '# checksum = "sha256:4444444444444444444444444444444444444444444444444444444444444444"\n' +
+      '# url = "https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.20.1%2B1/OpenJDK17U-jdk_x64_windows_hotspot_17.0.20.1_1.zip"\n';
     assert.throws(
       () =>
         parseOculixJavaIdentity(
@@ -316,6 +374,28 @@ test("Java metadata is strict and never selects a Java candidate", async (contex
           lock,
         ),
       /must lock every supported platform exactly once/,
+    );
+  });
+  await context.test("artifact release build drift", async () => {
+    const config = await fixture("config.oculix.toml");
+    const lock = (await fixture("mise.oculix.lock")).replace(
+      "jdk-17.0.20.1%2B1",
+      "jdk-17.0.20.1%2B2",
+    );
+    assert.throws(
+      () => parseOculixJavaIdentity(config, lock),
+      /does not bind temurin-17\.0\.20\+101/,
+    );
+  });
+  await context.test("artifact filename build drift", async () => {
+    const config = await fixture("config.oculix.toml");
+    const lock = (await fixture("mise.oculix.lock")).replace(
+      "17.0.20.1_1.tar.gz",
+      "17.0.20.1_2.tar.gz",
+    );
+    assert.throws(
+      () => parseOculixJavaIdentity(config, lock),
+      /filename does not bind 17\.0\.20\.1\+1/,
     );
   });
   const observation = await candidateObservation();
@@ -481,8 +561,17 @@ test("qualification plan binds candidate, commit, runner, lock platforms, and ch
     },
   );
   assert.match(plan.java.identity_digest, /^sha256:[0-9a-f]{64}$/u);
+  assert.equal(plan.java.runtime_version, "17.0.20.1+1");
+  assert.match(
+    plan.java.runtime_identity_digest,
+    /^sha256:[0-9a-f]{64}$/u,
+  );
+  assert.deepEqual(
+    plan.oculix_assets.map(({ platform }) => platform),
+    OCULIX_LOCK_PLATFORMS,
+  );
   assert.equal(plan.lock.command.includes("--bump"), false);
-  assert.equal(plan.workspace.kind, "ephemeral-copy");
+  assert.equal(plan.workspace.kind, "ephemeral-git-archive");
   assert.equal(Object.isFrozen(plan), true);
 });
 
@@ -524,16 +613,18 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
   const lockPath = join(workspacePath, OCULIX_LOCK_PATH);
   const originalConfig = await fixture("config.oculix.toml");
   const originalLock = await fixture("mise.oculix.lock");
-  const javaIdentity = parseOculixJavaIdentity(
-    originalConfig,
-    originalLock,
-  );
+  const plan = createOculixRcQualificationPlan({
+    observation: await candidateObservation(),
+    runner: RUNNER,
+  });
+  const javaIdentity = plan.java;
   const commands = [];
   try {
     await mkdir(resolve(configPath, ".."), { recursive: true });
     await writeFile(configPath, originalConfig);
     await writeFile(lockPath, originalLock);
     const prepared = await prepareOculixRcCandidate({
+      candidateAssets: plan.oculix_assets,
       candidateVersion: "4.1.0-rc10",
       currentVersion: "4.0.0",
       javaIdentity,
@@ -552,12 +643,12 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
         commands.push(command);
         await writeFile(
           lockPath,
-          originalLock.replace(
-            'version = "4.0.0"',
-            'version = "4.1.0-rc10"',
-          ),
+          generatedCandidateLock(originalLock),
         );
-        return { stderr: "", stdout: "" };
+        return {
+          stderr: "warning: lock metadata warning\n",
+          stdout: "",
+        };
       },
       workspacePath,
     });
@@ -570,6 +661,9 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
       prepared.java_identity_digest,
       javaIdentity.identity_digest,
     );
+    assert.deepEqual(prepared.warnings, [
+      "warning: lock metadata warning",
+    ]);
     assert.deepEqual(commands, [
       {
         command: "mise",
@@ -595,6 +689,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
     await writeFile(lockPath, originalLock);
     await assert.rejects(
       prepareOculixRcCandidate({
+        candidateAssets: plan.oculix_assets,
         candidateVersion: "4.1.0-rc10",
         currentVersion: "4.0.0",
         javaIdentity,
@@ -612,11 +707,7 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
         runCommand: async () => {
           await writeFile(
             lockPath,
-            originalLock
-              .replace(
-                'version = "4.0.0"',
-                'version = "4.1.0-rc10"',
-              )
+            generatedCandidateLock(originalLock)
               .replace(
                 "temurin-17.0.20+101",
                 "temurin-21.0.1+1",
@@ -630,6 +721,155 @@ test("candidate preparation rewrites and relocks only the ephemeral copy", async
         error instanceof OculixJavaRuntimeIncompatibilityError &&
         /review-gated Java runtime/u.test(error.message),
     );
+  } finally {
+    await rm(temporaryRoot, { force: true, recursive: true });
+  }
+});
+
+test("generated lock evidence must be structural and exact", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-lock-"));
+  const workspacePath = join(temporaryRoot, "workspace");
+  const configPath = join(workspacePath, OCULIX_CONFIG_PATH);
+  const lockPath = join(workspacePath, OCULIX_LOCK_PATH);
+  const originalConfig = await fixture("config.oculix.toml");
+  const originalLock = await fixture("mise.oculix.lock");
+  const plan = createOculixRcQualificationPlan({
+    observation: await candidateObservation(),
+    runner: RUNNER,
+  });
+  async function prepareWith(
+    generatedLock,
+    candidateAssets = plan.oculix_assets,
+  ) {
+    await mkdir(resolve(configPath, ".."), { recursive: true });
+    await writeFile(configPath, originalConfig);
+    await writeFile(lockPath, originalLock);
+    return prepareOculixRcCandidate({
+      candidateAssets,
+      candidateVersion: plan.candidate_version,
+      currentVersion: "4.0.0",
+      javaIdentity: plan.java,
+      lockCommand: plan.lock.command,
+      managedPaths: plan.workspace.managed_paths,
+      runCommand: async () => {
+        await writeFile(lockPath, generatedLock);
+        return { stderr: "", stdout: "" };
+      },
+      workspacePath,
+    });
+  }
+  try {
+    await context.test("comments and substrings are not records", async () => {
+      const fakeEvidence =
+        `${originalLock}\n` +
+        `# version = "${plan.candidate_version}"\n` +
+        plan.oculix_assets
+          .map(
+            ({ digest, platform, url }) =>
+              `# [tools."http:oculixide"."platforms.${platform}"]\n` +
+              `# checksum = "${digest}"\n# url = "${url}"`,
+          )
+          .join("\n");
+      await assert.rejects(
+        prepareWith(fakeEvidence),
+        /structurally lock Oculix 4\.1\.0-rc10/,
+      );
+    });
+    await context.test("a URL hidden in another value is rejected", async () => {
+      const generated = generatedCandidateLock(originalLock);
+      const expectedUrl = plan.oculix_assets.find(
+        ({ platform }) => platform === "linux-x64",
+      ).url;
+      await assert.rejects(
+        prepareWith(
+          generated.replace(
+            `url = "${expectedUrl}"`,
+            `note = "${expectedUrl}"`,
+          ),
+        ),
+        /must contain one url/,
+      );
+    });
+    await context.test("wrong candidate digest is rejected", async () => {
+      await assert.rejects(
+        prepareWith(
+          generatedCandidateLock(originalLock).replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          ),
+        ),
+        /exact candidate asset URL and digest/,
+      );
+    });
+    await context.test("incomplete expected assets cannot bypass checks", async () => {
+      await assert.rejects(
+        prepareWith(
+          generatedCandidateLock(originalLock),
+          plan.oculix_assets.slice(1),
+        ),
+        /requires every candidate asset/,
+      );
+    });
+  } finally {
+    await rm(temporaryRoot, { force: true, recursive: true });
+  }
+});
+
+test("ephemeral workspaces archive the exact clean Git revision", async (context) => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-source-"));
+  const sourcePath = join(temporaryRoot, "source");
+  const trackedPath = join(sourcePath, "tracked.txt");
+  async function git(...args) {
+    return execFile("git", args, { cwd: sourcePath });
+  }
+  try {
+    await mkdir(sourcePath);
+    await git("init", "--quiet");
+    await git("config", "user.name", "Oculix RC test");
+    await git("config", "user.email", "oculix-rc@example.invalid");
+    await writeFile(trackedPath, "claimed revision\n");
+    await git("add", "tracked.txt");
+    await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "first");
+    const claimedRevision = (await git("rev-parse", "HEAD")).stdout.trim();
+    await writeFile(trackedPath, "newer clean revision\n");
+    await git("add", "tracked.txt");
+    await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "second");
+
+    const workspace = await createEphemeralOculixWorkspace({
+      repositoryRoot: sourcePath,
+      revision: claimedRevision,
+    });
+    try {
+      assert.equal(
+        await readFile(join(workspace.path, "tracked.txt"), "utf8"),
+        "claimed revision\n",
+      );
+    } finally {
+      await workspace.dispose();
+    }
+
+    await context.test("untracked source is rejected", async () => {
+      const untrackedPath = join(sourcePath, "untracked.txt");
+      await writeFile(untrackedPath, "not committed\n");
+      await assert.rejects(
+        createEphemeralOculixWorkspace({
+          repositoryRoot: sourcePath,
+          revision: claimedRevision,
+        }),
+        /must be clean, including untracked files/,
+      );
+      await rm(untrackedPath);
+    });
+    await context.test("dirty tracked source is rejected", async () => {
+      await writeFile(trackedPath, "dirty live tree\n");
+      await assert.rejects(
+        createEphemeralOculixWorkspace({
+          repositoryRoot: sourcePath,
+          revision: claimedRevision,
+        }),
+        /must be clean, including untracked files/,
+      );
+    });
   } finally {
     await rm(temporaryRoot, { force: true, recursive: true });
   }
@@ -665,7 +905,8 @@ function successfulQualification(overrides = {}) {
           status: "pass",
           warnings: [],
           output: input.check.id,
-          java_identity_digest: input.plan.java.identity_digest,
+          java_identity_digest:
+            input.plan.java.runtime_identity_digest,
         };
       },
       runner: RUNNER,
@@ -678,6 +919,127 @@ function successfulQualification(overrides = {}) {
     promise,
   };
 }
+
+test("real command warning forms are captured and block qualification", async () => {
+  assert.deepEqual(
+    classifyOculixWarnings({
+      stdout: [
+        "warning: compiler warning",
+        "::warning file=test.mjs::annotation",
+        "ordinary output mentioning warning without punctuation",
+      ].join("\n"),
+      stderr: [
+        "[WARNING] Maven warning",
+        "npm WARN deprecated dependency",
+        "script.py:2: DeprecationWarning: old API",
+      ].join("\n"),
+    }),
+    [
+      "warning: compiler warning",
+      "::warning file=test.mjs::annotation",
+      "[WARNING] Maven warning",
+      "npm WARN deprecated dependency",
+      "script.py:2: DeprecationWarning: old API",
+    ],
+  );
+  const qualification = successfulQualification({
+    runCheck: (input) =>
+      executeOculixQualificationCheck({
+        ...input,
+        runCommand: async ({ args }) =>
+          args.includes("-XshowSettings:properties")
+            ? { stderr: javaRuntimeOutput(), stdout: "" }
+            : {
+                stderr: "WARNING: command completed with a warning\n",
+                stdout: "",
+              },
+      }),
+  });
+  const { validation } = await qualification.promise;
+  assert.deepEqual(validation.disposition, {
+    state: "blocked",
+    reason_codes: ["OCULIX_RC_VALIDATION_WARNING"],
+  });
+  assert.deepEqual(validation.results[0].warnings, [
+    "WARNING: command completed with a warning",
+  ]);
+  const preparationWarning = successfulQualification({
+    prepareCandidate: async ({ javaIdentity }) => ({
+      changed_paths: [OCULIX_CONFIG_PATH, OCULIX_LOCK_PATH],
+      diff_digest: DIFF_DIGEST,
+      java_identity_digest: javaIdentity.identity_digest,
+      warnings: ["warning: lock metadata warning"],
+    }),
+  });
+  const { validation: preparationValidation } =
+    await preparationWarning.promise;
+  assert.deepEqual(preparationValidation.disposition, {
+    state: "blocked",
+    reason_codes: ["OCULIX_RC_VALIDATION_WARNING"],
+  });
+});
+
+test("execution observes the actual Java runtime identity", async () => {
+  const observation = await candidateObservation();
+  const plan = createOculixRcQualificationPlan({
+    observation,
+    runner: RUNNER,
+  });
+  const observed = await observeOculixJavaRuntime({
+    runCommand: async () => ({
+      stderr: javaRuntimeOutput(),
+      stdout: "",
+    }),
+    workspacePath: "/tmp/oculix-runtime-observation",
+  });
+  assert.equal(observed.runtime_version, plan.java.runtime_version);
+  assert.equal(observed.runtime_vendor, plan.java.runtime_vendor);
+  assert.equal(
+    observed.identity_digest,
+    plan.java.runtime_identity_digest,
+  );
+  let observedEnvironment;
+  const executed = await executeOculixQualificationCheck({
+    check: plan.checks[0],
+    plan,
+    runCommand: async ({ args, environment }) => {
+      if (args.includes("-XshowSettings:properties")) {
+        observedEnvironment = environment;
+        return { stderr: javaRuntimeOutput(), stdout: "" };
+      }
+      return { stderr: "", stdout: "check passed\n" };
+    },
+    workspacePath: "/tmp/oculix-runtime-observation",
+  });
+  assert.deepEqual(observedEnvironment, plan.checks[0].environment);
+  assert.equal(
+    executed.java_identity_digest,
+    plan.java.runtime_identity_digest,
+  );
+});
+
+test("observed Java runtime drift has the stable incompatibility reason", async () => {
+  const qualification = successfulQualification({
+    runCheck: (input) =>
+      executeOculixQualificationCheck({
+        ...input,
+        runCommand: async ({ args }) =>
+          args.includes("-XshowSettings:properties")
+            ? {
+                stderr: javaRuntimeOutput({
+                  version: "17.0.20.1+2",
+                }),
+                stdout: "",
+              }
+            : { stderr: "", stdout: "check passed\n" },
+      }),
+  });
+  const { validation } = await qualification.promise;
+  assert.deepEqual(validation.disposition, {
+    state: "incompatible",
+    reason_codes: ["OCULIX_RC_JAVA_RUNTIME_INCOMPATIBLE"],
+  });
+});
 
 test("qualification mutates only an external ephemeral workspace", async () => {
   const qualification = successfulQualification();
@@ -736,7 +1098,7 @@ test("failed, warning, and unknown checks cannot independently qualify", async (
           ...(check.id === "repository-policy"
             ? scenario.result
             : { status: "pass", warnings: [], output: "passed" }),
-          java_identity_digest: plan.java.identity_digest,
+          java_identity_digest: plan.java.runtime_identity_digest,
         }),
       });
       const { validation } = await qualification.promise;
@@ -808,7 +1170,7 @@ test("Java incompatibility has one stable preparation and execution reason", asy
         warnings: [],
         output: check.id,
         java_compatible: check.id !== "repository-policy",
-        java_identity_digest: plan.java.identity_digest,
+        java_identity_digest: plan.java.runtime_identity_digest,
       }),
     });
     const { validation } = await qualification.promise;

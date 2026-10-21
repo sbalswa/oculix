@@ -1,7 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  cp,
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -9,7 +9,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
-  basename,
   isAbsolute,
   join,
   relative,
@@ -29,10 +28,20 @@ const RC_PATTERN =
 const STABLE_PATTERN =
   /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
 const TEMURIN_SPECIFIER_PATTERN = /^temurin-([1-9][0-9]*)$/u;
-const TEMURIN_RUNTIME_PATTERN =
-  /^temurin-([1-9][0-9]*)(?:\.(0|[1-9][0-9]*)){1,3}(?:\+[0-9A-Za-z.-]+)?$/u;
+const TEMURIN_RESOLVED_PATTERN =
+  /^temurin-([1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\+([1-9][0-9]*)$/u;
+const TEMURIN_VENDOR = "Eclipse Adoptium";
 const REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+const WARNING_PATTERNS = Object.freeze([
+  /^warn(?:ing)?(?:\s|:)/iu,
+  /^\[warn(?:ing)?\]/iu,
+  /^##\[warning\]/iu,
+  /^::warning(?:\s|:|$)/iu,
+  /^npm\s+warn(?:ing)?\b/iu,
+  /(?:^|:\s)warning\s*:/iu,
+  /\b(?:deprecation|user|runtime|future)warning\s*:/iu,
+]);
 const RESULT_STATUSES = new Set([
   "pass",
   "fail",
@@ -331,44 +340,138 @@ function currentVersionFromConfig(contents) {
   return version;
 }
 
-function assertCurrentLock(lockContents, currentVersion) {
-  const text = String(lockContents);
-  const escaped = currentVersion.replaceAll(".", String.raw`\.`);
-  const matches = text.match(
-    new RegExp(`^version = "${escaped}"$`, "gmu"),
+function stripTomlComment(line) {
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quoted && character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (!quoted && character === "#") {
+      return line.slice(0, index);
+    }
+  }
+  return line;
+}
+
+function relevantLockSection(header) {
+  if (header === '[[tools."http:oculixide"]]') {
+    return { kind: "oculix-tool" };
+  }
+  if (header === "[[tools.java]]") {
+    return { kind: "java-tool" };
+  }
+  const oculixPlatform =
+    /^\[tools\."http:oculixide"\."platforms\.([a-z0-9-]+)"\]$/u
+      .exec(header);
+  if (oculixPlatform !== null) {
+    return {
+      kind: "oculix-platform",
+      platform: oculixPlatform[1],
+    };
+  }
+  const javaPlatform =
+    /^\[tools\.java\."platforms\.([a-z0-9-]+)"\]$/u.exec(header);
+  if (javaPlatform !== null) {
+    return {
+      kind: "java-platform",
+      platform: javaPlatform[1],
+    };
+  }
+  return null;
+}
+
+function parseLockSections(contents) {
+  const sections = [];
+  let current = null;
+  for (const [index, rawLine] of String(contents).split(/\r?\n/u).entries()) {
+    const line = stripTomlComment(rawLine).trim();
+    if (line.length === 0) {
+      continue;
+    }
+    if (line.startsWith("[")) {
+      const identity = relevantLockSection(line);
+      current =
+        identity === null
+          ? null
+          : {
+              ...identity,
+              assignments: new Map(),
+              line: index + 1,
+            };
+      if (current !== null) {
+        sections.push(current);
+      }
+      continue;
+    }
+    if (current === null) {
+      continue;
+    }
+    const assignment = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/u.exec(line);
+    if (assignment === null) {
+      throw new Error(
+        `${OCULIX_LOCK_PATH}:${index + 1} is not a structural assignment`,
+      );
+    }
+    const [, key, value] = assignment;
+    if (current.assignments.has(key)) {
+      throw new Error(
+        `${OCULIX_LOCK_PATH}:${index + 1} duplicates ${key}`,
+      );
+    }
+    current.assignments.set(key, value);
+  }
+  return sections;
+}
+
+function requireLockSection(sections, kind, platform) {
+  const matches = sections.filter(
+    (section) =>
+      section.kind === kind &&
+      (platform === undefined || section.platform === platform),
   );
-  if (matches?.length !== 1) {
+  const context =
+    platform === undefined ? kind : `${kind} ${platform}`;
+  if (matches.length !== 1) {
     throw new Error(
-      `${OCULIX_LOCK_PATH} must lock Oculix ${currentVersion} exactly once`,
+      `${OCULIX_LOCK_PATH} must contain exactly one ${context} record`,
     );
   }
+  return matches[0];
 }
 
-function parseTomlString(block, key, context) {
-  const match = new RegExp(
-    `^\\s*${key}\\s*=\\s*"([^"]+)"\\s*(?:#.*)?$`,
-    "mu",
-  ).exec(block);
-  if (match === null) {
+function parseTomlValue(section, key, context) {
+  const source = section.assignments.get(key);
+  if (source === undefined) {
     throw new Error(`${context} must contain one ${key}`);
   }
-  return match[1];
-}
-
-function parseStringArray(block, key, context) {
-  const match = new RegExp(
-    `^\\s*${key}\\s*=\\s*(\\[[^\\n]+\\])\\s*(?:#.*)?$`,
-    "mu",
-  ).exec(block);
-  if (match === null) {
-    throw new Error(`${context} must contain ${key}`);
-  }
-  let values;
   try {
-    values = JSON.parse(match[1]);
+    return JSON.parse(source);
   } catch {
     throw new Error(`${context} contains invalid ${key}`);
   }
+}
+
+function parseTomlString(section, key, context) {
+  const value = parseTomlValue(section, key, context);
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${context} contains invalid ${key}`);
+  }
+  return value;
+}
+
+function parseStringArray(section, key, context) {
+  const values = parseTomlValue(section, key, context);
   if (
     !Array.isArray(values) ||
     values.length === 0 ||
@@ -378,6 +481,29 @@ function parseStringArray(block, key, context) {
     throw new Error(`${context} contains invalid ${key}`);
   }
   return values;
+}
+
+function parseOculixToolRecord(sections, expectedVersion) {
+  const section = requireLockSection(sections, "oculix-tool");
+  const context = `${OCULIX_LOCK_PATH} Oculix`;
+  const version = parseTomlString(section, "version", context);
+  const backend = parseTomlString(section, "backend", context);
+  const specifiers = parseStringArray(section, "specifiers", context);
+  if (
+    version !== expectedVersion ||
+    backend !== "http:oculixide" ||
+    specifiers.length !== 1 ||
+    specifiers[0] !== expectedVersion
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} must structurally lock Oculix ${expectedVersion}`,
+    );
+  }
+  return { backend, specifiers, version };
+}
+
+function assertCurrentLock(lockContents, currentVersion) {
+  parseOculixToolRecord(parseLockSections(lockContents), currentVersion);
 }
 
 function configuredTemurinPolicy(configContents) {
@@ -423,9 +549,100 @@ function javaPlatformToken(platform) {
   }[platform];
 }
 
-function parseLockedJavaPlatform(block, platform, major) {
+function javaPlatformExtension(platform) {
+  return platform === "windows-x64" ? "zip" : "tar.gz";
+}
+
+function escapeRegularExpression(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, String.raw`\$&`);
+}
+
+function resolvedTemurinVersion(releaseVersion, build) {
+  const parts = releaseVersion.split(".");
+  if (parts.length === 3) {
+    return `${releaseVersion}+${build}`;
+  }
+  if (parts.length === 4) {
+    return `${parts.slice(0, 3).join(".")}+${parts[3]}${build.padStart(2, "0")}`;
+  }
+  throw new Error("Temurin release version must have three or four parts");
+}
+
+function parseTemurinArtifactUrl(url, platform, lockedVersion, major) {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new Error(`${OCULIX_LOCK_PATH} Java ${platform} URL is invalid`);
+  }
+  let pathname;
+  try {
+    pathname = decodeURIComponent(parsedUrl.pathname);
+  } catch {
+    throw new Error(`${OCULIX_LOCK_PATH} Java ${platform} URL is invalid`);
+  }
+  const prefix =
+    `/adoptium/temurin${major}-binaries/releases/download/`;
+  if (
+    parsedUrl.protocol !== "https:" ||
+    parsedUrl.hostname !== "github.com" ||
+    !pathname.startsWith(prefix)
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} URL does not bind Temurin ${major}`,
+    );
+  }
+  const remainder = pathname.slice(prefix.length);
+  const separator = remainder.indexOf("/");
+  if (separator === -1) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} URL lacks an artifact`,
+    );
+  }
+  const release = remainder.slice(0, separator);
+  const filename = remainder.slice(separator + 1);
+  const releaseMatch =
+    /^jdk-([1-9][0-9]*\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?)\+([1-9][0-9]*)$/u
+      .exec(release);
+  if (releaseMatch === null) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} URL has an invalid release`,
+    );
+  }
+  const [, releaseVersion, build] = releaseMatch;
+  const runtimeVersion = `${releaseVersion}+${build}`;
+  if (
+    `temurin-${resolvedTemurinVersion(releaseVersion, build)}` !==
+    lockedVersion
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} URL does not bind ${lockedVersion}`,
+    );
+  }
+  const expectedFilename = new RegExp(
+    `^OpenJDK${escapeRegularExpression(major)}U-jdk_` +
+      `${escapeRegularExpression(javaPlatformToken(platform))}_` +
+      `${escapeRegularExpression(releaseVersion)}_` +
+      `${escapeRegularExpression(build)}\\.` +
+      `${escapeRegularExpression(javaPlatformExtension(platform))}$`,
+    "u",
+  );
+  if (!expectedFilename.test(filename)) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java ${platform} filename does not bind ${runtimeVersion}`,
+    );
+  }
+  return runtimeVersion;
+}
+
+function parseLockedJavaPlatform(
+  section,
+  platform,
+  lockedVersion,
+  major,
+) {
   const checksum = parseTomlString(
-    block,
+    section,
     "checksum",
     `${OCULIX_LOCK_PATH} Java ${platform}`,
   );
@@ -435,29 +652,17 @@ function parseLockedJavaPlatform(block, platform, major) {
     );
   }
   const url = parseTomlString(
-    block,
+    section,
     "url",
     `${OCULIX_LOCK_PATH} Java ${platform}`,
   );
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(url);
-  } catch {
-    throw new Error(`${OCULIX_LOCK_PATH} Java ${platform} URL is invalid`);
-  }
-  const expectedPrefix =
-    `/adoptium/temurin${major}-binaries/releases/download/`;
-  if (
-    parsedUrl.protocol !== "https:" ||
-    parsedUrl.hostname !== "github.com" ||
-    !parsedUrl.pathname.startsWith(expectedPrefix) ||
-    !parsedUrl.pathname.includes(javaPlatformToken(platform))
-  ) {
-    throw new Error(
-      `${OCULIX_LOCK_PATH} Java ${platform} URL does not bind Temurin ${major}`,
-    );
-  }
-  return { checksum, platform, url };
+  const runtimeVersion = parseTemurinArtifactUrl(
+    url,
+    platform,
+    lockedVersion,
+    major,
+  );
+  return { checksum, platform, runtime_version: runtimeVersion, url };
 }
 
 function javaIdentityProjection(identity) {
@@ -466,37 +671,38 @@ function javaIdentityProjection(identity) {
     major: identity.major,
     platforms: identity.platforms,
     resolved_version: identity.resolved_version,
+    runtime_identity_digest: identity.runtime_identity_digest,
+    runtime_version: identity.runtime_version,
+    runtime_vendor: identity.runtime_vendor,
     solver_version: identity.solver_version,
     specifier: identity.specifier,
   };
 }
 
+function javaRuntimeIdentityProjection(identity) {
+  return {
+    runtime_version: identity.runtime_version,
+    runtime_vendor: identity.runtime_vendor,
+  };
+}
+
 export function parseOculixJavaIdentity(configContents, lockContents) {
   const policy = configuredTemurinPolicy(configContents);
-  const lock = String(lockContents);
-  const headers = [...lock.matchAll(/^\[\[tools\.java\]\]\s*$/gmu)];
-  if (headers.length !== 1) {
-    throw new Error(`${OCULIX_LOCK_PATH} must contain one Java tool record`);
-  }
-  const toolStart = headers[0].index + headers[0][0].length;
-  const nextHeader = lock.indexOf("\n[", toolStart);
-  const toolBlock = lock.slice(
-    toolStart,
-    nextHeader === -1 ? lock.length : nextHeader,
-  );
+  const sections = parseLockSections(lockContents);
+  const toolSection = requireLockSection(sections, "java-tool");
   const lockedVersion = parseTomlString(
-    toolBlock,
+    toolSection,
     "version",
     `${OCULIX_LOCK_PATH} Java`,
   );
-  const versionMatch = TEMURIN_RUNTIME_PATTERN.exec(lockedVersion);
+  const versionMatch = TEMURIN_RESOLVED_PATTERN.exec(lockedVersion);
   if (versionMatch === null || versionMatch[1] !== policy.major) {
     throw new Error(
       `${OCULIX_LOCK_PATH} Java version must resolve ${policy.specifier}`,
     );
   }
   const backend = parseTomlString(
-    toolBlock,
+    toolSection,
     "backend",
     `${OCULIX_LOCK_PATH} Java`,
   );
@@ -504,7 +710,7 @@ export function parseOculixJavaIdentity(configContents, lockContents) {
     throw new Error(`${OCULIX_LOCK_PATH} Java backend must be core:java`);
   }
   const specifiers = parseStringArray(
-    toolBlock,
+    toolSection,
     "specifiers",
     `${OCULIX_LOCK_PATH} Java`,
   );
@@ -514,22 +720,20 @@ export function parseOculixJavaIdentity(configContents, lockContents) {
     );
   }
 
-  const platformExpression =
-    /^\[tools\.java\."platforms\.([a-z0-9-]+)"\]\s*$/gmu;
-  const matches = [...lock.matchAll(platformExpression)];
-  const platforms = matches.map((match, index) => {
-    const platform = match[1];
+  const platformSections = sections.filter(
+    ({ kind }) => kind === "java-platform",
+  );
+  const platforms = platformSections.map((section) => {
+    const { platform } = section;
     if (!OCULIX_LOCK_PLATFORMS.includes(platform)) {
       throw new Error(
         `${OCULIX_LOCK_PATH} contains unsupported Java platform ${platform}`,
       );
     }
-    const blockStart = match.index + match[0].length;
-    const blockEnd =
-      index + 1 < matches.length ? matches[index + 1].index : lock.length;
     return parseLockedJavaPlatform(
-      lock.slice(blockStart, blockEnd),
+      section,
       platform,
+      lockedVersion,
       policy.major,
     );
   }).sort((left, right) => left.platform.localeCompare(right.platform));
@@ -543,19 +747,28 @@ export function parseOculixJavaIdentity(configContents, lockContents) {
       `${OCULIX_LOCK_PATH} Java must lock every supported platform exactly once`,
     );
   }
+  const runtimeVersions = new Set(
+    platforms.map(({ runtime_version: runtimeVersion }) => runtimeVersion),
+  );
+  if (runtimeVersions.size !== 1) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} Java artifacts must bind one exact runtime build`,
+    );
+  }
+  const runtimeVersion = [...runtimeVersions][0];
+  const runtimeIdentity = {
+    runtime_version: runtimeVersion,
+    runtime_vendor: TEMURIN_VENDOR,
+  };
   const identity = {
     backend,
     major: policy.major,
     platforms,
     resolved_version: lockedVersion.slice("temurin-".length),
-    solver_version: lockedVersion
-      .slice("temurin-".length)
-      .split("+", 1)[0]
-      .split(".")
-      .slice(0, 3)
-      .concat(["0", "0"])
-      .slice(0, 3)
-      .join("."),
+    runtime_identity_digest: sha256(runtimeIdentity),
+    runtime_version: runtimeVersion,
+    runtime_vendor: TEMURIN_VENDOR,
+    solver_version: versionMatch.slice(1, 4).join("."),
     specifier: policy.specifier,
   };
   return deepFreeze({
@@ -659,6 +872,115 @@ function selectedAssets(release, version) {
     });
   }
   return assets;
+}
+
+function oculixAssetPlatformName(version, platform) {
+  const releasePlatform = {
+    "linux-arm64": "linux",
+    "linux-x64": "linux",
+    "macos-arm64": "macos",
+    "windows-x64": "windows",
+  }[platform];
+  return `oculixide-${version}-${releasePlatform}.jar`;
+}
+
+function candidateLockAssets(component) {
+  const assetEvidence = component.candidate.evidence.filter(
+    ({ type }) => type === "github-release-asset",
+  );
+  return OCULIX_LOCK_PLATFORMS.map((platform) => {
+    const name = oculixAssetPlatformName(
+      component.candidate.version,
+      platform,
+    );
+    const matches = assetEvidence.filter(({ locator }) =>
+      locator.endsWith(`/${name}`),
+    );
+    if (matches.length !== 1 || !SHA256_PATTERN.test(matches[0].digest)) {
+      throw new Error(
+        `Oculix RC evidence must bind exactly one ${name} asset`,
+      );
+    }
+    let url;
+    try {
+      url = new URL(matches[0].locator);
+    } catch {
+      throw new Error(`Oculix RC ${name} asset URL is invalid`);
+    }
+    const pathMatch =
+      /^\/oculix-org\/Oculix\/releases\/download\/([^/]+)\/([^/]+)$/u
+        .exec(url.pathname);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "github.com" ||
+      pathMatch === null ||
+      pathMatch[2] !== name ||
+      parseOculixRcTag(pathMatch[1])?.version !==
+        component.candidate.version
+    ) {
+      throw new Error(
+        `Oculix RC ${name} asset URL does not bind the candidate`,
+      );
+    }
+    return {
+      digest: matches[0].digest,
+      platform,
+      url: matches[0].locator,
+    };
+  });
+}
+
+function validateGeneratedOculixLock(
+  lockContents,
+  candidateVersion,
+  candidateAssets,
+) {
+  const expectedAssetPlatforms = Array.isArray(candidateAssets)
+    ? candidateAssets.map(({ platform }) => platform).sort()
+    : [];
+  if (
+    new Set(expectedAssetPlatforms).size !==
+      OCULIX_LOCK_PLATFORMS.length ||
+    JSON.stringify(expectedAssetPlatforms) !==
+      JSON.stringify([...OCULIX_LOCK_PLATFORMS].sort())
+  ) {
+    throw new Error(
+      "Generated Oculix lock validation requires every candidate asset",
+    );
+  }
+  const sections = parseLockSections(lockContents);
+  parseOculixToolRecord(sections, candidateVersion);
+  const platformSections = sections.filter(
+    ({ kind }) => kind === "oculix-platform",
+  );
+  const actualPlatforms = platformSections
+    .map(({ platform }) => platform)
+    .sort();
+  if (
+    new Set(actualPlatforms).size !== OCULIX_LOCK_PLATFORMS.length ||
+    JSON.stringify(actualPlatforms) !==
+      JSON.stringify([...OCULIX_LOCK_PLATFORMS].sort())
+  ) {
+    throw new Error(
+      `${OCULIX_LOCK_PATH} must structurally lock every Oculix platform exactly once`,
+    );
+  }
+  for (const expected of candidateAssets) {
+    const section = requireLockSection(
+      sections,
+      "oculix-platform",
+      expected.platform,
+    );
+    const context =
+      `${OCULIX_LOCK_PATH} Oculix ${expected.platform}`;
+    const checksum = parseTomlString(section, "checksum", context);
+    const url = parseTomlString(section, "url", context);
+    if (checksum !== expected.digest || url !== expected.url) {
+      throw new Error(
+        `${context} must bind the exact candidate asset URL and digest`,
+      );
+    }
+  }
 }
 
 async function candidateEvidence(
@@ -871,59 +1193,106 @@ function javaComponent(observation) {
 
 function javaIdentityFromObservation(observation) {
   const component = javaComponent(observation);
-  const policy = component.current.evidence.find(
+  const policyEvidence = component.current.evidence.filter(
     ({ type }) => type === "temurin-policy",
   );
-  const runtime = component.current.evidence.find(
+  const runtimeEvidence = component.current.evidence.filter(
     ({ type }) => type === "locked-java-runtime",
   );
+  if (policyEvidence.length !== 1 || runtimeEvidence.length !== 1) {
+    throw new Error(
+      "Oculix RC observation must contain one Java policy and runtime",
+    );
+  }
+  const [policy] = policyEvidence;
+  const [runtime] = runtimeEvidence;
   const relation = observation.relations.find(
     ({ id }) => id === "oculix-rc-requires-java-runtime",
   );
-  const platforms = component.current.evidence
-    .filter(({ type }) => type === "locked-java-artifact")
-    .map((evidence) => {
-      const separator = evidence.revision.lastIndexOf(":");
-      const expectedPrefix = `${runtime?.revision}:`;
-      return {
-        checksum: evidence.digest,
-        platform: evidence.revision.startsWith(expectedPrefix)
-          ? evidence.revision.slice(separator + 1)
-          : "",
-        url: evidence.locator,
-      };
-    })
+  const specifierMatch = TEMURIN_SPECIFIER_PATTERN.exec(policy.revision);
+  const resolvedVersion =
+    runtime.revision.startsWith("temurin-")
+      ? runtime.revision.slice("temurin-".length)
+      : "";
+  const resolvedMatch = TEMURIN_RESOLVED_PATTERN.exec(
+    `temurin-${resolvedVersion}`,
+  );
+  if (
+    specifierMatch === null ||
+    resolvedMatch === null ||
+    resolvedMatch[1] !== specifierMatch[1]
+  ) {
+    throw new Error(
+      "Oculix RC observation does not bind a strict Temurin runtime",
+    );
+  }
+  const artifactEvidence = component.current.evidence.filter(
+    ({ type }) => type === "locked-java-artifact",
+  );
+  const platforms = artifactEvidence.map((evidence) => {
+    const separator = evidence.revision.lastIndexOf(":");
+    const expectedPrefix = `${runtime.revision}:`;
+    const platform = evidence.revision.startsWith(expectedPrefix)
+      ? evidence.revision.slice(separator + 1)
+      : "";
+    if (
+      !OCULIX_LOCK_PLATFORMS.includes(platform) ||
+      !SHA256_PATTERN.test(evidence.digest)
+    ) {
+      throw new Error(
+        "Oculix RC observation contains invalid Java artifact evidence",
+      );
+    }
+    return {
+      checksum: evidence.digest,
+      platform,
+      runtime_version: parseTemurinArtifactUrl(
+        evidence.locator,
+        platform,
+        `temurin-${resolvedVersion}`,
+        specifierMatch[1],
+      ),
+      url: evidence.locator,
+    };
+  })
     .sort((left, right) => left.platform.localeCompare(right.platform));
   const expectedPlatforms = [...OCULIX_LOCK_PLATFORMS].sort();
   const actualPlatforms = platforms.map(({ platform }) => platform);
-  const specifierMatch = TEMURIN_SPECIFIER_PATTERN.exec(
-    policy?.revision ?? "",
+  const runtimeVersions = new Set(
+    platforms.map(({ runtime_version: runtimeVersion }) => runtimeVersion),
   );
-  const resolvedVersion =
-    runtime?.revision.startsWith("temurin-") === true
-      ? runtime.revision.slice("temurin-".length)
-      : "";
   if (
-    policy === undefined ||
-    runtime === undefined ||
-    specifierMatch === null ||
-    TEMURIN_RUNTIME_PATTERN.test(`temurin-${resolvedVersion}`) === false ||
     relation?.type !== "shares-runtime" ||
     relation.from !== OCULIX_RC_COMPONENT_ID ||
     relation.to !== OCULIX_JAVA_COMPONENT_ID ||
     relation.hard !== true ||
     relation.constraint !== javaMajorConstraint(specifierMatch[1]) ||
-    JSON.stringify(actualPlatforms) !== JSON.stringify(expectedPlatforms)
+    JSON.stringify(actualPlatforms) !== JSON.stringify(expectedPlatforms) ||
+    runtimeVersions.size !== 1 ||
+    component.current.version !== resolvedMatch.slice(1, 4).join(".") ||
+    policy.digest !==
+      sha256({
+        major: specifierMatch[1],
+        specifier: policy.revision,
+      })
   ) {
     throw new Error(
       "Oculix RC observation does not bind its configured Java runtime",
     );
   }
+  const runtimeVersion = [...runtimeVersions][0];
+  const runtimeIdentity = {
+    runtime_version: runtimeVersion,
+    runtime_vendor: TEMURIN_VENDOR,
+  };
   const identity = {
     backend: "core:java",
     major: specifierMatch[1],
     platforms,
     resolved_version: resolvedVersion,
+    runtime_identity_digest: sha256(runtimeIdentity),
+    runtime_version: runtimeVersion,
+    runtime_vendor: TEMURIN_VENDOR,
     solver_version: component.current.version,
     specifier: policy.revision,
   };
@@ -972,6 +1341,7 @@ export function createOculixRcQualificationPlan({
 }) {
   const component = candidateComponent(observation);
   const java = javaIdentityFromObservation(observation);
+  const oculixAssets = candidateLockAssets(component);
   const normalizedRunner = requireRunner(runner);
   return deepFreeze({
     schema_version: 1,
@@ -979,10 +1349,11 @@ export function createOculixRcQualificationPlan({
     candidate_digest: subjectDigest(observation),
     candidate_version: component.candidate.version,
     java: structuredClone(java),
+    oculix_assets: structuredClone(oculixAssets),
     repository: structuredClone(observation.repository),
     runner: normalizedRunner,
     workspace: {
-      kind: "ephemeral-copy",
+      kind: "ephemeral-git-archive",
       source_revision: observation.repository.revision,
       managed_paths: [...OCULIX_MANAGED_PATHS],
     },
@@ -1017,17 +1388,51 @@ function outsideRepository(repositoryRoot, workspacePath) {
 export async function createEphemeralOculixWorkspace({
   repositoryRoot,
   revision,
+  runCommand = runOculixQualificationCommand,
 }) {
   requireRevision(revision, "revision");
+  const root = resolve(repositoryRoot);
+  const status = await runCommand({
+    command: "git",
+    args: ["status", "--porcelain=v1", "--untracked-files=all"],
+    cwd: root,
+  });
+  if (`${status?.stdout ?? ""}${status?.stderr ?? ""}`.trim().length > 0) {
+    throw new Error(
+      "Qualification source repository must be clean, including untracked files",
+    );
+  }
+  const resolvedRevision = await runCommand({
+    command: "git",
+    args: ["rev-parse", "--verify", `${revision}^{commit}`],
+    cwd: root,
+  });
+  if ((resolvedRevision?.stdout ?? "").trim() !== revision) {
+    throw new Error("Qualification revision does not resolve exactly");
+  }
   const temporaryRoot = await mkdtemp(
     join(tmpdir(), "oculix-rc-qualification-"),
   );
   const workspacePath = join(temporaryRoot, "repository");
+  const archivePath = join(temporaryRoot, "repository.tar");
   try {
-    await cp(resolve(repositoryRoot), workspacePath, {
-      recursive: true,
-      filter: (source) => basename(source) !== ".git",
+    await runCommand({
+      command: "git",
+      args: [
+        "archive",
+        "--format=tar",
+        `--output=${archivePath}`,
+        revision,
+      ],
+      cwd: root,
     });
+    await mkdir(workspacePath);
+    await runCommand({
+      command: "tar",
+      args: ["-xf", archivePath, "-C", workspacePath],
+      cwd: temporaryRoot,
+    });
+    await rm(archivePath);
   } catch (error) {
     await rm(temporaryRoot, { force: true, recursive: true });
     throw error;
@@ -1060,6 +1465,81 @@ export async function runOculixQualificationCommand({
     stderr: result.stderr,
     stdout: result.stdout,
   };
+}
+
+export function classifyOculixWarnings({ stderr = "", stdout = "" }) {
+  const warnings = [];
+  const seen = new Set();
+  for (const line of `${stdout}\n${stderr}`.split(/\r?\n/u)) {
+    const normalized = line.trim();
+    if (
+      normalized.length > 0 &&
+      WARNING_PATTERNS.some((pattern) => pattern.test(normalized)) &&
+      !seen.has(normalized)
+    ) {
+      seen.add(normalized);
+      warnings.push(normalized);
+    }
+  }
+  return warnings;
+}
+
+function commandOutput(result) {
+  return {
+    stderr:
+      typeof result?.stderr === "string" ? result.stderr : "",
+    stdout:
+      typeof result?.stdout === "string" ? result.stdout : "",
+  };
+}
+
+function parseRuntimeProperty(output, property) {
+  const escaped = escapeRegularExpression(property);
+  const matches = [
+    ...output.matchAll(
+      new RegExp(`^\\s*${escaped}\\s*=\\s*(\\S.*?)\\s*$`, "gmu"),
+    ),
+  ].map((match) => match[1]);
+  if (matches.length !== 1) {
+    throw new Error(`Java runtime output must contain one ${property}`);
+  }
+  return matches[0];
+}
+
+export async function observeOculixJavaRuntime({
+  environment = {},
+  runCommand = runOculixQualificationCommand,
+  workspacePath,
+}) {
+  const result = await runCommand({
+    command: "mise",
+    args: [
+      "-E",
+      "oculix",
+      "exec",
+      "--",
+      "java",
+      "-XshowSettings:properties",
+      "-version",
+    ],
+    cwd: workspacePath,
+    environment,
+  });
+  const output = commandOutput(result);
+  const combined = `${output.stdout}\n${output.stderr}`;
+  const identity = {
+    runtime_version: parseRuntimeProperty(
+      combined,
+      "java.runtime.version",
+    ),
+    runtime_vendor: parseRuntimeProperty(combined, "java.vendor"),
+  };
+  return deepFreeze({
+    ...identity,
+    identity_digest: sha256(javaRuntimeIdentityProjection(identity)),
+    output_digest: sha256(output),
+    warnings: classifyOculixWarnings(output),
+  });
 }
 
 function replaceOculixVersion(configContents, currentVersion, candidateVersion) {
@@ -1108,6 +1588,7 @@ function requirePreparedJavaIdentity(
 }
 
 export async function prepareOculixRcCandidate({
+  candidateAssets,
   candidateVersion,
   currentVersion,
   javaIdentity,
@@ -1140,7 +1621,7 @@ export async function prepareOculixRcCandidate({
       candidateVersion,
     ),
   );
-  await runCommand({
+  const lockResult = await runCommand({
     command: lockCommand[0],
     args: lockCommand.slice(1),
     cwd: workspacePath,
@@ -1169,16 +1650,11 @@ export async function prepareOculixRcCandidate({
     );
   }
   const lockText = after.get(OCULIX_LOCK_PATH).toString("utf8");
-  if (
-    !lockText.includes(`version = "${candidateVersion}"`) ||
-    OCULIX_LOCK_PLATFORMS.some(
-      (platform) => !lockText.includes(`"platforms.${platform}"`),
-    )
-  ) {
-    throw new Error(
-      "Generated Oculix lock does not bind the candidate on every platform",
-    );
-  }
+  validateGeneratedOculixLock(
+    lockText,
+    candidateVersion,
+    candidateAssets,
+  );
   const afterJava = requirePreparedJavaIdentity(
     after.get(OCULIX_CONFIG_PATH),
     after.get(OCULIX_LOCK_PATH),
@@ -1189,15 +1665,23 @@ export async function prepareOculixRcCandidate({
     changed_paths: entries.map(({ path }) => path),
     diff_digest: sha256(diffProjection(entries)),
     java_identity_digest: afterJava.identity_digest,
+    warnings: classifyOculixWarnings(commandOutput(lockResult)),
   });
 }
 
-async function executePlannedCheck({
+export async function executeOculixQualificationCheck({
   check,
+  observeJavaRuntime = observeOculixJavaRuntime,
   plan,
   runCommand = runOculixQualificationCommand,
   workspacePath,
 }) {
+  const runtime = await observeJavaRuntime({
+    environment: check.environment,
+    plan,
+    runCommand,
+    workspacePath,
+  });
   try {
     const result = await runCommand({
       command: check.command[0],
@@ -1205,26 +1689,46 @@ async function executePlannedCheck({
       cwd: workspacePath,
       environment: check.environment,
     });
+    const output = commandOutput(result);
     return {
       status: "pass",
-      warnings: [],
+      warnings: [
+        ...new Set([
+          ...runtime.warnings,
+          ...classifyOculixWarnings(output),
+        ]),
+      ],
       output_digest: sha256({
-        stderr: result?.stderr ?? "",
-        stdout: result?.stdout ?? "",
+        command: output,
+        runtime_output_digest: runtime.output_digest,
       }),
-      java_identity_digest: plan.java.identity_digest,
+      java_identity_digest: runtime.identity_digest,
     };
   } catch (error) {
+    const output = commandOutput(error);
     return {
       status: "fail",
-      warnings: [],
-      output_digest: sha256(String(error?.message ?? error)),
-      java_identity_digest: plan.java.identity_digest,
+      warnings: [
+        ...new Set([
+          ...runtime.warnings,
+          ...classifyOculixWarnings(output),
+        ]),
+      ],
+      output_digest: sha256({
+        command: output,
+        error: String(error?.message ?? error),
+        runtime_output_digest: runtime.output_digest,
+      }),
+      java_identity_digest: runtime.identity_digest,
     };
   }
 }
 
-function validateCheckResult(result, checkId, expectedJavaIdentityDigest) {
+function validateCheckResult(
+  result,
+  checkId,
+  expectedRuntimeIdentityDigest,
+) {
   if (!RESULT_STATUSES.has(result?.status)) {
     throw new Error(`${checkId} returned an invalid result status`);
   }
@@ -1254,7 +1758,7 @@ function validateCheckResult(result, checkId, expectedJavaIdentityDigest) {
   }
   const javaCompatible =
     result.java_compatible !== false &&
-    reportedJavaIdentity === expectedJavaIdentityDigest;
+    reportedJavaIdentity === expectedRuntimeIdentityDigest;
   return {
     javaCompatible,
     javaIdentityDigest: reportedJavaIdentity,
@@ -1432,7 +1936,7 @@ export async function qualifyOculixRc({
   observation,
   prepareCandidate = prepareOculixRcCandidate,
   repositoryRoot,
-  runCheck = executePlannedCheck,
+  runCheck = executeOculixQualificationCheck,
   runner,
 }) {
   requireTimestamp(generatedAt, "generatedAt");
@@ -1458,6 +1962,7 @@ export async function qualifyOculixRc({
     let preparation;
     try {
       preparation = await prepareCandidate({
+        candidateAssets: plan.oculix_assets,
         candidateVersion: component.candidate.version,
         currentVersion: component.current.version,
         javaIdentity: plan.java,
@@ -1468,6 +1973,18 @@ export async function qualifyOculixRc({
       if (preparation.java_identity_digest !== plan.java.identity_digest) {
         throw new OculixJavaRuntimeIncompatibilityError(
           "Candidate preparation reported a different Java runtime",
+        );
+      }
+      if (
+        preparation.warnings !== undefined &&
+        (!Array.isArray(preparation.warnings) ||
+          preparation.warnings.some(
+            (warning) =>
+              typeof warning !== "string" || warning.length === 0,
+          ))
+      ) {
+        throw new Error(
+          "Candidate preparation warnings must be nonempty strings",
         );
       }
       if (
@@ -1515,8 +2032,14 @@ export async function qualifyOculixRc({
             workspacePath: workspace.path,
           }),
           check.id,
-          plan.java.identity_digest,
+          plan.java.runtime_identity_digest,
         );
+        result.warnings = [
+          ...new Set([
+            ...(preparation.warnings ?? []),
+            ...result.warnings,
+          ]),
+        ].sort();
         checkResults.push({ check, result });
       } catch (error) {
         document = validationDocument({
