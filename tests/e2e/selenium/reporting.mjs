@@ -39,12 +39,27 @@ export function repositoryRelativePath(
 }
 
 async function dependencyVersions() {
-  const packageJson = JSON.parse(
-    await readFile(resolve(HARNESS_DIRECTORY, "package.json"), "utf8"),
-  );
+  const readInstalledVersion = async (name) => {
+    const packageJson = JSON.parse(
+      await readFile(
+        resolve(
+          HARNESS_DIRECTORY,
+          "node_modules",
+          ...name.split("/"),
+          "package.json",
+        ),
+        "utf8",
+      ),
+    );
+    if (packageJson.name !== name || typeof packageJson.version !== "string") {
+      throw new Error(`Installed ${name} package identity is invalid`);
+    }
+    return packageJson.version;
+  };
   return {
-    axeWebdriver: packageJson.dependencies["@axe-core/webdriverjs"],
-    selenium: packageJson.dependencies["selenium-webdriver"],
+    axeCore: await readInstalledVersion("axe-core"),
+    axeWebdriver: await readInstalledVersion("@axe-core/webdriverjs"),
+    selenium: await readInstalledVersion("selenium-webdriver"),
   };
 }
 
@@ -58,10 +73,15 @@ async function existingArtifactPath(path, repositoryDirectory) {
 }
 
 export async function createScenarioReporter({
+  assertion = {
+    expected: "238",
+    name: "web-calculator final display",
+  },
   clock = () => new Date(),
   diagnosticsDirectory = DIAGNOSTICS_DIRECTORY,
   repositoryDirectory = REPOSITORY_DIRECTORY,
   scenario,
+  versions: suppliedVersions,
 } = {}) {
   const directory = resolve(diagnosticsDirectory, scenario);
   const paths = {
@@ -77,7 +97,7 @@ export async function createScenarioReporter({
     screenshot: resolve(directory, "result.png"),
   };
   const started = clock();
-  const versions = await dependencyVersions();
+  const versions = suppliedVersions ?? (await dependencyVersions());
   const state = {
     accessibility: {
       counts: null,
@@ -87,8 +107,8 @@ export async function createScenarioReporter({
     },
     assertion: {
       actual: null,
-      expected: "238",
-      name: "web-calculator final display",
+      expected: assertion.expected,
+      name: assertion.name,
       status: "not-run",
     },
     capability: {
@@ -102,7 +122,9 @@ export async function createScenarioReporter({
     environment: {
       browserName: null,
       browserVersion: null,
+      browserExecutable: null,
       driverVersion: null,
+      driverExecutable: null,
       hostDistribution: null,
       hostPlatform: process.platform,
       nodeVersion: process.version,
@@ -177,7 +199,9 @@ export async function createScenarioReporter({
       state.environment = {
         browserName: metadata.browserName ?? null,
         browserVersion: metadata.browserVersion ?? null,
+        browserExecutable: metadata.browserExecutable ?? null,
         driverVersion: metadata.driverVersion ?? null,
+        driverExecutable: metadata.driverExecutable ?? null,
         hostDistribution: metadata.hostDistribution ?? null,
         hostPlatform: metadata.hostPlatform ?? process.platform,
         nodeVersion: metadata.nodeVersion ?? process.version,
@@ -226,7 +250,8 @@ export async function createScenarioReporter({
         tool: {
           accessibility: {
             engine: "axe-core",
-            engineVersion: state.accessibility.engineVersion,
+            engineVersion:
+              state.accessibility.engineVersion ?? versions.axeCore,
             integration: "@axe-core/webdriverjs",
             integrationVersion: versions.axeWebdriver,
           },

@@ -1,8 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import AxeBuilder from "@axe-core/webdriverjs";
-
 export const ACCESSIBILITY_TAGS = Object.freeze([
   "wcag2a",
   "wcag2aa",
@@ -97,5 +95,6 @@ export function enforceAccessibilityPolicy(results) {
 }
 
 export async function auditAccessibility(driver) {
+  const { default: AxeBuilder } = await import("@axe-core/webdriverjs");
   return new AxeBuilder(driver).withTags(ACCESSIBILITY_TAGS).analyze();
 }

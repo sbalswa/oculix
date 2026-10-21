@@ -1,5 +1,8 @@
-import { access, mkdir, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 
 import chrome from "selenium-webdriver/chrome.js";
 
@@ -11,6 +14,8 @@ import {
   runtimeStatePath,
   scenarioLogDirectory,
 } from "./runtime.mjs";
+
+const execFileAsync = promisify(execFile);
 
 async function packageVersion() {
   const packageJson = JSON.parse(
@@ -27,7 +32,71 @@ function driverVersion(capabilities) {
   return "unknown";
 }
 
-async function browserMetadata(driver, capability, state) {
+function expectedExecutableIdentity(kind) {
+  const prefix = `E2E_${kind.toUpperCase()}_EXECUTABLE_`;
+  const expected = {
+    digest: process.env[`${prefix}DIGEST`] ?? null,
+    realpath: process.env[`${prefix}REALPATH`] ?? null,
+    version: process.env[`${prefix}VERSION`] ?? null,
+  };
+  const configured = Object.values(expected).filter(
+    (value) => value !== null,
+  ).length;
+  if (configured === 0) {
+    return null;
+  }
+  if (configured !== Object.keys(expected).length) {
+    throw new Error(`${kind} executable identity is only partially configured`);
+  }
+  return expected;
+}
+
+async function measureExecutable(path, kind) {
+  const canonical = await realpath(path);
+  const content = await readFile(canonical);
+  const { stdout } = await execFileAsync(canonical, ["--version"], {
+    encoding: "utf8",
+  });
+  const match = /\b([0-9]+(?:\.[0-9]+){2,3})\b/u.exec(stdout);
+  if (match === null) {
+    throw new Error(`${kind} executable did not report an exact version`);
+  }
+  const observed = {
+    digest: `sha256:${createHash("sha256").update(content).digest("hex")}`,
+    realpath: canonical,
+    version: match[1],
+  };
+  const expected = expectedExecutableIdentity(kind);
+  if (
+    expected !== null &&
+    JSON.stringify(observed) !== JSON.stringify(expected)
+  ) {
+    throw new Error(
+      `${kind} executable identity does not match qualification evidence`,
+    );
+  }
+  return observed;
+}
+
+async function executableIdentities(state) {
+  return {
+    browserExecutable: await measureExecutable(
+      state.browserBinary,
+      "browser",
+    ),
+    driverExecutable: await measureExecutable(
+      state.driverBinary,
+      "driver",
+    ),
+  };
+}
+
+async function browserMetadata(
+  driver,
+  capability,
+  state,
+  executableIdentity,
+) {
   const capabilities = await driver.getCapabilities();
   return {
     browser: capability.browser,
@@ -35,9 +104,11 @@ async function browserMetadata(driver, capability, state) {
     browserName: capabilities.getBrowserName(),
     browserSource: capability.browserSource,
     browserVersion: capabilities.getBrowserVersion(),
+    browserExecutable: executableIdentity.browserExecutable,
     downloadsAllowed: state.downloadsAllowed,
     driverBinary: state.driverBinary,
     driverVersion: driverVersion(capabilities),
+    driverExecutable: executableIdentity.driverExecutable,
     hostDistribution: capability.hostDistribution,
     hostPlatform: capability.hostPlatform,
     nodeVersion: process.version,
@@ -195,6 +266,7 @@ export async function runScenario(
   let capability;
   let driver;
   let failure;
+  let executableIdentity;
   let logDirectory;
   let logPaths = {};
   let metadata;
@@ -210,12 +282,18 @@ export async function runScenario(
     reporter?.recordMetadata(baseMetadata(capability, state));
     state = await loadResourceState(capability);
     reporter?.recordMetadata(baseMetadata(capability, state));
+    executableIdentity = await executableIdentities(state);
     const logs = await prepareScenarioLogs(capability, scenario);
     logDirectory = logs.directory;
     logPaths = logs.paths;
     driver = await buildDriver(state, logPaths);
     metadata = {
-      ...(await browserMetadata(driver, capability, state)),
+      ...(await browserMetadata(
+        driver,
+        capability,
+        state,
+        executableIdentity,
+      )),
       phase: "scenario",
     };
     reporter?.recordMetadata(metadata);
@@ -230,6 +308,13 @@ export async function runScenario(
       ].join(" | "),
     );
     await scenarioFunction(driver, capability);
+    const executableIdentityAfter = await executableIdentities(state);
+    if (
+      JSON.stringify(executableIdentityAfter) !==
+      JSON.stringify(executableIdentity)
+    ) {
+      throw new Error("Runner executable identity changed during scenario");
+    }
   } catch (caughtError) {
     failure = asError(caughtError);
     metadata = {
