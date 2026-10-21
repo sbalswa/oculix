@@ -1,0 +1,3 @@
+[tools]
+# Pin the shared browser E2E runtime to the Node.js 24 LTS line.
+node = "24"

@@ -1,0 +1,51 @@
+{
+  "assignments": [
+    {
+      "id": "node-candidate-selenium-candidate",
+      "maximal": true,
+      "results": [
+        {
+          "capability_id": "playwright-ubuntu-chromium",
+          "status": "pass",
+          "warnings": []
+        },
+        {
+          "capability_id": "selenium-ubuntu-chromium",
+          "status": "pass",
+          "warnings": []
+        }
+      ],
+      "selections": [
+        {
+          "candidate_digest": "378e114820110d329fcd6dbf7a993a5d6969d679d61249981863866f559b4d69",
+          "provider_id": "selenium",
+          "state": "candidate"
+        },
+        {
+          "candidate_digest": "d48e1b4c2642a4bc2d6e58e1b30949306f60be0fd97d93f5524eb7f9d4110cbd",
+          "provider_id": "node",
+          "state": "candidate"
+        }
+      ]
+    }
+  ],
+  "capability_catalog": {
+    "digest": "sha256:8bf5613768ba1f8f6cd2a2ff4ef00f05978f47499c40d99c07692a750ae8ec9b",
+    "schema_version": 1
+  },
+  "compatible_frontier": "node-candidate-selenium-candidate",
+  "disposition": {
+    "reason_codes": [
+      "COUPLED_COMPATIBLE"
+    ],
+    "state": "cohort-planned"
+  },
+  "generated_at": "2026-10-21T17:00:00Z",
+  "kind": "plan",
+  "minimal_blockers": [],
+  "repository": {
+    "name": "sbalswa/oculix",
+    "revision": "d460a7e8ce751eb772d1b3120e5508bbecaa7bff"
+  },
+  "schema_version": 1
+}

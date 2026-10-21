@@ -1,0 +1,30 @@
+[
+  {
+    "version": "v24.22.0",
+    "date": "2026-10-20",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": "Krypton"
+  },
+  {
+    "version": "v23.11.1",
+    "date": "2025-05-14",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": false
+  }
+]

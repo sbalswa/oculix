@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "kind": "observation",
+  "generated_at": "2026-10-21T17:00:00.000Z",
+  "repository": {
+    "name": "sbalswa/oculix",
+    "revision": "d460a7e8ce751eb772d1b3120e5508bbecaa7bff"
+  },
+  "capability_catalog": {
+    "schema_version": 1,
+    "digest": "sha256:8bf5613768ba1f8f6cd2a2ff4ef00f05978f47499c40d99c07692a750ae8ec9b"
+  },
+  "provider_id": "playwright",
+  "disposition": {
+    "state": "candidate",
+    "reason_codes": [
+      "CANDIDATE_AVAILABLE"
+    ]
+  },
+  "components": [
+    {
+      "id": "playwright-package-cohort",
+      "lane": "playwright",
+      "ecosystem": "npm",
+      "current": {
+        "version": "{\"axePeerRange\":\">= 1.0.0\",\"integrities\":{\"@axe-core/playwright\":\"sha512-Y3VycmVudC1heGU=\",\"@playwright/test\":\"sha512-Y3VycmVudC10ZXN0\",\"playwright\":\"sha512-Y3VycmVudC1wbGF5d3JpZ2h0\",\"playwright-core\":\"sha512-Y3VycmVudC1jb3Jl\"},\"nodeRanges\":{\"@axe-core/playwright\":\">=22.12.0\",\"@playwright/test\":\">=20\",\"playwright\":\">=20\",\"playwright-core\":\">=20\"},\"packages\":{\"@axe-core/playwright\":\"4.14.0\",\"@playwright/test\":\"1.64.1\",\"playwright\":\"1.64.1\",\"playwright-core\":\"1.64.1\"},\"tarballs\":{\"@axe-core/playwright\":\"https://registry.npmjs.org/@axe-core/playwright/-/playwright-4.14.0.tgz\",\"@playwright/test\":\"https://registry.npmjs.org/@playwright/test/-/test-1.64.1.tgz\",\"playwright\":\"https://registry.npmjs.org/playwright/-/playwright-1.64.1.tgz\",\"playwright-core\":\"https://registry.npmjs.org/playwright-core/-/playwright-core-1.64.1.tgz\"}}",
+        "evidence": [
+          {
+            "type": "repository-file",
+            "locator": "tests/e2e/playwright/package.json",
+            "revision": "d460a7e8ce751eb772d1b3120e5508bbecaa7bff",
+            "digest": "sha256:6fcfad5325d8ed3e6d987e6d6502f3107d7dd3e66d5f8996e2765d92f5383817",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          },
+          {
+            "type": "repository-file",
+            "locator": "tests/e2e/playwright/package-lock.json",
+            "revision": "d460a7e8ce751eb772d1b3120e5508bbecaa7bff",
+            "digest": "sha256:ad15f6663f4fd249e0ca9bcd4ca0f33fe02f4b06cd276181cf40c2376defd0fa",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          }
+        ]
+      },
+      "candidate": {
+        "version": "{\"axePeerRange\":\">= 1.0.0\",\"integrities\":{\"@axe-core/playwright\":\"sha512-Y2FuZGlkYXRlLWF4ZQ==\",\"@playwright/test\":\"sha512-Y2FuZGlkYXRlLXRlc3Q=\",\"playwright\":\"sha512-Y2FuZGlkYXRlLXBsYXl3cmlnaHQ=\",\"playwright-core\":\"sha512-Y2FuZGlkYXRlLWNvcmU=\"},\"nodeRanges\":{\"@axe-core/playwright\":\">=22.12.0\",\"@playwright/test\":\">=20\",\"playwright\":\">=20\",\"playwright-core\":\">=20\"},\"packages\":{\"@axe-core/playwright\":\"4.15.0\",\"@playwright/test\":\"1.65.0\",\"playwright\":\"1.65.0\",\"playwright-core\":\"1.65.0\"},\"tarballs\":{\"@axe-core/playwright\":\"https://registry.npmjs.org/@axe-core/playwright/-/playwright-4.15.0.tgz\",\"@playwright/test\":\"https://registry.npmjs.org/@playwright/test/-/test-1.65.0.tgz\",\"playwright\":\"https://registry.npmjs.org/playwright/-/playwright-1.65.0.tgz\",\"playwright-core\":\"https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.0.tgz\"}}",
+        "evidence": [
+          {
+            "type": "npm-package-metadata",
+            "locator": "https://registry.npmjs.org/@axe-core/playwright/-/playwright-4.15.0.tgz",
+            "revision": "4.15.0",
+            "digest": "sha256:9517d66bca0f9ea02d18b30206321b643c6076458cbcfaa953f3d1da5d3e5847",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          },
+          {
+            "type": "npm-package-metadata",
+            "locator": "https://registry.npmjs.org/@playwright/test/-/test-1.65.0.tgz",
+            "revision": "1.65.0",
+            "digest": "sha256:af30b277c593ee8799aae5001c4336b3543b6f04462231ae8e5d1e47377e62da",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          },
+          {
+            "type": "npm-package-metadata",
+            "locator": "https://registry.npmjs.org/playwright/-/playwright-1.65.0.tgz",
+            "revision": "1.65.0",
+            "digest": "sha256:8734685cef2f5e4db889aaaef7ef3415e5cf0de071ba60579db9522772319d58",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          },
+          {
+            "type": "npm-package-metadata",
+            "locator": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.65.0.tgz",
+            "revision": "1.65.0",
+            "digest": "sha256:5c0daf5666f21df81e2f2818512086770c86419f8e106b547e7e3e507dcc07c3",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          }
+        ]
+      },
+      "eventual_managed_paths": [
+        "tests/e2e/playwright/package.json"
+      ],
+      "affected_capabilities": [
+        "playwright-ubuntu-chromium"
+      ]
+    },
+    {
+      "id": "playwright-chromium-bundle",
+      "lane": "playwright",
+      "ecosystem": "playwright",
+      "current": {
+        "version": "{\"name\":\"chromium\",\"revision\":\"1194\"}",
+        "evidence": [
+          {
+            "type": "playwright-browser-metadata",
+            "locator": "https://example.invalid/playwright-core@1.64.1/browsers.json",
+            "revision": "1.64.1:1194",
+            "digest": "sha256:00f49c15d206bd042da52ce4cfe445c765591c97beea7ddfa43ea7868b1d00f6",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          }
+        ]
+      },
+      "candidate": {
+        "version": "{\"name\":\"chromium\",\"revision\":\"1200\"}",
+        "evidence": [
+          {
+            "type": "playwright-browser-metadata",
+            "locator": "https://example.invalid/playwright-core@1.65.0/browsers.json",
+            "revision": "1.65.0:1200",
+            "digest": "sha256:ed28ee3d56de3e6724a28d43c1445ff8ab47062eb36fcff2cfe1e2bc6397e5e9",
+            "observed_at": "2026-10-21T17:00:00.000Z"
+          }
+        ]
+      },
+      "eventual_managed_paths": [
+        "tests/e2e/playwright/package-lock.json"
+      ],
+      "affected_capabilities": [
+        "playwright-ubuntu-chromium"
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "id": "playwright-lockstep",
+      "type": "must-match",
+      "from": "playwright-package-cohort",
+      "to": "playwright-chromium-bundle",
+      "hard": true,
+      "constraint": "{\"@playwright/test\":\"1.65.0\",\"playwright\":\"1.65.0\",\"playwright-core\":\"1.65.0\"}"
+    },
+    {
+      "id": "playwright-node-ranges",
+      "type": "requires",
+      "from": "playwright-package-cohort",
+      "to": "node-runtime",
+      "hard": true,
+      "constraint": "{\"@axe-core/playwright\":\">=22.12.0\",\"@playwright/test\":\">=20\",\"playwright\":\">=20\",\"playwright-core\":\">=20\"}"
+    },
+    {
+      "id": "playwright-bundled-chromium",
+      "type": "bundles",
+      "from": "playwright-package-cohort",
+      "to": "playwright-chromium-bundle",
+      "hard": true,
+      "constraint": "{\"browser\":\"chromium\",\"package\":\"playwright-core@1.65.0\",\"revision\":\"1200\"}"
+    },
+    {
+      "id": "playwright-axe-alignment",
+      "type": "policy-align",
+      "from": "playwright-package-cohort",
+      "to": "playwright-chromium-bundle",
+      "hard": false,
+      "constraint": "{\"package\":\"@axe-core/playwright@4.15.0\",\"peer\":\"playwright-core@>= 1.0.0\"}"
+    }
+  ]
+}
