@@ -157,6 +157,11 @@ jobs:
             task: e2e:selenium
             diagnostics: tests/e2e/selenium/diagnostics/
             evidence: tests/e2e/selenium/diagnostics/web-calculator/result.png
+            required_files: >-
+              ["tests/e2e/selenium/diagnostics/web-calculator/result.png","tests/e2e/selenium/diagnostics/web-calculator/result.json","tests/e2e/selenium/diagnostics/web-calculator/accessibility.json","tests/e2e/selenium/diagnostics/web-calculator/accessibility-summary.md"]
+            result_reports: >-
+              ["tests/e2e/selenium/diagnostics/web-calculator/result.json"]
+            require_accessibility: true
           - id: cypress-ubuntu-chrome
             position: 2
             total: 4
@@ -168,7 +173,12 @@ jobs:
             task: e2e:cypress
             diagnostics: tests/e2e/cypress/diagnostics/
             evidence: >-
-              tests/e2e/cypress/diagnostics/screenshots/web-calculator.cy.mjs/result.png
+              tests/e2e/cypress/diagnostics/web-calculator/screenshots/web-calculator.cy.mjs/result.png
+            required_files: >-
+              ["tests/e2e/cypress/diagnostics/smoke/run.json","tests/e2e/cypress/diagnostics/smoke/accessibility.json","tests/e2e/cypress/diagnostics/smoke/accessibility.md","tests/e2e/cypress/diagnostics/smoke/screenshots/**/*.png","tests/e2e/cypress/diagnostics/smoke/videos/**/*.mp4","tests/e2e/cypress/diagnostics/web-calculator/run.json","tests/e2e/cypress/diagnostics/web-calculator/accessibility.json","tests/e2e/cypress/diagnostics/web-calculator/accessibility.md","tests/e2e/cypress/diagnostics/web-calculator/screenshots/**/*.png","tests/e2e/cypress/diagnostics/web-calculator/videos/**/*.mp4","tests/e2e/cypress/diagnostics/summary.json","tests/e2e/cypress/diagnostics/summary.md"]
+            result_reports: >-
+              ["tests/e2e/cypress/diagnostics/smoke/run.json","tests/e2e/cypress/diagnostics/web-calculator/run.json"]
+            require_accessibility: true
           - id: playwright-ubuntu-chromium
             position: 3
             total: 4
@@ -179,7 +189,12 @@ jobs:
             environment: web-e2e
             task: e2e:playwright
             diagnostics: tests/e2e/playwright/test-results/
-            evidence: tests/e2e/playwright/test-results/web-calculator-result.png
+            evidence: tests/e2e/playwright/test-results/web-calculator/final.png
+            required_files: >-
+              ["tests/e2e/playwright/test-results/smoke/result.json","tests/e2e/playwright/test-results/smoke/playwright-report.json","tests/e2e/playwright/test-results/smoke/html-report/index.html","tests/e2e/playwright/test-results/smoke/artifacts/**/*.webm","tests/e2e/playwright/test-results/web-calculator/result.json","tests/e2e/playwright/test-results/web-calculator/accessibility.json","tests/e2e/playwright/test-results/web-calculator/accessibility-summary.json","tests/e2e/playwright/test-results/web-calculator/accessibility-summary.md","tests/e2e/playwright/test-results/web-calculator/final.png","tests/e2e/playwright/test-results/web-calculator/playwright-report.json","tests/e2e/playwright/test-results/web-calculator/html-report/index.html","tests/e2e/playwright/test-results/web-calculator/artifacts/**/*.webm"]
+            result_reports: >-
+              ["tests/e2e/playwright/test-results/smoke/result.json","tests/e2e/playwright/test-results/web-calculator/result.json"]
+            require_accessibility: true
           - id: oculix-ubuntu-chromium
             position: 4
             total: 4
@@ -191,6 +206,10 @@ jobs:
             task: e2e:oculix:web-calculator
             diagnostics: oculix-web-calculator-diagnostics/
             evidence: oculix-web-calculator-diagnostics/result.png
+            required_files: >-
+              ["oculix-web-calculator-diagnostics/result.png"]
+            result_reports: "[]"
+            require_accessibility: false
             linux_packages: xdotool
             oculix_chromium_disable_sandbox: "1"
             use_xvfb: true
@@ -244,7 +263,7 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Verify end-user result evidence
+      - name: Validate reports and end-user result evidence
         id: evidence
         if: >-
           ${{
@@ -253,9 +272,13 @@ jobs:
           }}
         shell: bash
         env:
+          E2E_CAPABILITY_ID: ${{ matrix.id }}
           E2E_EVIDENCE_FILE: ${{ matrix.evidence }}
+          E2E_REQUIRED_FILES: ${{ matrix.required_files }}
+          E2E_REQUIRE_ACCESSIBILITY: ${{ matrix.require_accessibility }}
+          E2E_RESULT_REPORTS: ${{ matrix.result_reports }}
         run: |
-          test -s "$E2E_EVIDENCE_FILE"
+          node .github/scripts/validate-e2e-reports.mjs
           printf 'End-user result evidence: %s\n' "$E2E_EVIDENCE_FILE"
 
       - name: Summarize capability result
@@ -288,6 +311,8 @@ jobs:
             printf -- "- Task: \`%s\`\n" "$E2E_TASK_NAME"
             printf -- "- End-user evidence: \`%s\` (\`%s\`)\n" \
               "$E2E_EVIDENCE_FILE" "$E2E_EVIDENCE_RESULT"
+            printf -- "- Report contract: \`%s\`\n" \
+              "$E2E_EVIDENCE_RESULT"
             printf -- "- Result: \`%s\`\n" "$E2E_RESULT"
           } >>"$GITHUB_STEP_SUMMARY"
 
