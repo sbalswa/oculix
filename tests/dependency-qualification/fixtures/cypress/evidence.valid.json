@@ -28,14 +28,12 @@
   "binary": {
     "current": {
       "version": "16.2.0",
-      "locator": "/opt/oculix-evidence/cypress-16.2.0.zip",
-      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "locator": "binaries/cypress-16.2.0.archive",
       "warnings": []
     },
     "candidate": {
       "version": "16.3.0",
-      "locator": "/opt/oculix-evidence/cypress-16.3.0.zip",
-      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "locator": "binaries/cypress-16.3.0.archive",
       "warnings": []
     }
   },
@@ -45,8 +43,7 @@
       "runner": "ubuntu-latest",
       "os": "ubuntu",
       "version": "141.0.7390.54",
-      "path": "/opt/oculix-evidence/google-chrome",
-      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "path": "browser/google-chrome",
       "warnings": []
     }
   }

@@ -6,7 +6,9 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,7 +20,7 @@ import {
   collectCypressCohort,
   createCypressQualificationPlan,
   detectCypressWarnings,
-  qualifyCypressCandidate,
+  qualifyCypressCandidate as qualifyCypressCandidateRaw,
 } from "./cypress-collector.mjs";
 
 const TEST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -27,13 +29,42 @@ const FIXTURE_PATH = resolve(
   REPOSITORY_ROOT,
   "tests/dependency-qualification/fixtures/cypress/evidence.valid.json",
 );
+const FIXTURE_DIRECTORY = dirname(FIXTURE_PATH);
 const PACKAGE_PATH = "tests/e2e/cypress/package.json";
 const LOCK_PATH = "tests/e2e/cypress/package-lock.json";
 const REVISION = "a".repeat(40);
 const GENERATED_AT = "2026-10-21T17:00:00Z";
 
 async function fixture() {
-  return JSON.parse(await readFile(FIXTURE_PATH, "utf8"));
+  const evidence = JSON.parse(await readFile(FIXTURE_PATH, "utf8"));
+  for (const binary of Object.values(evidence.binary)) {
+    binary.locator = resolve(FIXTURE_DIRECTORY, binary.locator);
+    binary.realpath = await realpath(binary.locator);
+    binary.digest =
+      `sha256:${createHash("sha256")
+        .update(await readFile(binary.realpath))
+        .digest("hex")}`;
+  }
+  for (const browser of Object.values(evidence.browser)) {
+    browser.path = resolve(FIXTURE_DIRECTORY, browser.path);
+    browser.realpath = await realpath(browser.path);
+    browser.digest =
+      `sha256:${createHash("sha256")
+        .update(await readFile(browser.realpath))
+        .digest("hex")}`;
+  }
+  return evidence;
+}
+
+async function cleanSourceCheckout() {
+  return { clean: true, revision: REVISION };
+}
+
+function qualifyCypressCandidate(collection, options = {}) {
+  return qualifyCypressCandidateRaw(collection, {
+    inspectSourceCheckout: cleanSourceCheckout,
+    ...options,
+  });
 }
 
 function stableValue(value) {
@@ -185,9 +216,10 @@ test("plans package tests before every catalog-selected Cypress check", async ()
     ["cypress-ubuntu-chrome"],
   );
   assert.equal(plan.cypress_binary.version, "16.3.0");
-  assert.equal(
-    plan.cypress_binary.locator,
-    "/opt/oculix-evidence/cypress-16.3.0.zip",
+  assert.equal(plan.cypress_binary.locator, plan.cypress_binary.realpath);
+  assert.match(
+    plan.cypress_binary.realpath,
+    /fixtures\/cypress\/binaries\/cypress-16\.3\.0\.archive$/u,
   );
   assert.equal(
     plan.cypress_binary.evidence.type,
@@ -201,11 +233,11 @@ test("plans package tests before every catalog-selected Cypress check", async ()
   assert.equal(
     plan.checks.find(({ id }) => id === "cypress-candidate-install")
       .environment.CYPRESS_INSTALL_BINARY,
-    plan.cypress_binary.locator,
+    plan.cypress_binary.realpath,
   );
   assert.equal(
     plan.selected_capabilities[0].browser_evidence.path,
-    "/opt/oculix-evidence/google-chrome",
+    plan.selected_capabilities[0].browser_evidence.realpath,
   );
   assert.match(plan.plan_digest, /^sha256:[0-9a-f]{64}$/u);
   const clonedPlan = createCypressQualificationPlan(
@@ -245,11 +277,11 @@ test("plans package tests before every catalog-selected Cypress check", async ()
     assert.equal(check.environment.E2E_BROWSER, "chrome");
     assert.equal(
       check.environment.CHROME_BIN,
-      plan.selected_capabilities[0].browser_evidence.path,
+      plan.selected_capabilities[0].browser_evidence.realpath,
     );
     assert.equal(
       check.environment.CYPRESS_INSTALL_BINARY,
-      plan.cypress_binary.locator,
+      plan.cypress_binary.realpath,
     );
     assert.ok(!check.arguments.includes("electron"));
   }
@@ -279,6 +311,17 @@ test("strictly binds the entire prescribed qualification plan", async () => {
     },
     (plan) => {
       plan.cypress_binary.digest = `sha256:${"f".repeat(64)}`;
+    },
+    (plan) => {
+      plan.cypress_binary.realpath = "/tmp/forged-cypress";
+    },
+    (plan) => {
+      plan.selected_capabilities[0].browser_evidence.realpath =
+        "/tmp/forged-chrome";
+    },
+    (plan) => {
+      plan.selected_capabilities[0]
+        .accessibility_policy.blockingViolationCount = 99;
     },
     (plan) => {
       plan.node.locked = "26.0.0";
@@ -404,6 +447,19 @@ test("enforces Node ranges and strict prerelease SemVer ordering", async () => {
   );
   assert.equal(nodeResult.qualification_plan, null);
 
+  const invalidAlternative = await fixture();
+  invalidAlternative.npm.cypress.engines.node =
+    ">=24.0.0 || >=26.0.0 definitely-invalid";
+  const invalidAlternativeResult = await collect({
+    evidence: invalidAlternative,
+  });
+  assert.ok(
+    invalidAlternativeResult.observation.disposition.reason_codes.includes(
+      "CYPRESS_NPM_EVIDENCE_UNAVAILABLE",
+    ),
+  );
+  assert.equal(invalidAlternativeResult.qualification_plan, null);
+
   const invalid = await fixture();
   invalid.npm.cypress.version = "16.3.0-beta.01";
   const invalidResult = await collect({ evidence: invalid });
@@ -451,6 +507,49 @@ test("enforces Node ranges and strict prerelease SemVer ordering", async () => {
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
+
+  const largeDirectory = await mkdtemp(
+    join(tmpdir(), "cypress-large-semver-"),
+  );
+  try {
+    await copyCollectorInputs(REPOSITORY_ROOT, largeDirectory);
+    const packagePath = join(largeDirectory, PACKAGE_PATH);
+    const lockPath = join(largeDirectory, LOCK_PATH);
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
+    const lock = JSON.parse(await readFile(lockPath, "utf8"));
+    const currentVersion = "16.3.0-beta.9007199254740993";
+    const candidateVersion = "16.3.0-beta.9007199254740992";
+    packageJson.dependencies.cypress = currentVersion;
+    lock.packages[""].dependencies.cypress = currentVersion;
+    Object.assign(lock.packages["node_modules/cypress"], {
+      version: currentVersion,
+      resolved:
+        `https://registry.npmjs.org/cypress/-/cypress-${currentVersion}.tgz`,
+      integrity: "sha512-current-large-prerelease",
+    });
+    await writeFile(
+      packagePath,
+      `${JSON.stringify(packageJson, null, 2)}\n`,
+    );
+    await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const evidence = await fixture();
+    evidence.npm.cypress.version = candidateVersion;
+    evidence.npm.cypress.dist.tarball =
+      `https://registry.npmjs.org/cypress/-/cypress-${candidateVersion}.tgz`;
+    evidence.binary.current.version = currentVersion;
+    const result = await collect({
+      evidence,
+      repositoryRoot: largeDirectory,
+    });
+    assert.ok(
+      result.observation.disposition.reason_codes.includes(
+        "CYPRESS_NPM_METADATA_REGRESSION",
+      ),
+    );
+    assert.equal(result.qualification_plan, null);
+  } finally {
+    await rm(largeDirectory, { force: true, recursive: true });
+  }
 });
 
 test("detects compound, plural, case-insensitive, and structured warnings", () => {
@@ -476,6 +575,18 @@ test("detects compound, plural, case-insensitive, and structured warnings", () =
       `expected warning containing ${expected}`,
     );
   }
+  assert.deepEqual(
+    detectCypressWarnings('{"warnings":[],"warningCount":0}'),
+    [],
+  );
+  assert.deepEqual(
+    detectCypressWarnings('{\n  "warnings": [],\n  "warningCount": 0\n}'),
+    [],
+  );
+  assert.ok(
+    detectCypressWarnings('{"warningsCount":2,"warnings":[]}')
+      .some((warning) => warning === "warningsCount: 2"),
+  );
 });
 
 async function copyCollectorInputs(source, destination) {
@@ -557,6 +668,31 @@ async function writeArtifact(path, contents = "evidence\n") {
   await writeFile(path, contents);
 }
 
+function accessibilityPolicy() {
+  return {
+    blockingViolationCount: 1,
+    incompleteBlocking: false,
+    levels: ["A", "AA"],
+    standards: ["WCAG 2.0", "WCAG 2.1", "WCAG 2.2"],
+    tags: [
+      "wcag2a",
+      "wcag2aa",
+      "wcag21a",
+      "wcag21aa",
+      "wcag22aa",
+    ],
+  };
+}
+
+function emptyAccessibilityCounts() {
+  return {
+    incomplete: { rules: 0, nodes: 0 },
+    inapplicable: { rules: 0, nodes: 0 },
+    passes: { rules: 0, nodes: 0 },
+    violations: { rules: 0, nodes: 0 },
+  };
+}
+
 function accessibilityResult(plan, scenario) {
   return {
     schemaVersion: 1,
@@ -565,11 +701,16 @@ function accessibilityResult(plan, scenario) {
     axeCoreVersion: plan.packages.find(
       ({ name }) => name === "axe-core",
     ).version,
+    policy: accessibilityPolicy(),
     audits: [
       {
         state: "final",
-        counts: {
-          violations: { rules: 0, nodes: 0 },
+        counts: emptyAccessibilityCounts(),
+        result: {
+          incomplete: [],
+          inapplicable: [],
+          passes: [],
+          violations: [],
         },
       },
     ],
@@ -590,11 +731,10 @@ function scenarioReport(plan, capability, scenario) {
     assertion: { status: "passed" },
     accessibility: {
       status: "passed",
+      blocking: false,
       audits: ["final"],
-      counts: {
-        violations: { rules: 0, nodes: 0 },
-        incomplete: { rules: 0, nodes: 0 },
-      },
+      counts: emptyAccessibilityCounts(),
+      policy: accessibilityPolicy(),
     },
     artifacts: {
       accessibilityJson: `${base}/accessibility.json`,
@@ -632,6 +772,7 @@ async function writeMockArtifacts(
   plan,
   workspaceRoot,
   mutateArtifacts,
+  mutateWrittenArtifacts,
 ) {
   const capability = plan.selected_capabilities[0];
   const reports = Object.fromEntries(
@@ -693,6 +834,7 @@ async function writeMockArtifacts(
       "tests/e2e/cypress/diagnostics/summary.md",
     ),
   );
+  await mutateWrittenArtifacts?.(workspaceRoot, reports, capability);
 }
 
 function checkEvidence(check, sequence = 0) {
@@ -718,11 +860,25 @@ function passingExecutor(plan, observed, overrides = {}) {
     if (check.id === "cypress-candidate-lock") {
       await updateEphemeralLock(plan, context.workspaceRoot);
     }
+    if (
+      check.id === "cypress-candidate-install" &&
+      overrides.skipInstallCache !== true
+    ) {
+      await writeArtifact(
+        join(
+          context.environment.CYPRESS_CACHE_FOLDER,
+          plan.cypress_binary.version,
+          "Cypress",
+        ),
+        "installed binary\n",
+      );
+    }
     if (check.id.endsWith("-web-calculator")) {
       await writeMockArtifacts(
         plan,
         context.workspaceRoot,
         overrides.mutateArtifacts,
+        overrides.mutateWrittenArtifacts,
       );
     }
     const currentSequence = sequence;
@@ -731,16 +887,16 @@ function passingExecutor(plan, observed, overrides = {}) {
       "file-evidence": {
         digest: check.expected_digest,
         locator: check.path,
+        realpath: check.expected_realpath,
         version: check.expected_version,
       },
       "browser-evidence": {
         digest: check.expected_digest,
-        locator: check.expected_path,
+        locator: check.expected_alias,
+        realpath: check.expected_realpath,
         version: check.expected_version,
       },
       "binary-evidence": {
-        digest: check.expected_source_digest,
-        locator: check.expected_source_locator,
         version: check.expected_binary_version,
       },
       "node-evidence": {
@@ -875,22 +1031,19 @@ test("qualification warnings and missing evidence cannot become success", async 
 });
 
 test("binary and external Chrome execution must match reviewed evidence", async () => {
-  for (const checkId of [
-    "cypress-binary-source",
-    "cypress-installed-binary",
-    "cypress-ubuntu-chrome-external-browser",
-  ]) {
-    const collection = await collect();
-    const result = await qualifyCypressCandidate(collection, {
+  const installedCollection = await collect();
+  const installedResult = await qualifyCypressCandidate(
+    installedCollection,
+    {
       executeCheck: passingExecutor(
-        collection.qualification_plan,
+        installedCollection.qualification_plan,
         [],
         {
           binding: (check, binding) =>
-            check.id === checkId
+            check.id === "cypress-installed-binary"
               ? {
                   ...binding,
-                  digest: `sha256:${"f".repeat(64)}`,
+                  version: "99.0.0",
                 }
               : binding,
         },
@@ -898,12 +1051,131 @@ test("binary and external Chrome execution must match reviewed evidence", async 
       generatedAt: "2026-10-21T17:04:30Z",
       materializeWorkspace: materializeQualificationInputs,
       repositoryRoot: REPOSITORY_ROOT,
+    },
+  );
+  assert.equal(installedResult.validation.disposition.state, "blocked");
+  assert.equal(
+    installedResult.checks.find(
+      ({ id }) => id === "cypress-installed-binary",
+    ).status,
+    "fail",
+  );
+
+  const missingProvenanceCollection = await collect();
+  const missingProvenance = await qualifyCypressCandidate(
+    missingProvenanceCollection,
+    {
+      executeCheck: passingExecutor(
+        missingProvenanceCollection.qualification_plan,
+        [],
+        { skipInstallCache: true },
+      ),
+      generatedAt: "2026-10-21T17:04:31Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    },
+  );
+  assert.equal(missingProvenance.validation.disposition.state, "blocked");
+  assert.equal(
+    missingProvenance.checks.find(
+      ({ id }) => id === "cypress-install-provenance",
+    ).status,
+    "fail",
+  );
+
+  const aliasDirectory = await mkdtemp(
+    join(tmpdir(), "cypress-reviewed-alias-"),
+  );
+  try {
+    const evidence = await fixture();
+    const reviewedArchive = evidence.binary.candidate;
+    const archiveAlias = join(aliasDirectory, "cypress.zip");
+    await symlink(reviewedArchive.realpath, archiveAlias);
+    reviewedArchive.locator = archiveAlias;
+    const archiveCollection = await collect({ evidence });
+    await rm(archiveAlias);
+    const replacementArchive = join(aliasDirectory, "replacement.zip");
+    await writeFile(replacementArchive, "unreviewed archive\n");
+    await symlink(replacementArchive, archiveAlias);
+    const archiveResult = await qualifyCypressCandidate(
+      archiveCollection,
+      {
+        executeCheck: passingExecutor(
+          archiveCollection.qualification_plan,
+          [],
+        ),
+        generatedAt: "2026-10-21T17:04:32Z",
+        materializeWorkspace: materializeQualificationInputs,
+        repositoryRoot: REPOSITORY_ROOT,
+      },
+    );
+    assert.equal(
+      archiveResult.validation.disposition.state,
+      "blocked",
+    );
+    assert.equal(
+      archiveResult.checks.find(
+        ({ id }) => id === "cypress-binary-source",
+      ).status,
+      "fail",
+    );
+    assert.equal(
+      archiveResult.checks.find(
+        ({ id }) => id === "cypress-install-provenance",
+      ).status,
+      "fail",
+    );
+
+    const browserEvidence = await fixture();
+    const reviewedBrowser =
+      browserEvidence.browser["cypress-ubuntu-chrome"];
+    const browserAlias = join(aliasDirectory, "google-chrome");
+    await symlink(reviewedBrowser.realpath, browserAlias);
+    reviewedBrowser.path = browserAlias;
+    const collection = await collect({ evidence: browserEvidence });
+    assert.equal(
+      collection.qualification_plan.selected_capabilities[0]
+        .browser_evidence.realpath,
+      reviewedBrowser.realpath,
+    );
+    await rm(browserAlias);
+    const replacement = join(aliasDirectory, "replacement-chrome");
+    await writeFile(
+      replacement,
+      "#!/bin/sh\nprintf '%s\\n' 'Google Chrome 141.0.7390.54'\nchanged\n",
+      { mode: 0o755 },
+    );
+    await symlink(replacement, browserAlias);
+    const observed = [];
+    const result = await qualifyCypressCandidate(collection, {
+      executeCheck: passingExecutor(
+        collection.qualification_plan,
+        observed,
+      ),
+      generatedAt: "2026-10-21T17:04:33Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
     });
     assert.equal(result.validation.disposition.state, "blocked");
     assert.equal(
-      result.checks.find(({ id }) => id === checkId).status,
+      result.checks.find(
+        ({ id }) => id ===
+          "cypress-ubuntu-chrome-external-browser",
+      ).status,
       "fail",
     );
+    assert.ok(
+      observed
+        .filter(({ check }) => check.covers.includes("smoke"))
+        .every(
+          ({ environment }) =>
+            environment.CHROME_BIN === reviewedBrowser.realpath &&
+            environment.CYPRESS_BROWSER_PATH ===
+              reviewedBrowser.realpath,
+        ),
+    );
+  } finally {
+    await rm(aliasDirectory, { force: true, recursive: true });
   }
 });
 
@@ -946,6 +1218,113 @@ test("artifact semantics require complete scenario, browser, Node, accessibility
       ).status,
       "fail",
     );
+  }
+
+  const rawViolationCollection = await collect();
+  const rawViolation = await qualifyCypressCandidate(
+    rawViolationCollection,
+    {
+      executeCheck: passingExecutor(
+        rawViolationCollection.qualification_plan,
+        [],
+        {
+          mutateWrittenArtifacts: async (workspaceRoot) => {
+            const path = join(
+              workspaceRoot,
+              "tests/e2e/cypress/diagnostics/smoke/accessibility.json",
+            );
+            const accessibility = JSON.parse(
+              await readFile(path, "utf8"),
+            );
+            accessibility.audits[0].result.violations = [
+              { id: "forged-violation", nodes: [{}] },
+            ];
+            accessibility.audits[0].counts.violations = {
+              nodes: 1,
+              rules: 1,
+            };
+            await writeFile(
+              path,
+              `${JSON.stringify(accessibility, null, 2)}\n`,
+            );
+          },
+        },
+      ),
+      generatedAt: "2026-10-21T17:04:46Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    },
+  );
+  assert.equal(rawViolation.validation.disposition.state, "blocked");
+  assert.equal(
+    rawViolation.checks.find(
+      ({ id }) => id === "cypress-ubuntu-chrome-artifact-semantics",
+    ).status,
+    "fail",
+  );
+});
+
+test("rejects artifact symlinks and realpath escapes", async () => {
+  const outsideDirectory = await mkdtemp(
+    join(tmpdir(), "cypress-outside-artifact-"),
+  );
+  try {
+    const outsideArtifact = join(outsideDirectory, "outside.png");
+    await writeFile(outsideArtifact, "outside\n");
+    const collection = await collect();
+    const result = await qualifyCypressCandidate(collection, {
+      executeCheck: passingExecutor(
+        collection.qualification_plan,
+        [],
+        {
+          mutateWrittenArtifacts: async (
+            workspaceRoot,
+            reports,
+          ) => {
+            const screenshot = join(
+              workspaceRoot,
+              reports.smoke.artifacts.screenshots[0],
+            );
+            await rm(screenshot);
+            await symlink(outsideArtifact, screenshot);
+          },
+        },
+      ),
+      generatedAt: "2026-10-21T17:04:47Z",
+      materializeWorkspace: materializeQualificationInputs,
+      repositoryRoot: REPOSITORY_ROOT,
+    });
+    assert.equal(result.validation.disposition.state, "blocked");
+    assert.equal(
+      result.checks.find(
+        ({ id }) => id ===
+          "cypress-ubuntu-chrome-artifact-semantics",
+      ).status,
+      "fail",
+    );
+  } finally {
+    await rm(outsideDirectory, { force: true, recursive: true });
+  }
+});
+
+test("requires a clean source checkout at the exact claimed revision before copying", async () => {
+  for (const checkout of [
+    { clean: false, revision: REVISION },
+    { clean: true, revision: "b".repeat(40) },
+  ]) {
+    const collection = await collect();
+    let copied = false;
+    await assert.rejects(
+      qualifyCypressCandidate(collection, {
+        inspectSourceCheckout: async () => checkout,
+        materializeWorkspace: async () => {
+          copied = true;
+        },
+        repositoryRoot: REPOSITORY_ROOT,
+      }),
+      /clean source checkout/u,
+    );
+    assert.equal(copied, false);
   }
 });
 
