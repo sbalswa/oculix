@@ -1,0 +1,20 @@
+{
+  "name": "oculix-cypress-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node harness.mjs smoke",
+    "test": "node --test harness.test.mjs",
+    "web-calculator": "node harness.mjs web-calculator"
+  },
+  "dependencies": {
+    "cypress": "16.2.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "allowScripts": {
+    "cypress@16.2.0": true
+  }
+}

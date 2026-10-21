@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Run all Cypress E2E scenarios in order"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+exec mise -E web-e2e exec -- \
+  node tests/e2e/cypress/task.mjs all "$@"
