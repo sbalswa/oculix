@@ -10,7 +10,6 @@ import {
   readdir,
   realpath,
   rm,
-  stat,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
@@ -247,9 +246,10 @@ function comparePrerelease(left, right) {
     const leftNumeric = /^\d+$/u.test(left[index]);
     const rightNumeric = /^\d+$/u.test(right[index]);
     if (leftNumeric && rightNumeric) {
-      const difference = Number(left[index]) - Number(right[index]);
-      if (difference !== 0) {
-        return Math.sign(difference);
+      const leftValue = BigInt(left[index]);
+      const rightValue = BigInt(right[index]);
+      if (leftValue !== rightValue) {
+        return leftValue < rightValue ? -1 : 1;
       }
     } else if (leftNumeric !== rightNumeric) {
       return leftNumeric ? -1 : 1;
@@ -1642,17 +1642,30 @@ async function defaultCreateWorkspace() {
   return mkdtemp(join(tmpdir(), "oculix-selenium-qualification-"));
 }
 
-async function defaultGitState(repositoryRoot) {
-  const { stdout } = await execFileAsync(
-    "git",
-    ["status", "--porcelain=v1", "--untracked-files=all"],
-    {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-      maxBuffer: 1024 * 1024,
-    },
-  );
-  return stdout;
+async function checkoutState(repositoryRoot) {
+  const options = {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  };
+  const [{ stdout: head }, { stdout: status }] = await Promise.all([
+    execFileAsync("git", ["rev-parse", "--verify", "HEAD"], options),
+    execFileAsync(
+      "git",
+      [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "-z",
+      ],
+      options,
+    ),
+  ]);
+  return {
+    head: head.trim(),
+    status,
+  };
 }
 
 async function runRawCommand(step, { environment, workspaceRoot }) {
@@ -1703,10 +1716,12 @@ async function runRawCommand(step, { environment, workspaceRoot }) {
 }
 
 function warningLines(output) {
+  const warningPattern =
+    /(?:\bwarn(?:ing)?s?\b|\b[A-Za-z][A-Za-z0-9_-]*warnings?\b)/iu;
   return output
     .split(/\r?\n/u)
     .map((line) => line.trim())
-    .filter((line) => /\bwarn(?:ing)?\b/iu.test(line) && line.length > 0);
+    .filter((line) => warningPattern.test(line) && line.length > 0);
 }
 
 function commandEvidence(
@@ -1813,6 +1828,7 @@ async function executeControlledStep(
 ) {
   const startedAt = timestamp(now());
   let raw;
+  let commandOutput = "";
   const identity =
     step.kind === "browser-identity"
       ? plan.runner.browser
@@ -1841,6 +1857,7 @@ async function executeControlledStep(
       }),
       step.id,
     );
+    commandOutput = `${raw.stdout}${raw.stderr}`;
   } catch (error) {
     raw = {
       exitCode: 1,
@@ -1881,7 +1898,7 @@ async function executeControlledStep(
     scenario: step.scenario,
     status:
       raw.exitCode === 0 && identityMatches ? "pass" : "fail",
-    warnings: sortedUnique(warningLines(output)),
+    warnings: sortedUnique(warningLines(commandOutput)),
     evidence: [
       commandEvidence(step, plan, raw, startedAt, completedAt),
     ],
@@ -2058,12 +2075,34 @@ async function filesForPattern(pattern, workspaceRoot) {
 }
 
 async function nonemptyFile(path, workspaceRoot) {
-  const absolute = resolve(workspaceRoot, path);
-  const metadata = await stat(absolute);
+  const root = resolve(workspaceRoot);
+  const absolute = resolve(root, path);
+  if (!isWithin(root, absolute)) {
+    throw new Error(`Artifact ${path} escapes the ephemeral workspace`);
+  }
+  const rootMetadata = await lstat(root);
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+    throw new Error("Ephemeral workspace must be a real directory");
+  }
+  const canonicalRoot = await realpath(root);
+  let current = root;
+  const parts = relative(root, absolute).split(sep).filter(Boolean);
+  for (const part of parts) {
+    current = join(current, part);
+    const entry = await lstat(current);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Artifact ${path} must not traverse a symlink`);
+    }
+  }
+  const canonical = await realpath(absolute);
+  if (!isWithin(canonicalRoot, canonical)) {
+    throw new Error(`Artifact ${path} resolves outside the ephemeral workspace`);
+  }
+  const metadata = await lstat(canonical);
   if (!metadata.isFile() || metadata.size === 0) {
     throw new Error(`Artifact ${path} must be a nonempty file`);
   }
-  return readFile(absolute);
+  return readFile(canonical);
 }
 
 function reportCapabilityId(report) {
@@ -2079,10 +2118,8 @@ async function inspectCapabilityArtifacts(capability, workspaceRoot) {
     }
     matches.forEach((path) => paths.add(path));
   }
-  if (!paths.has(capability.evidence)) {
-    await nonemptyFile(capability.evidence, workspaceRoot);
-    paths.add(capability.evidence);
-  }
+  await nonemptyFile(capability.evidence, workspaceRoot);
+  paths.add(capability.evidence);
   if (
     capability.result_reports.length !== capability.scenarios.length ||
     new Set(capability.result_reports).size !== capability.result_reports.length
@@ -2268,7 +2305,6 @@ export async function qualifySeleniumCandidate(
     generatedAt = new Date().toISOString(),
     materializeWorkspace = copyRepository,
     now = () => new Date(),
-    readGitState = defaultGitState,
     runCommand = runRawCommand,
   } = {},
 ) {
@@ -2279,8 +2315,18 @@ export async function qualifySeleniumCandidate(
       await readFile(resolve(root, CATALOG_PATH), "utf8"),
       CATALOG_PATH,
     );
+  const checkoutBefore = await checkoutState(root);
+  if (checkoutBefore.head !== observation.repository.revision) {
+    throw new Error(
+      "Source checkout HEAD must exactly match observation repository.revision",
+    );
+  }
+  if (checkoutBefore.status !== "") {
+    throw new Error(
+      "Source checkout must be clean across tracked, untracked, and ignored files",
+    );
+  }
   const sourceBefore = await sourceState(root);
-  const gitBefore = await readGitState(root);
   await verifySourcePackageBinding(observation, root);
   const temporaryRoot = resolve(await createWorkspace());
   if (isWithin(root, temporaryRoot) || isWithin(temporaryRoot, root)) {
@@ -2517,13 +2563,14 @@ export async function qualifySeleniumCandidate(
     await rm(temporaryRoot, { force: true, recursive: true });
   }
 
-  const [sourceAfter, gitAfter] = await Promise.all([
+  const [sourceAfter, checkoutAfter] = await Promise.all([
     sourceState(root),
-    readGitState(root),
+    checkoutState(root),
   ]);
   if (
     stableJson(sourceBefore) !== stableJson(sourceAfter) ||
-    gitBefore !== gitAfter
+    checkoutAfter.head !== observation.repository.revision ||
+    checkoutAfter.status !== ""
   ) {
     throw new Error("Selenium qualification changed source Git state");
   }
@@ -2535,12 +2582,12 @@ export async function qualifySeleniumCandidate(
   const guardCompletedAt = timestamp(now());
   const guardEvidence = {
     type: "qualification-git-state",
-    locator: "git-status:unchanged",
+    locator: "git-checkout:exact-clean",
     revision: observation.repository.revision,
     digest: hash({
       candidate_digest: execution.plan.candidate_digest,
-      before: gitBefore,
-      after: gitAfter,
+      checkout_before: checkoutBefore,
+      checkout_after: checkoutAfter,
       source_before: sourceBefore,
       source_after: sourceAfter,
     }),
