@@ -1,0 +1,173 @@
+name: Demand-driven E2E selectors
+run-name: E2E selectors for ${{ github.event.pull_request.number || github.ref_name }}
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - closed
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: Catalog selection preset
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - smoke
+          - full
+          - custom
+      selectors:
+        description: Comma/newline-separated exact IDs for preset=custom
+        required: false
+        type: string
+      include_experimental:
+        description: Permit exact experimental capability selectors
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    e2e-selectors-${{
+      (
+        github.event_name == 'pull_request' &&
+        (
+          github.event.action == 'labeled' ||
+          github.event.action == 'unlabeled'
+        ) &&
+        !startsWith(github.event.label.name, 'ci:e2e:')
+      ) &&
+      format('ignored-{0}', github.run_id) ||
+      github.event.pull_request.number ||
+      github.ref
+    }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan selected E2E capabilities
+    if: >-
+      ${{
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.preset != 'none'
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.action != 'closed' &&
+          contains(
+            toJSON(github.event.pull_request.labels.*.name),
+            '"ci:e2e:'
+          ) &&
+          (
+            (
+              github.event.action != 'labeled' &&
+              github.event.action != 'unlabeled'
+            ) ||
+            startsWith(github.event.label.name, 'ci:e2e:')
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MISE_ENV: web-e2e
+      MISE_LOCKED: "1"
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
+      mise_version: ${{ steps.context.outputs.mise_version }}
+      validation_ref: ${{ steps.context.outputs.validation_ref }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read validation context
+        id: context
+        shell: bash
+        run: |
+          version="$(
+            sed -n 's/^min_version = "\([^"]*\)"$/\1/p' mise/config.toml
+          )"
+          if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){2,3}$ ]]; then
+            echo "mise/config.toml must contain one numeric min_version." >&2
+            exit 1
+          fi
+          printf 'mise_version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          printf 'validation_ref=%s\n' "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned planner toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ steps.context.outputs.mise_version }}
+          install_args: --locked
+
+      - name: Validate and expand selectors
+        id: plan
+        shell: bash
+        env:
+          E2E_INCLUDE_EXPERIMENTAL: >-
+            ${{ inputs.include_experimental || false }}
+          E2E_LABELS: >-
+            ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          E2E_PRESET: ${{ inputs.preset || 'none' }}
+          E2E_SELECTION_MODE: >-
+            ${{
+              github.event_name == 'pull_request' &&
+              'labels' ||
+              'dispatch'
+            }}
+          E2E_SELECTORS: ${{ inputs.selectors || '' }}
+        run: |
+          mise exec -- node .github/scripts/plan-e2e.mjs \
+            >>"$GITHUB_OUTPUT"
+
+  execute:
+    name: E2E ${{ matrix.id }}
+    if: >-
+      ${{
+        needs.plan.result == 'success' &&
+        needs.plan.outputs.count != '' &&
+        needs.plan.outputs.count != '0' &&
+        needs.plan.outputs.matrix != ''
+      }}
+    needs: plan
+    uses: $/.github/workflows/e2e-executor.yml
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    with:
+      ref: ${{ needs.plan.outputs.validation_ref }}
+      mise_version: ${{ needs.plan.outputs.mise_version }}
+      id: ${{ matrix.id }}
+      position: ${{ matrix.position }}
+      total: ${{ matrix.total }}
+      tool: ${{ matrix.tool }}
+      runner: ${{ matrix.runner }}
+      os: ${{ matrix.os }}
+      browser: ${{ matrix.browser }}
+      environment: ${{ matrix.environment }}
+      task: ${{ matrix.task }}
+      diagnostics: ${{ matrix.diagnostics }}
+      evidence: ${{ matrix.evidence }}
+      required_files: ${{ matrix.required_files }}
+      result_reports: ${{ matrix.result_reports }}
+      require_accessibility: ${{ matrix.require_accessibility }}
+      linux_packages: ${{ matrix.linux_packages }}
+      oculix_chromium_disable_sandbox: >-
+        ${{ matrix.oculix_chromium_disable_sandbox }}
+      use_xvfb: ${{ matrix.use_xvfb }}
