@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -305,8 +312,214 @@ test("lock platform labels must match unique effective artifacts",
         repository: REPOSITORY,
         repositoryRoot: directory,
       }),
-      /duplicate Node platforms|duplicate effective Node artifacts/,
+      /duplicate effective Node artifacts/,
     );
+  });
+
+test("platform headers accept comments but reject unsupported syntax and case",
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "node-platform-headers-"));
+    context.after(() => rm(directory, { force: true, recursive: true }));
+    const config = await fixture("config.web-e2e.toml");
+    const lock = await fixture("mise.web-e2e.lock");
+    await writeFile(join(directory, "config.toml"), config);
+
+    const commented = lock.replace(
+      /^(\[tools\.node\."platforms\.[^"]+"\])$/gmu,
+      "$1 # supported lock target",
+    );
+    await writeFile(join(directory, "commented.lock"), commented);
+    const observation = await collectNodeObservation({
+      capabilityCatalogPath: CAPABILITY_PATH,
+      configPath: "config.toml",
+      generatedAt: GENERATED_AT,
+      lockPath: "commented.lock",
+      releaseMetadata: releaseMetadata(
+        await fixture("releases.current.json"),
+      ),
+      repository: REPOSITORY,
+      repositoryRoot: directory,
+    });
+    assert.equal(
+      component(observation, "node-runtime").current.evidence.filter(
+        ({ type }) => type === "locked-release-artifact",
+      ).length,
+      5,
+    );
+
+    const invalidLocks = [
+      lock.replace(
+        'platforms.windows-x64"',
+        'platforms.Windows-X64"',
+      ),
+      lock.replace(
+        '[tools.node."platforms.windows-x64"]',
+        "[tools.node.platforms.windows-x64]",
+      ),
+      lock.replace(
+        '[tools.node."platforms.windows-x64"]',
+        '[tools . node . "platforms.windows-x64"]',
+      ),
+      lock.replace(
+        '[tools.node."platforms.windows-x64"]',
+        '[tools.nod."platforms.windows-x64"]',
+      ),
+      lock.replace(
+        '[tools.node."platforms.windows-x64"]',
+        '[tools.node."platforms.windows-x64"',
+      ),
+    ];
+    for (const [index, invalid] of invalidLocks.entries()) {
+      const path = `invalid-${index}.lock`;
+      await writeFile(join(directory, path), invalid);
+      await assert.rejects(
+        collectNodeObservation({
+          capabilityCatalogPath: CAPABILITY_PATH,
+          configPath: "config.toml",
+          generatedAt: GENERATED_AT,
+          lockPath: path,
+          releaseMetadata: releaseMetadata(
+            await fixture("releases.current.json"),
+          ),
+          repository: REPOSITORY,
+          repositoryRoot: directory,
+        }),
+        /unsupported Node header|malformed header/,
+      );
+    }
+  });
+
+test("lock artifact URLs require the exact canonical Node pathname",
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "node-artifact-path-"));
+    context.after(() => rm(directory, { force: true, recursive: true }));
+    await Promise.all([
+      writeFile(
+        join(directory, "config.toml"),
+        await fixture("config.web-e2e.toml"),
+      ),
+      writeFile(
+        join(directory, "noncanonical.lock"),
+        (await fixture("mise.web-e2e.lock")).replace(
+          "https://nodejs.org/dist/v24.22.0/" +
+            "node-v24.22.0-linux-arm64.tar.gz",
+          "https://nodejs.org/mirror/dist/v24.22.0/" +
+            "node-v24.22.0-linux-arm64.tar.gz",
+        ),
+      ),
+    ]);
+
+    await assert.rejects(
+      collectNodeObservation({
+        capabilityCatalogPath: CAPABILITY_PATH,
+        configPath: "config.toml",
+        generatedAt: GENERATED_AT,
+        lockPath: "noncanonical.lock",
+        releaseMetadata: releaseMetadata(
+          await fixture("releases.current.json"),
+        ),
+        repository: REPOSITORY,
+        repositoryRoot: directory,
+      }),
+      /URL does not bind Node 24\.22\.0/,
+    );
+  });
+
+test("duplicate or conflicting keys fail in tool and platform blocks",
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "node-duplicate-keys-"));
+    context.after(() => rm(directory, { force: true, recursive: true }));
+    const lock = await fixture("mise.web-e2e.lock");
+    await writeFile(
+      join(directory, "config.toml"),
+      await fixture("config.web-e2e.toml"),
+    );
+    const invalidLocks = [
+      lock.replace(
+        'version = "24.22.0"',
+        'version = "24.22.0"\nversion = "24.22.0"',
+      ),
+      lock.replace(
+        'version = "24.22.0"',
+        'version = "24.22.0"\nversion = "24.21.0"',
+      ),
+      lock.replace(
+        "checksum = " +
+          '"sha256:f9683a19877e12a9b167305c8db71040d812876359de21f0d2e97c3f321f80c3"',
+        "checksum = " +
+          '"sha256:f9683a19877e12a9b167305c8db71040d812876359de21f0d2e97c3f321f80c3"' +
+          "\nchecksum = " +
+          '"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+      ),
+      lock.replace(
+        'url = "https://nodejs.org/dist/v24.22.0/' +
+          'node-v24.22.0-win-x64.zip"',
+        'url = "https://nodejs.org/dist/v24.22.0/' +
+          'node-v24.22.0-win-x64.zip"\n' +
+          'url = "https://nodejs.org/dist/v24.22.0/' +
+          'node-v24.22.0-win-arm64.zip"',
+      ),
+    ];
+
+    for (const [index, invalid] of invalidLocks.entries()) {
+      const path = `duplicate-${index}.lock`;
+      await writeFile(join(directory, path), invalid);
+      await assert.rejects(
+        collectNodeObservation({
+          capabilityCatalogPath: CAPABILITY_PATH,
+          configPath: "config.toml",
+          generatedAt: GENERATED_AT,
+          lockPath: path,
+          releaseMetadata: releaseMetadata(
+            await fixture("releases.current.json"),
+          ),
+          repository: REPOSITORY,
+          repositoryRoot: directory,
+        }),
+        /duplicate key (version|checksum|url)/,
+      );
+    }
+  });
+
+test("repository-file evidence rejects symlinks escaping repositoryRoot",
+  async (context) => {
+    const outside = await mkdtemp(join(tmpdir(), "node-outside-"));
+    context.after(() => rm(outside, { force: true, recursive: true }));
+    const config = await fixture("config.web-e2e.toml");
+    const lock = await fixture("mise.web-e2e.lock");
+    await Promise.all([
+      writeFile(join(outside, "config.toml"), config),
+      writeFile(join(outside, "runtime.lock"), lock),
+    ]);
+
+    for (const escaped of ["config", "lock"]) {
+      const directory = await mkdtemp(join(tmpdir(), `node-${escaped}-link-`));
+      context.after(() => rm(directory, { force: true, recursive: true }));
+      const configPath = escaped === "config" ? "config-link.toml" : "config.toml";
+      const lockPath = escaped === "lock" ? "lock-link.toml" : "runtime.lock";
+      if (escaped === "config") {
+        await symlink(join(outside, "config.toml"), join(directory, configPath));
+        await writeFile(join(directory, lockPath), lock);
+      } else {
+        await writeFile(join(directory, configPath), config);
+        await symlink(join(outside, "runtime.lock"), join(directory, lockPath));
+      }
+
+      await assert.rejects(
+        collectNodeObservation({
+          capabilityCatalogPath: CAPABILITY_PATH,
+          configPath,
+          generatedAt: GENERATED_AT,
+          lockPath,
+          releaseMetadata: releaseMetadata(
+            await fixture("releases.current.json"),
+          ),
+          repository: REPOSITORY,
+          repositoryRoot: directory,
+        }),
+        /escapes repositoryRoot through a symlink/,
+      );
+    }
   });
 
 test("configurable repository paths and release locators remain evidence",

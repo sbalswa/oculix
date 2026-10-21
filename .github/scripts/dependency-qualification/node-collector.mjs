@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
@@ -127,22 +127,106 @@ function parseRequestedChannel(config, configRepositoryPath) {
   return values[0];
 }
 
-function parseTomlString(block, key, context) {
-  const expression = new RegExp(
-    `^\\s*${key}\\s*=\\s*"([^"]+)"\\s*(?:#.*)?$`,
-    "mu",
-  );
-  const match = expression.exec(block);
+function scanTomlHeaders(lock, lockRepositoryPath) {
+  const headers = [];
+  let lineStart = 0;
+  while (lineStart < lock.length) {
+    const newline = lock.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? lock.length : newline;
+    const line = lock.slice(lineStart, lineEnd).replace(/\r$/u, "");
+    if (line.trimStart().startsWith("[")) {
+      const match =
+        /^\s*(\[\[[^\]]+\]\]|\[[^\]]+\])\s*(?:#.*)?$/u.exec(line);
+      if (match === null) {
+        throw new Error(`${lockRepositoryPath} contains a malformed header`);
+      }
+      const token = match[1];
+      const array = token.startsWith("[[");
+      const body = token.slice(array ? 2 : 1, array ? -2 : -1);
+      const compactBody = body.replace(/\s+/gu, "").toLowerCase();
+      const nodeLike =
+        compactBody.startsWith("tools.node") ||
+        compactBody.includes("platforms.");
+      let kind = "other";
+      let platform = null;
+      if (array && body === "tools.node") {
+        kind = "node-tool";
+      } else if (!array) {
+        const platformMatch =
+          /^tools\.node\."platforms\.([a-z0-9-]+)"$/u.exec(body);
+        if (platformMatch !== null) {
+          kind = "node-platform";
+          platform = platformMatch[1];
+        } else if (nodeLike) {
+          throw new Error(
+            `${lockRepositoryPath} contains an unsupported Node header ` +
+              token,
+          );
+        }
+      } else if (nodeLike) {
+        throw new Error(
+          `${lockRepositoryPath} contains an unsupported Node header ${token}`,
+        );
+      }
+      headers.push({
+        contentStart: newline === -1 ? lock.length : newline + 1,
+        kind,
+        platform,
+        start: lineStart,
+      });
+    }
+    if (newline === -1) {
+      break;
+    }
+    lineStart = newline + 1;
+  }
+  return headers.map((header, index) => ({
+    ...header,
+    contentEnd:
+      index + 1 < headers.length ? headers[index + 1].start : lock.length,
+  }));
+}
+
+function parseTomlBlock(block, context, allowedKeys) {
+  const entries = new Map();
+  for (const line of block.split(/\r?\n/u)) {
+    if (line.trim() === "" || line.trimStart().startsWith("#")) {
+      continue;
+    }
+    const match = /^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*?)\s*$/u.exec(line);
+    if (match === null) {
+      throw new Error(`${context} contains a malformed entry`);
+    }
+    const [, key, value] = match;
+    if (!allowedKeys.has(key)) {
+      throw new Error(`${context} contains unsupported key ${key}`);
+    }
+    if (entries.has(key)) {
+      throw new Error(`${context} contains duplicate key ${key}`);
+    }
+    entries.set(key, value);
+  }
+  return entries;
+}
+
+function parseTomlString(entries, key, context) {
+  const value = entries.get(key);
+  const match =
+    typeof value === "string"
+      ? /^"([^"]+)"\s*(?:#.*)?$/u.exec(value)
+      : null;
   if (match === null) {
     throw new Error(`${context} must contain ${key}`);
   }
   return match[1];
 }
 
-function parseSpecifierArray(block, lockRepositoryPath) {
-  const match = /^\s*specifiers\s*=\s*(\[[^\n]+\])\s*(?:#.*)?$/mu.exec(
-    block,
-  );
+function parseSpecifierArray(entries, lockRepositoryPath) {
+  const value = entries.get("specifiers");
+  const match =
+    typeof value === "string"
+      ? /^(\[[^\n]+\])\s*(?:#.*)?$/u.exec(value)
+      : null;
   if (match === null) {
     throw new Error(`${lockRepositoryPath} must contain Node specifiers`);
   }
@@ -194,40 +278,35 @@ function artifactIdentity(filename, lockRepositoryPath) {
 }
 
 function parseLock(lock, requestedChannel, lockRepositoryPath) {
-  const toolHeader = "[[tools.node]]";
-  const starts = [];
-  let offset = lock.indexOf(toolHeader);
-  while (offset !== -1) {
-    starts.push(offset);
-    offset = lock.indexOf(toolHeader, offset + toolHeader.length);
-  }
-  if (starts.length !== 1) {
+  const headers = scanTomlHeaders(lock, lockRepositoryPath);
+  const toolHeaders = headers.filter(({ kind }) => kind === "node-tool");
+  if (toolHeaders.length !== 1) {
     throw new Error(
       `${lockRepositoryPath} must contain one Node tool record`,
     );
   }
 
-  const toolStart = starts[0] + toolHeader.length;
-  const nextHeader = lock.indexOf("\n[", toolStart);
-  const toolBlock = lock.slice(
-    toolStart,
-    nextHeader === -1 ? lock.length : nextHeader,
+  const toolHeader = toolHeaders[0];
+  const toolEntries = parseTomlBlock(
+    lock.slice(toolHeader.contentStart, toolHeader.contentEnd),
+    `${lockRepositoryPath} Node tool record`,
+    new Set(["version", "backend", "specifiers"]),
   );
   const version = parseTomlString(
-    toolBlock,
+    toolEntries,
     "version",
     lockRepositoryPath,
   );
   parseSemver(version, `${lockRepositoryPath} Node version`);
   const backend = parseTomlString(
-    toolBlock,
+    toolEntries,
     "backend",
     lockRepositoryPath,
   );
   if (backend !== "core:node") {
     throw new Error(`${lockRepositoryPath} Node backend must be core:node`);
   }
-  const specifiers = parseSpecifierArray(toolBlock, lockRepositoryPath);
+  const specifiers = parseSpecifierArray(toolEntries, lockRepositoryPath);
   if (!specifiers.includes(requestedChannel)) {
     throw new Error(
       `${lockRepositoryPath} does not resolve requested channel ` +
@@ -242,28 +321,29 @@ function parseLock(lock, requestedChannel, lockRepositoryPath) {
   }
 
   const platforms = [];
-  const platformExpression =
-    /^\[tools\.node\."platforms\.([a-z0-9-]+)"\]\s*$/gmu;
-  const matches = [...lock.matchAll(platformExpression)];
-  for (const [index, match] of matches.entries()) {
-    const platform = match[1];
+  const platformHeaders = headers.filter(
+    ({ kind }) => kind === "node-platform",
+  );
+  for (const header of platformHeaders) {
+    const platform = header.platform;
     if (!PLATFORM_PATTERN.test(platform)) {
       throw new Error(
         `${lockRepositoryPath} contains invalid platform ${platform}`,
       );
     }
-    const blockStart = match.index + match[0].length;
-    const blockEnd =
-      index + 1 < matches.length ? matches[index + 1].index : lock.length;
-    const block = lock.slice(blockStart, blockEnd);
-    const checksum = parseTomlString(block, "checksum", platform);
+    const entries = parseTomlBlock(
+      lock.slice(header.contentStart, header.contentEnd),
+      `${lockRepositoryPath} platform ${platform}`,
+      new Set(["checksum", "url"]),
+    );
+    const checksum = parseTomlString(entries, "checksum", platform);
     if (!checksum.startsWith("sha256:") ||
         !SHA256_PATTERN.test(checksum.slice("sha256:".length))) {
       throw new Error(
         `${lockRepositoryPath} contains invalid ${platform} checksum`,
       );
     }
-    const url = parseTomlString(block, "url", platform);
+    const url = parseTomlString(entries, "url", platform);
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
@@ -274,10 +354,11 @@ function parseLock(lock, requestedChannel, lockRepositoryPath) {
     }
     const filename = parsedUrl.pathname.split("/").at(-1);
     if (
-      parsedUrl.protocol !== "https:" ||
-      parsedUrl.hostname !== "nodejs.org" ||
-      !parsedUrl.pathname.includes(`/dist/v${version}/`) ||
-      !filename.includes(`node-v${version}-`) ||
+      parsedUrl.origin !== "https://nodejs.org" ||
+      parsedUrl.username !== "" ||
+      parsedUrl.password !== "" ||
+      parsedUrl.pathname !== `/dist/v${version}/${filename}` ||
+      !filename.startsWith(`node-v${version}-`) ||
       parsedUrl.search !== "" ||
       parsedUrl.hash !== ""
     ) {
@@ -308,16 +389,16 @@ function parseLock(lock, requestedChannel, lockRepositoryPath) {
   platforms.sort((left, right) =>
     compareLexically(left.platform, right.platform),
   );
-  if (new Set(platforms.map(({ platform }) => platform)).size !==
-      platforms.length) {
-    throw new Error(
-      `${lockRepositoryPath} contains duplicate Node platforms`,
-    );
-  }
   if (new Set(platforms.map(({ filename }) => filename)).size !==
       platforms.length) {
     throw new Error(
       `${lockRepositoryPath} contains duplicate effective Node artifacts`,
+    );
+  }
+  if (new Set(platforms.map(({ platform }) => platform)).size !==
+      platforms.length) {
+    throw new Error(
+      `${lockRepositoryPath} contains duplicate Node platforms`,
     );
   }
   return { platforms, version };
@@ -501,22 +582,29 @@ function selectCandidate(releases, requestedChannel, currentVersion, platforms,
     null;
 }
 
-function repositoryFileLocation(repositoryRoot, configuredPath, name) {
+function pathInside(root, target) {
+  const path = relative(root, target);
+  return path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+
+async function repositoryFileLocation(repositoryRoot, configuredPath, name) {
   if (typeof configuredPath !== "string" || configuredPath === "") {
     throw new Error(`${name} must be a nonempty path`);
   }
   const root = resolve(repositoryRoot);
   const absolutePath = resolve(root, configuredPath);
-  const repositoryPath = relative(root, absolutePath).split(sep).join("/");
-  if (
-    repositoryPath === "" ||
-    repositoryPath === ".." ||
-    repositoryPath.startsWith("../") ||
-    isAbsolute(repositoryPath)
-  ) {
+  if (!pathInside(root, absolutePath) || absolutePath === root) {
     throw new Error(`${name} must resolve inside the repository`);
   }
-  return { absolutePath, repositoryPath };
+  const [realRoot, realFile] = await Promise.all([
+    realpath(root),
+    realpath(absolutePath),
+  ]);
+  if (!pathInside(realRoot, realFile) || realFile === realRoot) {
+    throw new Error(`${name} escapes repositoryRoot through a symlink`);
+  }
+  const repositoryPath = relative(root, absolutePath).split(sep).join("/");
+  return { readPath: realFile, repositoryPath };
 }
 
 function repositoryFileEvidence(path, content, revision, observedAt) {
@@ -717,19 +805,13 @@ export async function collectNodeObservation({
   repositoryRoot = process.cwd(),
 } = {}) {
   const normalizedRepository = normalizeRepository(repository);
-  const configLocation = repositoryFileLocation(
-    repositoryRoot,
-    configPath,
-    "configPath",
-  );
-  const lockLocation = repositoryFileLocation(
-    repositoryRoot,
-    lockPath,
-    "lockPath",
-  );
+  const [configLocation, lockLocation] = await Promise.all([
+    repositoryFileLocation(repositoryRoot, configPath, "configPath"),
+    repositoryFileLocation(repositoryRoot, lockPath, "lockPath"),
+  ]);
   const [config, lock, capabilityCatalog] = await Promise.all([
-    readFile(configLocation.absolutePath, "utf8"),
-    readFile(lockLocation.absolutePath, "utf8"),
+    readFile(configLocation.readPath, "utf8"),
+    readFile(lockLocation.readPath, "utf8"),
     readCapabilityCatalog(resolve(repositoryRoot, capabilityCatalogPath)),
   ]);
   for (const capabilityId of NODE_CAPABILITY_IDS) {
