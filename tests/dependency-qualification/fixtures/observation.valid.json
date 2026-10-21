@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "kind": "observation",
+  "generated_at": "2026-10-21T16:00:00Z",
+  "repository": {
+    "name": "sbalswa/oculix",
+    "revision": "15096fea5e27f02d5cd3e52b31c55df7b263be0a"
+  },
+  "capability_catalog": {
+    "schema_version": 1,
+    "digest": "sha256:8bf5613768ba1f8f6cd2a2ff4ef00f05978f47499c40d99c07692a750ae8ec9b"
+  },
+  "provider_id": "node",
+  "disposition": {
+    "state": "candidate",
+    "reason_codes": [
+      "CANDIDATE_AVAILABLE"
+    ]
+  },
+  "components": [
+    {
+      "id": "node-runtime",
+      "lane": "node",
+      "ecosystem": "mise",
+      "current": {
+        "version": "24.22.0",
+        "evidence": [
+          {
+            "type": "repository-file",
+            "locator": "mise/mise.web-e2e.lock",
+            "revision": "15096fea5e27f02d5cd3e52b31c55df7b263be0a",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "observed_at": "2026-10-21T16:00:00Z"
+          }
+        ]
+      },
+      "candidate": {
+        "version": "26.0.0",
+        "evidence": [
+          {
+            "type": "upstream-release",
+            "locator": "https://nodejs.org/dist/v26.0.0/",
+            "revision": "v26.0.0",
+            "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "observed_at": "2026-10-21T16:00:00Z"
+          }
+        ]
+      },
+      "eventual_managed_paths": [
+        "mise/config.web-e2e.toml",
+        "mise/mise.web-e2e.lock"
+      ],
+      "affected_capabilities": [
+        "selenium-ubuntu-chromium",
+        "cypress-ubuntu-chrome",
+        "playwright-ubuntu-chromium",
+        "oculix-ubuntu-chromium"
+      ]
+    }
+  ],
+  "relations": []
+}
