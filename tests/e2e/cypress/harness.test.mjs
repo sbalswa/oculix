@@ -8,14 +8,14 @@ import {
 } from "./harness.mjs";
 import { WINDOWS_UNSUPPORTED_MESSAGE } from "./platform.mjs";
 
-test("defaults local runs to Electron", () => {
+test("defaults local runs to Chrome", () => {
   assert.deepEqual(
     resolveBrowserSelection({
       arguments_: ["smoke"],
       environment: {},
     }),
     {
-      browser: "electron",
+      browser: "chrome",
       scenario: "smoke",
       source: "local default",
     },
@@ -58,6 +58,17 @@ test("rejects unknown browsers before starting Cypress", () => {
         environment: {},
       }),
     /Unsupported E2E browser "safari"/,
+  );
+});
+
+test("rejects Electron because it is not an accepted Phase 1 browser", () => {
+  assert.throws(
+    () =>
+      resolveBrowserSelection({
+        arguments_: ["smoke", "--browser=electron"],
+        environment: {},
+      }),
+    /Unsupported E2E browser "electron"/,
   );
 });
 

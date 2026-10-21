@@ -187,7 +187,11 @@ function baseMetadata(capability, state) {
   };
 }
 
-export async function runScenario(scenario, scenarioFunction) {
+export async function runScenario(
+  scenario,
+  scenarioFunction,
+  { reporter } = {},
+) {
   let capability;
   let driver;
   let failure;
@@ -203,12 +207,18 @@ export async function runScenario(scenario, scenarioFunction) {
 
   try {
     capability = resolveCapability();
+    reporter?.recordMetadata(baseMetadata(capability, state));
     state = await loadResourceState(capability);
+    reporter?.recordMetadata(baseMetadata(capability, state));
     const logs = await prepareScenarioLogs(capability, scenario);
     logDirectory = logs.directory;
     logPaths = logs.paths;
     driver = await buildDriver(state, logPaths);
-    metadata = await browserMetadata(driver, capability, state);
+    metadata = {
+      ...(await browserMetadata(driver, capability, state)),
+      phase: "scenario",
+    };
+    reporter?.recordMetadata(metadata);
     console.log(
       [
         `Selenium ${metadata.seleniumVersion}`,
@@ -226,6 +236,8 @@ export async function runScenario(scenario, scenarioFunction) {
       ...baseMetadata(capability, state),
       ...metadata,
     };
+    reporter?.recordMetadata(metadata);
+    reporter?.recordFailure(metadata.phase ?? "scenario", failure);
     await writeFailureDiagnostics({
       diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
       driver,
@@ -238,6 +250,7 @@ export async function runScenario(scenario, scenarioFunction) {
         `Could not retain Selenium diagnostics: ${diagnosticError}`,
       );
     });
+    await reporter?.write();
   }
 
   if (driver !== undefined) {
@@ -246,8 +259,10 @@ export async function runScenario(scenario, scenarioFunction) {
     } catch (quitError) {
       if (failure !== undefined) {
         failure.cleanupError = quitError;
+        reporter?.recordFailure("cleanup", quitError);
       } else {
         failure = quitError;
+        reporter?.recordFailure("cleanup", quitError);
         await writeFailureDiagnostics({
           diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
           driver,
@@ -265,6 +280,7 @@ export async function runScenario(scenario, scenarioFunction) {
           );
         });
       }
+      await reporter?.write();
     }
   }
 
@@ -274,4 +290,5 @@ export async function runScenario(scenario, scenarioFunction) {
   if (failure !== undefined) {
     throw failure;
   }
+  await reporter?.write({ status: "passed" });
 }

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const MAX_TEXT_DIAGNOSTIC_BYTES = 256 * 1024;
@@ -51,7 +51,6 @@ export async function writeFailureDiagnostics({
   scenario,
 }) {
   const scenarioDirectory = resolve(diagnosticsDirectory, scenario);
-  await rm(scenarioDirectory, { force: true, recursive: true });
   await mkdir(scenarioDirectory, { recursive: true });
 
   const diagnosticMetadata = {

@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "smoke": "node task.mjs smoke",
-    "test": "node --test harness.test.mjs task.test.mjs",
+    "test": "node --test harness.test.mjs reporting.test.mjs task.test.mjs",
     "web-calculator": "node task.mjs web-calculator"
   },
   "dependencies": {
+    "axe-core": "4.14.0",
     "cypress": "16.2.0"
   },
   "engines": {

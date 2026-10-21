@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#MISE description="Run the four Phase 1 E2E tool aggregates on Ubuntu"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+
+if [[ "$(uname -s)" != "Linux" ]] ||
+  ! grep -Eq '^ID="?ubuntu"?$' /etc/os-release; then
+  printf 'e2e:all currently supports the Phase 1 Ubuntu capabilities only.\n' >&2
+  exit 2
+fi
+
+E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:selenium
+E2E_OS=ubuntu E2E_BROWSER=chrome mise run e2e:cypress
+E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:playwright
+
+for command in dbus-run-session fluxbox gnome-calculator setsid xvfb-run; do
+  command -v "$command" >/dev/null 2>&1 ||
+    {
+      printf 'e2e:all requires %s for the Oculix Ubuntu aggregate.\n' \
+        "$command" >&2
+      exit 1
+    }
+done
+
+oculix_session_pid=""
+
+stop_oculix_session() {
+  [[ -n "$oculix_session_pid" ]] || return
+  if ! kill -0 -- "-$oculix_session_pid" 2>/dev/null; then
+    wait "$oculix_session_pid" 2>/dev/null || :
+    return
+  fi
+
+  kill -TERM -- "-$oculix_session_pid" 2>/dev/null || :
+  for _ in {1..50}; do
+    kill -0 -- "-$oculix_session_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 -- "-$oculix_session_pid" 2>/dev/null; then
+    kill -KILL -- "-$oculix_session_pid" 2>/dev/null || :
+    for _ in {1..50}; do
+      kill -0 -- "-$oculix_session_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  wait "$oculix_session_pid" 2>/dev/null || :
+  if kill -0 -- "-$oculix_session_pid" 2>/dev/null; then
+    printf 'e2e:all could not terminate Oculix process group %s.\n' \
+      "$oculix_session_pid" >&2
+    return 1
+  fi
+}
+
+# finish is invoked indirectly by the EXIT, INT, and TERM traps.
+# shellcheck disable=SC2329
+finish() {
+  local status=$?
+
+  trap - EXIT INT TERM
+  if ! stop_oculix_session && [[ "$status" -eq 0 ]]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# $window_manager_pid and $calculator_pid belong to the nested Bash process.
+# shellcheck disable=SC2016
+setsid xvfb-run -a -s '-screen 0 1280x1024x24 -nolisten tcp' \
+  dbus-run-session -- \
+  bash -euo pipefail -c '
+    window_manager_pid=""
+    calculator_pid=""
+
+    cleanup() {
+      local status=$?
+      trap - EXIT INT TERM
+      if [[ -n "$calculator_pid" ]]; then
+        kill "$calculator_pid" 2>/dev/null || :
+        wait "$calculator_pid" 2>/dev/null || :
+      fi
+      if [[ -n "$window_manager_pid" ]]; then
+        kill "$window_manager_pid" 2>/dev/null || :
+        wait "$window_manager_pid" 2>/dev/null || :
+      fi
+      exit "$status"
+    }
+    trap cleanup EXIT
+    trap "exit 130" INT
+    trap "exit 143" TERM
+
+    fluxbox >/dev/null 2>&1 &
+    window_manager_pid=$!
+    gnome-calculator >/dev/null 2>&1 &
+    calculator_pid=$!
+
+    E2E_OS=ubuntu E2E_BROWSER=chromium \
+      mise -E oculix,web-e2e run e2e:oculix
+  ' &
+oculix_session_pid=$!
+
+if wait "$oculix_session_pid"; then
+  oculix_status=0
+else
+  oculix_status=$?
+fi
+if ! stop_oculix_session && [[ "$oculix_status" -eq 0 ]]; then
+  oculix_status=1
+fi
+oculix_session_pid=""
+trap - EXIT INT TERM
+exit "$oculix_status"
