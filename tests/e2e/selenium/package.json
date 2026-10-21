@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test browser-selection.test.mjs harness.test.mjs",
+    "test": "node --test browser-selection.test.mjs harness.test.mjs reporting.test.mjs",
     "setup": "node setup.mjs",
     "smoke": "npm test --silent && node smoke.mjs",
     "web-calculator": "node web-calculator.mjs"
   },
   "dependencies": {
+    "@axe-core/webdriverjs": "4.14.0",
     "selenium-webdriver": "4.51.0"
   },
   "engines": {
