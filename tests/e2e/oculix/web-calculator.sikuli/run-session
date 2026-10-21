@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Trap handlers and their helpers are invoked indirectly.
+# shellcheck disable=SC2329
+set -euo pipefail
+
+stop_attempts="${OCULIX_SESSION_STOP_ATTEMPTS:-50}"
+stop_interval="${OCULIX_SESSION_STOP_INTERVAL:-0.1}"
+session_pid=""
+session_directory=""
+cleanup_failed=0
+
+fail() {
+  printf 'oculix web-calculator session: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+record_diagnostic() {
+  local name="$1"
+  local message="$2"
+
+  mkdir -p "$diagnostics_directory"
+  printf '%s\n' "$message" >"$diagnostics_directory/$name"
+}
+
+group_alive() {
+  [[ -n "$session_pid" ]] &&
+    kill -0 -- "-$session_pid" 2>/dev/null
+}
+
+stop_session_group() {
+  local attempt
+
+  if ! group_alive; then
+    [[ -z "$session_pid" ]] || wait "$session_pid" 2>/dev/null || :
+    return
+  fi
+
+  kill -TERM -- "-$session_pid" 2>/dev/null || :
+  for ((attempt = 0; attempt < stop_attempts; attempt += 1)); do
+    group_alive || break
+    sleep "$stop_interval"
+  done
+  if group_alive; then
+    kill -KILL -- "-$session_pid" 2>/dev/null || :
+    for ((attempt = 0; attempt < stop_attempts; attempt += 1)); do
+      group_alive || break
+      sleep "$stop_interval"
+    done
+  fi
+  wait "$session_pid" 2>/dev/null || :
+
+  if group_alive; then
+    cleanup_failed=1
+    record_diagnostic \
+      "session-cleanup-error.txt" \
+      "Failed to terminate execution process group $session_pid."
+  fi
+}
+
+cleanup() {
+  local status=$?
+
+  trap - EXIT INT TERM
+  stop_session_group
+  if [[ "$status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+    status=1
+  fi
+  if [[ -n "$session_directory" ]] &&
+    ! rm -rf -- "$session_directory"; then
+    record_diagnostic \
+      "session-cleanup-error.txt" \
+      "Failed to remove browser session directory $session_directory."
+    status=1
+  fi
+  exit "$status"
+}
+
+[[ "$#" -eq 2 ]] || fail "expected OS and browser capability inputs." 2
+selected_os="$1"
+selected_browser="$2"
+capability="$selected_os-$selected_browser"
+[[ "$capability" == "ubuntu-chromium" ]] ||
+  fail "unsupported capability '$capability'; supported: ubuntu-chromium." 2
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+: "${WEB_CALCULATOR_URL:?WEB_CALCULATOR_URL is required}"
+diagnostics_directory="${OCULIX_WEB_CALCULATOR_DIAGNOSTICS:-$MISE_PROJECT_ROOT/oculix-web-calculator-diagnostics}"
+xvfb_run="${OCULIX_WEB_CALCULATOR_XVFB_RUN:-xvfb-run}"
+capability_runner="${OCULIX_WEB_CALCULATOR_RUN_CAPABILITY:-$MISE_PROJECT_ROOT/tests/e2e/oculix/web-calculator.sikuli/run-capability}"
+session_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+session_directory="$(mktemp -d "$session_root/oculix-web-calculator.XXXXXX")"
+export OCULIX_WEB_CALCULATOR_SESSION_DIRECTORY="$session_directory"
+
+trap cleanup EXIT
+trap 'record_diagnostic "session-signal.txt" "Received SIGINT."; exit 130' INT
+trap 'record_diagnostic "session-signal.txt" "Received SIGTERM."; exit 143' TERM
+
+setsid "$xvfb_run" \
+  -a \
+  -s "-screen 0 1280x1024x24 -nolisten tcp" \
+  "$capability_runner" \
+  "$selected_os" \
+  "$selected_browser" &
+session_pid=$!
+
+if wait "$session_pid"; then
+  exit 0
+else
+  exit $?
+fi

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bundle_directory="$(cd "$(dirname "$0")" && pwd)"
+test_directory="$(mktemp -d "${TMPDIR:-/tmp}/oculix-session-test.XXXXXX")"
+supervisor_pid=""
+
+cleanup() {
+  if [[ -n "$supervisor_pid" ]] && kill -0 "$supervisor_pid" 2>/dev/null; then
+    kill -KILL "$supervisor_pid" 2>/dev/null || :
+    wait "$supervisor_pid" 2>/dev/null || :
+  fi
+  if [[ -s "$test_directory/root.pid" ]]; then
+    root_pid="$(sed -n '1p' "$test_directory/root.pid")"
+    kill -KILL -- "-$root_pid" 2>/dev/null || :
+  fi
+  rm -rf -- "$test_directory"
+}
+trap cleanup EXIT
+
+mkdir -p \
+  "$test_directory/bin" \
+  "$test_directory/diagnostics" \
+  "$test_directory/tmp"
+
+cat >"$test_directory/bin/fake-xvfb-run" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -a)
+      shift
+      ;;
+    -s)
+      shift 2
+      ;;
+    *)
+      exec "$@"
+      ;;
+  esac
+done
+exit 2
+EOF
+
+cat >"$test_directory/bin/fake-capability" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" >"$OCULIX_SESSION_TEST_STATE/root.pid"
+(
+  trap '' TERM
+  printf '%s\n' "$BASHPID" >"$OCULIX_SESSION_TEST_STATE/descendant.pid"
+  sleep 300 &
+  printf '%s\n' "$!" >"$OCULIX_SESSION_TEST_STATE/grandchild.pid"
+  wait
+) &
+wait
+EOF
+chmod 755 \
+  "$test_directory/bin/fake-xvfb-run" \
+  "$test_directory/bin/fake-capability"
+
+export MISE_PROJECT_ROOT="$test_directory"
+export WEB_CALCULATOR_URL="http://127.0.0.1:1"
+export OCULIX_WEB_CALCULATOR_DIAGNOSTICS="$test_directory/diagnostics"
+export OCULIX_WEB_CALCULATOR_XVFB_RUN="$test_directory/bin/fake-xvfb-run"
+export OCULIX_WEB_CALCULATOR_RUN_CAPABILITY="$test_directory/bin/fake-capability"
+export OCULIX_SESSION_TEST_STATE="$test_directory"
+export OCULIX_SESSION_STOP_ATTEMPTS=10
+export OCULIX_SESSION_STOP_INTERVAL=0.05
+export TMPDIR="$test_directory/tmp"
+
+"$bundle_directory/run-session" ubuntu chromium &
+supervisor_pid=$!
+
+for file in root.pid descendant.pid grandchild.pid; do
+  for _ in {1..100}; do
+    [[ -s "$test_directory/$file" ]] && break
+    sleep 0.02
+  done
+  [[ -s "$test_directory/$file" ]] ||
+    {
+      printf 'Mock session did not create %s.\n' "$file" >&2
+      exit 1
+    }
+done
+
+kill -TERM "$supervisor_pid"
+set +e
+wait "$supervisor_pid"
+session_status=$?
+set -e
+supervisor_pid=""
+[[ "$session_status" -eq 143 ]] ||
+  {
+    printf 'Expected cancellation status 143, got %s.\n' "$session_status" >&2
+    exit 1
+  }
+
+for file in root.pid descendant.pid grandchild.pid; do
+  pid="$(sed -n '1p' "$test_directory/$file")"
+  for _ in {1..100}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'Cancellation left %s process %s alive.\n' "$file" "$pid" >&2
+    exit 1
+  fi
+done
+
+root_pid="$(sed -n '1p' "$test_directory/root.pid")"
+if kill -0 -- "-$root_pid" 2>/dev/null; then
+  printf 'Cancellation left process group %s alive.\n' "$root_pid" >&2
+  exit 1
+fi
+if find "$test_directory/tmp" -mindepth 1 -print -quit | grep -q .; then
+  printf 'Cancellation left a browser session directory behind.\n' >&2
+  exit 1
+fi
+grep -Fx 'Received SIGTERM.' "$test_directory/diagnostics/session-signal.txt"
+printf 'Oculix web-calculator cancellation cleanup passed.\n'
