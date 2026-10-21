@@ -1,0 +1,16 @@
+{
+  "name": "oculix-selenium-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@axe-core/webdriverjs": "4.14.0",
+    "selenium-webdriver": "4.51.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

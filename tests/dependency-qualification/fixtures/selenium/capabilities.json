@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "guardrails": {
+    "allowed_runners": [
+      "ubuntu-latest"
+    ],
+    "max_custom_cells": 6,
+    "max_parallel": 3
+  },
+  "capabilities": [
+    {
+      "id": "selenium-ubuntu-chromium",
+      "selector": "ci:e2e:selenium:ubuntu:chromium",
+      "tool": "selenium",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "browser": "chromium",
+      "environment": "web-e2e",
+      "task": "e2e:selenium",
+      "scenarios": [
+        "smoke",
+        "web-calculator"
+      ],
+      "diagnostics": "tests/e2e/selenium/diagnostics/",
+      "evidence": "tests/e2e/selenium/diagnostics/web-calculator/result.png",
+      "required_files": [
+        "tests/e2e/selenium/diagnostics/web-calculator/result.png",
+        "tests/e2e/selenium/diagnostics/web-calculator/result.json"
+      ],
+      "result_reports": [
+        "tests/e2e/selenium/diagnostics/web-calculator/result.json"
+      ],
+      "require_accessibility": true,
+      "linux_packages": [],
+      "oculix_chromium_disable_sandbox": false,
+      "use_xvfb": false,
+      "smoke": true,
+      "stability": "stable",
+      "cost_class": "standard"
+    },
+    {
+      "id": "selenium-linux-chromium",
+      "selector": "ci:e2e:selenium:linux:chromium",
+      "tool": "selenium",
+      "runner": "ubuntu-latest",
+      "os": "linux",
+      "browser": "chromium",
+      "environment": "web-e2e",
+      "task": "e2e:selenium:smoke",
+      "scenarios": [
+        "smoke"
+      ],
+      "diagnostics": "tests/e2e/selenium/diagnostics/",
+      "evidence": "tests/e2e/selenium/diagnostics/smoke/result.png",
+      "required_files": [
+        "tests/e2e/selenium/diagnostics/smoke/result.png",
+        "tests/e2e/selenium/diagnostics/smoke/result.json"
+      ],
+      "result_reports": [
+        "tests/e2e/selenium/diagnostics/smoke/result.json"
+      ],
+      "require_accessibility": false,
+      "linux_packages": [],
+      "oculix_chromium_disable_sandbox": false,
+      "use_xvfb": false,
+      "smoke": false,
+      "stability": "stable",
+      "cost_class": "standard"
+    }
+  ]
+}
