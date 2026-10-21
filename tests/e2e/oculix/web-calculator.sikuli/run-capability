@@ -21,22 +21,22 @@ stop_browser() {
     return
   fi
 
-  if ! kill -0 -- "-$browser_pid" 2>/dev/null; then
+  if ! kill -0 "$browser_pid" 2>/dev/null; then
     wait "$browser_pid" 2>/dev/null || :
     return
   fi
-  if ! kill -TERM -- "-$browser_pid" 2>/dev/null &&
-    kill -0 -- "-$browser_pid" 2>/dev/null; then
+  if ! kill -TERM "$browser_pid" 2>/dev/null &&
+    kill -0 "$browser_pid" 2>/dev/null; then
     stop_failed=1
   fi
   for _ in {1..50}; do
-    if ! kill -0 -- "-$browser_pid" 2>/dev/null; then
+    if ! kill -0 "$browser_pid" 2>/dev/null; then
       break
     fi
     sleep 0.1
   done
-  if kill -0 -- "-$browser_pid" 2>/dev/null; then
-    if ! kill -KILL -- "-$browser_pid" 2>/dev/null; then
+  if kill -0 "$browser_pid" 2>/dev/null; then
+    if ! kill -KILL "$browser_pid" 2>/dev/null; then
       stop_failed=1
     fi
   fi
@@ -46,7 +46,7 @@ stop_browser() {
     cleanup_failed=1
     record_diagnostic \
       "cleanup-error.txt" \
-      "Failed to terminate the Chromium process group $browser_pid."
+      "Failed to terminate the Chromium process $browser_pid."
   fi
 }
 
@@ -55,13 +55,9 @@ cleanup_session() {
 
   trap - EXIT INT TERM
   stop_browser
-  if [[ "$status" -ne 0 || "$cleanup_failed" -ne 0 ]]; then
-    mkdir -p "$diagnostics_directory"
-    if [[ -f "$browser_log" ]]; then
-      cp "$browser_log" "$diagnostics_directory/chromium.log"
-    fi
+  if [[ "$owns_session_directory" -eq 1 ]]; then
+    rm -rf -- "$session_directory"
   fi
-  rm -rf -- "$session_directory"
 
   if [[ "$status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
     status=1
@@ -79,11 +75,17 @@ capability="$selected_os-$selected_browser"
 cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
 : "${WEB_CALCULATOR_URL:?WEB_CALCULATOR_URL is required}"
 
-diagnostics_directory="$MISE_PROJECT_ROOT/oculix-web-calculator-diagnostics"
+diagnostics_directory="${OCULIX_WEB_CALCULATOR_DIAGNOSTICS:-$MISE_PROJECT_ROOT/oculix-web-calculator-diagnostics}"
 session_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
-session_directory="$(mktemp -d "$session_root/oculix-web-calculator.XXXXXX")"
+if [[ -n "${OCULIX_WEB_CALCULATOR_SESSION_DIRECTORY:-}" ]]; then
+  session_directory="$OCULIX_WEB_CALCULATOR_SESSION_DIRECTORY"
+  owns_session_directory=0
+else
+  session_directory="$(mktemp -d "$session_root/oculix-web-calculator.XXXXXX")"
+  owns_session_directory=1
+fi
 user_data_directory="$session_directory/chromium-profile"
-browser_log="$session_directory/chromium.log"
+browser_log="$diagnostics_directory/chromium.log"
 readiness_file="$user_data_directory/DevToolsActivePort"
 browser_binary=""
 browser_pid=""
@@ -99,6 +101,27 @@ for candidate in chromium chromium-browser; do
     break
   fi
 done
+
+browser_version="unavailable"
+if [[ -n "$browser_binary" ]]; then
+  browser_version="$("$browser_binary" --version 2>&1 | head -n 1 || :)"
+fi
+host_description="$(
+  sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release |
+    head -n 1
+)"
+{
+  printf 'capability=%s\n' "$capability"
+  printf 'browser_binary=%s\n' "$browser_binary"
+  printf 'browser_version=%s\n' "${browser_version:-unknown}"
+  printf 'host=%s\n' "${host_description:-unknown}"
+  printf 'uname=%s\n' "$(uname -a)"
+  printf 'runner_os=%s\n' "${RUNNER_OS:-unavailable}"
+  printf 'runner_arch=%s\n' "${RUNNER_ARCH:-unavailable}"
+  printf 'image_os=%s\n' "${ImageOS:-unavailable}"
+  printf 'image_version=%s\n' "${ImageVersion:-unavailable}"
+} | tee "$diagnostics_directory/environment.txt"
+
 if [[ -z "$browser_binary" ]]; then
   record_diagnostic \
     "browser-launch-error.txt" \
@@ -106,7 +129,7 @@ if [[ -z "$browser_binary" ]]; then
   fail "Chromium is required for capability ubuntu-chromium."
 fi
 
-setsid "$browser_binary" \
+"$browser_binary" \
   --app="$WEB_CALCULATOR_URL" \
   --disable-background-networking \
   --disable-component-update \

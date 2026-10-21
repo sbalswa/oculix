@@ -1,58 +1,79 @@
 #!/usr/bin/env bash
 #MISE description="Run the Oculix web calculator scenario for a capability"
-#USAGE flag "--os <os>" required=#true help="Capability operating system" {
-#USAGE   choices "ubuntu"
-#USAGE }
-#USAGE flag "--browser <browser>" required=#true help="Capability browser" {
-#USAGE   choices "chromium"
-#USAGE }
+#USAGE flag "--os <os>" help="Capability operating system"
+#USAGE flag "--browser <browser>" help="Capability browser"
 set -euo pipefail
 
-selected_os="${usage_os?}"
-selected_browser="${usage_browser?}"
+fail() {
+  printf 'oculix web-calculator: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+cli_os="${usage_os:-}"
+cli_browser="${usage_browser:-}"
+environment_os="${E2E_OS:-}"
+environment_browser="${E2E_BROWSER:-}"
+
+if [[ -n "$cli_os" && -n "$environment_os" &&
+  "$cli_os" != "$environment_os" ]]; then
+  fail \
+    "conflicting OS inputs: --os '$cli_os' and E2E_OS '$environment_os'." \
+    2
+fi
+if [[ -n "$cli_browser" && -n "$environment_browser" &&
+  "$cli_browser" != "$environment_browser" ]]; then
+  fail \
+    "conflicting browser inputs: --browser '$cli_browser' and E2E_BROWSER '$environment_browser'." \
+    2
+fi
+
+selected_os="${cli_os:-$environment_os}"
+selected_browser="${cli_browser:-$environment_browser}"
+[[ -n "$selected_os" ]] ||
+  fail "select an OS with --os or E2E_OS." 2
+[[ -n "$selected_browser" ]] ||
+  fail "select a browser with --browser or E2E_BROWSER." 2
+
 capability="$selected_os-$selected_browser"
 case "$capability" in
   ubuntu-chromium)
     ;;
   *)
-    printf \
-      "oculix web-calculator: unsupported capability '%s'; supported: ubuntu-chromium.\n" \
-      "$capability" >&2
-    exit 2
+    fail \
+      "unsupported capability '$capability'; supported: ubuntu-chromium." \
+      2
     ;;
 esac
 
 cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
 
-[[ "$(uname -s)" == "Linux" ]] ||
-  {
-    printf 'oculix web-calculator: ubuntu-chromium requires Linux.\n' >&2
-    exit 1
-  }
-command -v node >/dev/null 2>&1 ||
-  {
-    printf 'oculix web-calculator: the web-e2e Node.js is required.\n' >&2
-    exit 1
-  }
-mise where http:oculixide >/dev/null 2>&1 ||
-  {
-    printf 'oculix web-calculator: the oculix environment is required.\n' >&2
-    exit 1
-  }
-command -v xvfb-run >/dev/null 2>&1 ||
-  {
-    printf 'oculix web-calculator: xvfb-run is required.\n' >&2
-    exit 1
-  }
-command -v setsid >/dev/null 2>&1 ||
-  {
-    printf 'oculix web-calculator: setsid is required.\n' >&2
-    exit 1
-  }
+diagnostics_directory="$MISE_PROJECT_ROOT/oculix-web-calculator-diagnostics"
+rm -rf -- "$diagnostics_directory"
+mkdir -p "$diagnostics_directory"
+export OCULIX_WEB_CALCULATOR_DIAGNOSTICS="$diagnostics_directory"
 
-capability_runner="$MISE_PROJECT_ROOT/tests/e2e/oculix/web-calculator.sikuli/run-capability"
+[[ "$(uname -s)" == "Linux" ]] ||
+  fail "capability ubuntu-chromium requires Linux."
+[[ -r /etc/os-release ]] ||
+  fail "/etc/os-release is required."
+host_os="$(
+  awk -F= '$1 == "ID" { gsub(/^"|"$/, "", $2); print $2; exit }' \
+    /etc/os-release
+)"
+[[ "$host_os" == "$selected_os" ]] ||
+  fail \
+    "declared OS '$selected_os' does not match host OS '${host_os:-unknown}'."
+command -v node >/dev/null 2>&1 ||
+  fail "the web-e2e Node.js is required."
+mise where http:oculixide >/dev/null 2>&1 ||
+  fail "the oculix environment is required."
+command -v xvfb-run >/dev/null 2>&1 ||
+  fail "xvfb-run is required."
+command -v setsid >/dev/null 2>&1 ||
+  fail "setsid is required."
+
+session_runner="$MISE_PROJECT_ROOT/tests/e2e/oculix/web-calculator.sikuli/run-session"
 exec mise run e2e:fixtures:web-calculator:with-server \
-  xvfb-run -a -s "-screen 0 1280x1024x24 -nolisten tcp" \
-  "$capability_runner" \
+  "$session_runner" \
   "$selected_os" \
   "$selected_browser"
