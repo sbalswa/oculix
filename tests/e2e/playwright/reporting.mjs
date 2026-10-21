@@ -117,19 +117,30 @@ function finding(rule) {
   };
 }
 
+function findingCounts(findings) {
+  return {
+    nodes: findings.reduce(
+      (total, item) => total + (item.nodes?.length ?? 0),
+      0,
+    ),
+    rules: findings.length,
+  };
+}
+
 export function normalizeAccessibilityResults(results) {
   const violations = results.violations.map(finding);
   const incomplete = results.incomplete.map(finding);
+  const counts = {
+    incomplete: findingCounts(incomplete),
+    inapplicable: findingCounts(results.inapplicable),
+    passes: findingCounts(results.passes),
+    violations: findingCounts(violations),
+  };
   return {
-    counts: {
-      incomplete: incomplete.length,
-      inapplicable: results.inapplicable.length,
-      passes: results.passes.length,
-      violations: violations.length,
-    },
+    counts,
     incomplete,
     policy: ACCESSIBILITY_POLICY,
-    status: violations.length === 0 ? "passed" : "failed",
+    status: counts.violations.rules === 0 ? "passed" : "failed",
     testEngine: results.testEngine,
     testEnvironment: results.testEnvironment,
     testRunner: results.testRunner,
@@ -161,10 +172,15 @@ function accessibilityMarkdown(summary) {
     "",
     `- Status: **${summary.status}**`,
     `- Policy: ${summary.policy.automatedStandard}`,
-    `- Violations: ${summary.counts.violations} (blocking)`,
-    `- Incomplete/manual review: ${summary.counts.incomplete} (nonblocking)`,
-    `- Passes: ${summary.counts.passes}`,
-    `- Inapplicable: ${summary.counts.inapplicable}`,
+    `- Violations: ${summary.counts.violations.rules} rule(s) / ` +
+      `${summary.counts.violations.nodes} affected node(s) (blocking)`,
+    `- Incomplete/manual review: ${summary.counts.incomplete.rules} ` +
+      `rule(s) / ${summary.counts.incomplete.nodes} affected node(s) ` +
+      "(nonblocking)",
+    `- Passes: ${summary.counts.passes.rules} rule(s) / ` +
+      `${summary.counts.passes.nodes} affected node(s)`,
+    `- Inapplicable: ${summary.counts.inapplicable.rules} rule(s) / ` +
+      `${summary.counts.inapplicable.nodes} affected node(s)`,
     "",
     ...markdownFindings("Violations", summary.violations),
     ...markdownFindings(
@@ -196,12 +212,33 @@ export async function writeAccessibilityReports(
 }
 
 export function enforceAccessibilityPolicy(summary) {
-  if (summary.counts.violations > 0) {
+  if (summary.counts.violations.rules > 0) {
     throw new Error(
-      `Accessibility audit found ${summary.counts.violations} ` +
-        "blocking violation(s); reports were written before this failure.",
+      `Accessibility audit found ${summary.counts.violations.rules} ` +
+        "blocking violation rule(s) across " +
+        `${summary.counts.violations.nodes} affected node(s); reports ` +
+        "were written before this failure.",
     );
   }
+}
+
+function matrixOperatingSystem(operatingSystem) {
+  const normalized = operatingSystem.trim().toLowerCase();
+  if (normalized === "ubuntu" || normalized.startsWith("ubuntu-")) {
+    return "ubuntu";
+  }
+  if (normalized === "macos" || normalized.startsWith("macos-")) {
+    return "macos";
+  }
+  return normalized;
+}
+
+export function playwrightCapabilityId(operatingSystem, browser) {
+  return [
+    "playwright",
+    matrixOperatingSystem(operatingSystem),
+    browser.trim().toLowerCase(),
+  ].join("-");
 }
 
 async function packageVersion(path) {
@@ -313,6 +350,21 @@ export async function writePlaywrightResult({
     resolve(paths.directory, "runtime.json"),
   );
   const accessibility = await readJsonOrNull(paths.accessibilitySummary);
+  const environment = runtime ?? {
+    arch: process.arch,
+    browser: {
+      name: process.env.PLAYWRIGHT_PROJECT ?? "unknown",
+      project: process.env.PLAYWRIGHT_PROJECT ?? "unknown",
+      version: null,
+    },
+    operatingSystem: process.env.E2E_OS ?? process.platform,
+    platform: process.platform,
+    versions: {
+      axe: "4.14.0",
+      node: process.version,
+      playwright: "1.64.1",
+    },
+  };
   const startedAt = testResult.startTime;
   const completedAt = new Date(
     startedAt.getTime() + testResult.duration,
@@ -331,24 +383,13 @@ export async function writePlaywrightResult({
       : testResult.status;
   const report = {
     schemaVersion: 1,
-    capabilityId: scenario,
+    capabilityId: playwrightCapabilityId(
+      environment.operatingSystem,
+      environment.browser.project,
+    ),
     tool: "playwright",
     scenario,
-    environment: runtime ?? {
-      arch: process.arch,
-      browser: {
-        name: process.env.PLAYWRIGHT_PROJECT ?? "unknown",
-        project: process.env.PLAYWRIGHT_PROJECT ?? "unknown",
-        version: null,
-      },
-      operatingSystem: process.env.E2E_OS ?? process.platform,
-      platform: process.platform,
-      versions: {
-        axe: "4.14.0",
-        node: process.version,
-        playwright: "1.64.1",
-      },
-    },
+    environment,
     status,
     timestamps: {
       completedAt: completedAt.toISOString(),
@@ -389,7 +430,7 @@ export async function writeHarnessFailureResult(
   const now = new Date();
   const report = existing ?? {
     schemaVersion: 1,
-    capabilityId: scenario,
+    capabilityId: playwrightCapabilityId(operatingSystem, browser),
     tool: "playwright",
     scenario,
     environment: {

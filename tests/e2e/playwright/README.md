@@ -31,7 +31,9 @@ Each scenario writes isolated native Playwright output under
 `test-results/<scenario>/`, including line output, an HTML report, a JSON
 report, video, and retained failure traces/screenshots. A schema-versioned
 `result.json` records the environment, assertions, policy, counts, and
-repository-relative artifact paths.
+repository-relative artifact paths. Its stable capability identity follows the
+matrix (`playwright-<os>-<browser>`), while the scenario remains a separate
+field.
 
 The web-calculator scenario audits the final rendered `238` state with the
 pinned official `@axe-core/playwright` integration. WCAG 2.0, 2.1, and 2.2
@@ -39,3 +41,5 @@ Level A/AA violations block only after raw JSON, summaries, the final
 screenshot, and native-report attachments are written. Incomplete findings
 remain visible for manual review but are initially nonblocking. Automated
 auditing supplements rather than replaces manual accessibility review.
+Accessibility summaries retain both rule totals and affected-node totals for
+violations, incomplete findings, passes, and inapplicable rules.

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  mkdir,
   mkdtemp,
   readFile,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -11,6 +13,7 @@ import {
   ACCESSIBILITY_POLICY,
   enforceAccessibilityPolicy,
   normalizeAccessibilityResults,
+  playwrightCapabilityId,
   repositoryRelativeArtifact,
   scenarioPaths,
   writeAccessibilityReports,
@@ -24,8 +27,22 @@ function axeResults({
 } = {}) {
   return {
     incomplete,
-    inapplicable: [{ id: "inapplicable" }],
-    passes: [{ id: "passed" }, { id: "also-passed" }],
+    inapplicable: [
+      {
+        id: "inapplicable",
+        nodes: [{}],
+      },
+    ],
+    passes: [
+      {
+        id: "passed",
+        nodes: [{}, {}],
+      },
+      {
+        id: "also-passed",
+        nodes: [{}],
+      },
+    ],
     testEngine: {
       name: "axe-core",
       version: "4.14.0",
@@ -42,21 +59,19 @@ function axeResults({
   };
 }
 
-function rule(id, impact = "serious") {
+function rule(id, impact = "serious", nodes = 1) {
   return {
     description: `${id} description`,
     help: `${id} help`,
     helpUrl: `https://example.invalid/${id}`,
     id,
     impact,
-    nodes: [
-      {
-        failureSummary: `${id} failure`,
-        html: "<button>example</button>",
-        impact,
-        target: ["button"],
-      },
-    ],
+    nodes: Array.from({ length: nodes }, (_, index) => ({
+      failureSummary: `${id} failure`,
+      html: `<button data-index="${index}">example</button>`,
+      impact,
+      target: [`button:nth-of-type(${index + 1})`],
+    })),
     tags: ["wcag2a"],
   };
 }
@@ -64,20 +79,38 @@ function rule(id, impact = "serious") {
 test("normalizes axe findings and stable policy counts", () => {
   const summary = normalizeAccessibilityResults(
     axeResults({
-      incomplete: [rule("manual-review", "moderate")],
-      violations: [rule("blocking")],
+      incomplete: [rule("manual-review", "moderate", 2)],
+      violations: [
+        rule("blocking", "serious", 3),
+        rule("also-blocking", "critical", 1),
+      ],
     }),
   );
 
   assert.deepEqual(summary.counts, {
-    incomplete: 1,
-    inapplicable: 1,
-    passes: 2,
-    violations: 1,
+    incomplete: {
+      nodes: 2,
+      rules: 1,
+    },
+    inapplicable: {
+      nodes: 1,
+      rules: 1,
+    },
+    passes: {
+      nodes: 3,
+      rules: 2,
+    },
+    violations: {
+      nodes: 4,
+      rules: 2,
+    },
   });
   assert.equal(summary.status, "failed");
   assert.deepEqual(summary.policy, ACCESSIBILITY_POLICY);
-  assert.equal(summary.violations[0].nodes[0].target[0], "button");
+  assert.equal(
+    summary.violations[0].nodes[0].target[0],
+    "button:nth-of-type(1)",
+  );
 });
 
 test("writes accessibility reports before enforcing violations", async () => {
@@ -93,13 +126,13 @@ test("writes accessibility reports before enforcing violations", async () => {
     const { paths, summary } = await writeAccessibilityReports(
       "web-calculator",
       axeResults({
-        violations: [rule("blocking")],
+        violations: [rule("blocking", "serious", 3)],
       }),
       options,
     );
     assert.throws(
       () => enforceAccessibilityPolicy(summary),
-      /reports were written before this failure/,
+      /1 blocking violation rule\(s\) across 3 affected node\(s\).*reports were written before this failure/,
     );
     assert.equal(
       JSON.parse(await readFile(paths.accessibility, "utf8"))
@@ -110,6 +143,18 @@ test("writes accessibility reports before enforcing violations", async () => {
       JSON.parse(await readFile(paths.accessibilitySummary, "utf8"))
         .status,
       "failed",
+    );
+    const markdown = await readFile(
+      paths.accessibilitySummaryMarkdown,
+      "utf8",
+    );
+    assert.match(
+      markdown,
+      /Violations: 1 rule\(s\) \/ 3 affected node\(s\) \(blocking\)/,
+    );
+    assert.match(
+      markdown,
+      /Incomplete\/manual review: 0 rule\(s\) \/ 0 affected node\(s\)/,
     );
   } finally {
     await rm(repositoryRoot, {
@@ -126,8 +171,26 @@ test("incomplete findings remain nonblocking and visible", () => {
     }),
   );
   assert.equal(summary.status, "passed");
-  assert.equal(summary.counts.incomplete, 1);
+  assert.deepEqual(summary.counts.incomplete, {
+    nodes: 1,
+    rules: 1,
+  });
   assert.doesNotThrow(() => enforceAccessibilityPolicy(summary));
+});
+
+test("builds the stable matrix capability identity", () => {
+  assert.equal(
+    playwrightCapabilityId("ubuntu", "chromium"),
+    "playwright-ubuntu-chromium",
+  );
+  assert.equal(
+    playwrightCapabilityId("ubuntu-latest", "chromium"),
+    "playwright-ubuntu-chromium",
+  );
+  assert.equal(
+    playwrightCapabilityId("ubuntu-24.04", "chromium"),
+    "playwright-ubuntu-chromium",
+  );
 });
 
 test("normalizes repository artifact paths and rejects escapes", () => {
@@ -186,6 +249,13 @@ test("sequential scenario failures retain separate result reports", async () => 
     );
     assert.equal(smoke.harness.error, "smoke failed");
     assert.equal(calculator.harness.error, "calculator failed");
+    assert.equal(smoke.capabilityId, "playwright-ubuntu-chromium");
+    assert.equal(
+      calculator.capabilityId,
+      "playwright-ubuntu-chromium",
+    );
+    assert.equal(smoke.scenario, "smoke");
+    assert.equal(calculator.scenario, "web-calculator");
   } finally {
     await rm(repositoryRoot, {
       force: true,
@@ -207,6 +277,29 @@ test("writes the stable scenario result schema", async () => {
     resultsRoot,
   };
   try {
+    const paths = scenarioPaths("smoke", options);
+    await mkdir(paths.directory, {
+      recursive: true,
+    });
+    await writeFile(
+      resolve(paths.directory, "runtime.json"),
+      `${JSON.stringify({
+        arch: "x64",
+        browser: {
+          name: "chromium",
+          project: "chromium",
+          version: "156.0.0.0",
+        },
+        operatingSystem: "ubuntu",
+        platform: "linux",
+        scenario: "smoke",
+        versions: {
+          axe: "4.14.0",
+          node: "v24.0.0",
+          playwright: "1.64.1",
+        },
+      })}\n`,
+    );
     const report = await writePlaywrightResult({
       options,
       scenario: "smoke",
@@ -223,7 +316,10 @@ test("writes the stable scenario result schema", async () => {
     });
 
     assert.equal(report.schemaVersion, 1);
-    assert.equal(report.capabilityId, "smoke");
+    assert.equal(
+      report.capabilityId,
+      "playwright-ubuntu-chromium",
+    );
     assert.equal(report.tool, "playwright");
     assert.equal(report.status, "passed");
     assert.equal(report.timestamps.durationMs, 125);
