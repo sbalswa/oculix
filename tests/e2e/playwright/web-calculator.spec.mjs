@@ -1,6 +1,25 @@
+import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { writeFile } from "node:fs/promises";
+import {
+  ACCESSIBILITY_TAGS,
+  enforceAccessibilityPolicy,
+  scenarioPaths,
+  writeAccessibilityReports,
+  writeRuntimeMetadata,
+} from "./reporting.mjs";
 
-test("calculates 7 × 34", async ({ page }) => {
+test("calculates 7 × 34", async ({
+  browser,
+  browserName,
+  page,
+}, testInfo) => {
+  const paths = scenarioPaths("web-calculator");
+  await writeRuntimeMetadata({
+    browserName,
+    browserVersion: browser.version(),
+    scenario: "web-calculator",
+  });
   const fixtureUrl = process.env.WEB_CALCULATOR_URL;
   if (fixtureUrl === undefined) {
     throw new Error(
@@ -22,7 +41,34 @@ test("calculates 7 × 34", async ({ page }) => {
 
   await expect(display).toBeVisible();
   await expect(display).toHaveText("238");
-  await page.screenshot({
-    path: "test-results/web-calculator-result.png",
+  const screenshot = await page.screenshot({
+    path: paths.finalScreenshot,
   });
+  await writeFile(paths.legacyFinalScreenshot, screenshot);
+  await testInfo.attach("final-rendered-state", {
+    contentType: "image/png",
+    path: paths.finalScreenshot,
+  });
+
+  const accessibilityResults = await new AxeBuilder({
+    page,
+  })
+    .withTags(ACCESSIBILITY_TAGS)
+    .analyze();
+  const { summary } = await writeAccessibilityReports(
+    "web-calculator",
+    accessibilityResults,
+  );
+  await testInfo.attach("accessibility-results", {
+    body: Buffer.from(
+      `${JSON.stringify(accessibilityResults, null, 2)}\n`,
+    ),
+    contentType: "application/json",
+  });
+  await testInfo.attach("accessibility-summary", {
+    body: Buffer.from(`${JSON.stringify(summary, null, 2)}\n`),
+    contentType: "application/json",
+  });
+
+  enforceAccessibilityPolicy(summary);
 });
