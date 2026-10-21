@@ -301,7 +301,18 @@ catalog browser.
 
 ## Toolchain maintenance
 
-Scheduled updates stack as `mise` → `tools` → parallel `extras/*`
+Scheduled updates stack as `mise` → `tools` → parallel `extras/*`. Temurin
+point releases remain automated through that stable maintenance lane.
+
+Java major changes are issue-only alerts and require review. A detected
+mismatch does not edit configuration, re-lock dependencies, or open a pull
+request. Remediation must cite the commit-pinned upstream evidence,
+intentionally update the Java configuration, re-lock every supported platform,
+and run the full operating-system matrix before merge.
+
+When the configured major matches Oculix again, maintenance adds a resolution
+comment and closes the generated alert. If upstream evidence cannot be read,
+maintenance leaves the existing issue state unchanged.
 
 ## Development
 
