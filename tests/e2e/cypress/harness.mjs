@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { assertCypressPlatformSupported } from "./platform.mjs";
+import {
+  prepareScenarioDiagnostics,
+  writeScenarioResult,
+} from "./reporting.mjs";
 
 const HARNESS_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = resolve(HARNESS_DIRECTORY, "cypress.config.mjs");
@@ -14,7 +18,6 @@ const SUPPORTED_BROWSERS = new Set([
   "chrome",
   "chromium",
   "edge",
-  "electron",
   "firefox",
 ]);
 const OPERATING_SYSTEMS = new Map([
@@ -51,7 +54,7 @@ function parseArguments(arguments_) {
       throw new Error(
         `Unknown argument: ${option}\n` +
           "Usage: harness.mjs smoke|web-calculator " +
-          "[--browser electron|chrome|chromium|firefox|edge]",
+          "[--browser chrome|chromium|firefox|edge]",
       );
     }
   }
@@ -68,7 +71,7 @@ export function resolveBrowserSelection({
     throw new Error(
       `Unknown Cypress scenario: ${scenario ?? "(missing)"}\n` +
         "Usage: harness.mjs smoke|web-calculator " +
-        "[--browser electron|chrome|chromium|firefox|edge]",
+        "[--browser chrome|chromium|firefox|edge]",
     );
   }
 
@@ -154,35 +157,14 @@ async function cypressVersion() {
   return packageJson.dependencies.cypress;
 }
 
-async function retainFailureDiagnostics(selection, result, error) {
-  const scenarioDirectory = resolve(
-    DIAGNOSTICS_DIRECTORY,
-    selection.scenario,
+async function dependencyVersions() {
+  const packageJson = JSON.parse(
+    await readFile(resolve(HARNESS_DIRECTORY, "package.json"), "utf8"),
   );
-  await mkdir(scenarioDirectory, { recursive: true });
-  await writeFile(
-    resolve(scenarioDirectory, "run.json"),
-    `${JSON.stringify(
-      {
-        browser: selection.browser,
-        cypressVersion: await cypressVersion(),
-        error: error?.stack ?? null,
-        failures: result?.failures ?? null,
-        hostDistribution: selection.hostDistribution,
-        message: result?.message ?? null,
-        nodeVersion: process.version,
-        operatingSystem: selection.operatingSystem,
-        operatingSystemSource: selection.operatingSystemSource,
-        hostPlatform: selection.hostPlatform,
-        scenario: selection.scenario,
-        selectionSource: selection.source,
-        totalFailed: result?.totalFailed ?? null,
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
+  return {
+    axeCore: packageJson.dependencies["axe-core"],
+    cypress: packageJson.dependencies.cypress,
+  };
 }
 
 function failureMessage(selection, result) {
@@ -225,7 +207,12 @@ export async function runHarness({
     );
   }
 
-  await rm(DIAGNOSTICS_DIRECTORY, { force: true, recursive: true });
+  const versions = await dependencyVersions();
+  const startedAt = new Date().toISOString();
+  await prepareScenarioDiagnostics(
+    DIAGNOSTICS_DIRECTORY,
+    selection.scenario,
+  );
   process.stdout.write(
     `Cypress ${await cypressVersion()} with Node ${process.version}; ` +
       `os=${selection.operatingSystem} ` +
@@ -235,21 +222,49 @@ export async function runHarness({
   );
 
   let result;
+  let runError;
   try {
+    const scenarioDirectory = resolve(
+      DIAGNOSTICS_DIRECTORY,
+      selection.scenario,
+    );
     result = await cypress.run({
       browser: selection.browser,
-      config: baseUrl === undefined ? {} : { baseUrl },
+      config: {
+        ...(baseUrl === undefined ? {} : { baseUrl }),
+        downloadsFolder: resolve(scenarioDirectory, "downloads"),
+        env: {
+          axeCoreVersion: versions.axeCore,
+          diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
+          reportScenario: selection.scenario,
+        },
+        screenshotsFolder: resolve(scenarioDirectory, "screenshots"),
+        videosFolder: resolve(scenarioDirectory, "videos"),
+      },
       configFile: CONFIG_PATH,
       project: HARNESS_DIRECTORY,
       spec: resolve(HARNESS_DIRECTORY, SCENARIOS.get(selection.scenario)),
     });
   } catch (error) {
-    await retainFailureDiagnostics(selection, result, error);
-    throw error;
+    runError = error;
   }
 
+  const finishedAt = new Date().toISOString();
+  await writeScenarioResult({
+    axeCoreVersion: versions.axeCore,
+    cypressVersion: versions.cypress,
+    diagnosticsDirectory: DIAGNOSTICS_DIRECTORY,
+    error: runError,
+    finishedAt,
+    repositoryRoot: resolve(HARNESS_DIRECTORY, "../../.."),
+    result,
+    selection,
+    startedAt,
+  });
+  if (runError) {
+    throw runError;
+  }
   if (result.failures || result.totalFailed > 0) {
-    await retainFailureDiagnostics(selection, result);
     throw new Error(failureMessage(selection, result));
   }
 

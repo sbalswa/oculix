@@ -61,6 +61,17 @@ test("rejects unknown browsers before starting Cypress", () => {
   );
 });
 
+test("rejects Electron because it is not an accepted Phase 1 browser", () => {
+  assert.throws(
+    () =>
+      resolveBrowserSelection({
+        arguments_: ["smoke", "--browser=electron"],
+        environment: {},
+      }),
+    /Unsupported E2E browser "electron"/,
+  );
+});
+
 test("rejects missing browser values and unknown options", () => {
   assert.throws(
     () =>
