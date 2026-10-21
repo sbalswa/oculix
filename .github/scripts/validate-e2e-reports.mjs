@@ -177,7 +177,7 @@ async function validateResultReport({
   if (report.assertion?.status !== "passed") {
     throw new Error(`${path} must report a passed assertion`);
   }
-  if (requireAccessibility) {
+  if (requireAccessibility && report.scenario === "web-calculator") {
     if (report.accessibility?.status !== "passed") {
       throw new Error(`${path} must report a passed accessibility audit`);
     }

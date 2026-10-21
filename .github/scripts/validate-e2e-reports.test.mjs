@@ -88,6 +88,27 @@ test("accepts Selenium's nested capability and numeric counts", async () => {
   }
 });
 
+test("does not require an accessibility audit from a smoke report", async () => {
+  const root = await fixture({
+    accessibility: {
+      counts: null,
+      status: "not-run",
+    },
+    scenario: "smoke",
+  });
+  try {
+    await validateE2EOutputs({
+      capabilityId: "playwright-ubuntu-chromium",
+      repositoryRoot: root,
+      requiredPatterns: ["diagnostics/web-calculator/result.json"],
+      resultReports: ["diagnostics/web-calculator/result.json"],
+      requireAccessibility: true,
+    });
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("rejects missing required output", async () => {
   const root = await fixture();
   try {
