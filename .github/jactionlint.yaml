@@ -1,13 +1,14 @@
 # Enforce the repository's baseline GitHub Actions policy.
-require-commit-hash: true
-require-permissions: true
-require-checkout-before-local-action: true
-require-expression-wrapping: true
-check-falsy-ternary: true
-check-workflow-run-names: true
-require-shell: true
-max-run-lines: 30
+profile: default
 
-timeout-minutes:
-  required: true
-  max: 30
+rules:
+  unpinned-uses: error
+  missing-permissions: error
+  local-action-checkout: error
+  require-expression-wrapping: error
+  unsound-ternary: error
+  workflow-run-names: error
+  require-shell: error
+  max-run-lines: {level: error, max: 30}
+  missing-timeout: error
+  timeout-too-long: {level: error, max: 30}

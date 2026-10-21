@@ -38,73 +38,68 @@ url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/
 provenance = "cosign"
 
 [[tools.hk]]
-version = "2.5.0"
+version = "2.6.0"
 backend = "packslip:github.com/jdx/hk"
-specifiers = ["2.5.0"]
+specifiers = ["2.6.0"]
 
 [tools.hk."platforms.linux-arm64"]
-checksum = "sha256:c800091c414e1c8e8628137275d88c257bcfe0c35dd31d2762923a71dae7df7f"
-url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:bcccd60f962a784bcf602b3a1ee6aac4dc53c76b298bffe38c4f9101725d2fb0"
+url = "https://github.com/jdx/hk/releases/download/v2.6.0/hk-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
-repository_ids = { repository = "922514152" }
 
 [tools.hk."platforms.linux-x64"]
-checksum = "sha256:449b83c35ac3a460f80a4c9a41ad99430add8cf6caa6ceadc27e810feac3647d"
-url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:dfc2e1140a114c28f42fa6d1b958fac7008de3b96b19bbf74d693c0f86bcff60"
+url = "https://github.com/jdx/hk/releases/download/v2.6.0/hk-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
-repository_ids = { repository = "922514152" }
 
 [tools.hk."platforms.macos-arm64"]
-checksum = "sha256:fabbed3a44e72c601759fa81d56f3c9403ca466853bdf77e87cc69d986cb151a"
-url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:40a336e793397d5940b284aae674477d430b24dc86167be92e080120d80e42f2"
+url = "https://github.com/jdx/hk/releases/download/v2.6.0/hk-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
-repository_ids = { repository = "922514152" }
 
 [tools.hk."platforms.windows-arm64"]
-checksum = "sha256:159a5586ddd3519eb3d497b0537ec7c78eefccfcf5378b9599530ee0900707d1"
-url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-aarch64-pc-windows-msvc.zip"
+checksum = "sha256:5ad64ea69dc0635bcbb7894baaea52b27728a4ef3498f2f689637bcfa75bef8d"
+url = "https://github.com/jdx/hk/releases/download/v2.6.0/hk-aarch64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
-repository_ids = { repository = "922514152" }
 
 [tools.hk."platforms.windows-x64"]
-checksum = "sha256:9d3063f0eadb316415dc2aaea51608f436eb6ffe44e00c2e460294c66f269a54"
-url = "https://github.com/jdx/hk/releases/download/v2.5.0/hk-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:5afd28127f09f6b5a5d246413611b4494ad38d30930dd0cd009a8d6aff0f4c3d"
+url = "https://github.com/jdx/hk/releases/download/v2.6.0/hk-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/hk/.github/workflows/release.yml"
-repository_ids = { repository = "922514152" }
 
 [[tools.jactionlint]]
-version = "1.8.2"
+version = "2.1.0"
 backend = "github:jdx/jactionlint"
-specifiers = ["1.8.2"]
+specifiers = ["2.1.0"]
 
 [tools.jactionlint."platforms.linux-arm64"]
-checksum = "sha256:7d618749dbddd762a14bd491ea97bc4f6599626f830a11edc6c6522ead8bcd05"
-url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1.8.2_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338576"
+checksum = "sha256:ec0c6496d8a2f37b2ae2a1af0fbf98d58df1f7c98a27cf9fdd64c20ad317234b"
+url = "https://github.com/jdx/jactionlint/releases/download/v2.1.0/jactionlint_2.1.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/628112146"
 provenance = "github-attestations"
 
 [tools.jactionlint."platforms.linux-x64"]
-checksum = "sha256:6533bd8047fc012a3f66238d84f65cacdac669da00b9f6cf042c1734c252bc93"
-url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1.8.2_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338580"
+checksum = "sha256:baebfc5792135438fb3bb5ea266c3bf2538a089753616f1988ef618e4c0c3cb1"
+url = "https://github.com/jdx/jactionlint/releases/download/v2.1.0/jactionlint_2.1.0_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/628112089"
 provenance = "github-attestations"
 
 [tools.jactionlint."platforms.macos-arm64"]
-checksum = "sha256:de9eb05af3cde409dc0b37fe2fd6a21b875a575374e7b26c02d45a7086645c28"
-url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1.8.2_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338605"
+checksum = "sha256:3766a4b0890d3eb36fe58760289885712131c7974de4bc9fabb9a3faa599e931"
+url = "https://github.com/jdx/jactionlint/releases/download/v2.1.0/jactionlint_2.1.0_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/628111988"
 provenance = "github-attestations"
 
 [tools.jactionlint."platforms.windows-arm64"]
-checksum = "sha256:ed774c6085d0606bf3ae8ec86cd540e328b73f0ae2b1397e42704495e18f7cc9"
-url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1.8.2_windows_arm64.zip"
-url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338618"
+checksum = "sha256:df3657e37da05b0fb1e3f05adb450e63c30b890fd4f434b03897915f5562b3cf"
+url = "https://github.com/jdx/jactionlint/releases/download/v2.1.0/jactionlint_2.1.0_windows_arm64.zip"
+url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/628112185"
 provenance = "github-attestations"
 
 [tools.jactionlint."platforms.windows-x64"]
-checksum = "sha256:fd7be539cd3276d5178f85ef140c1bb52395b1ec1f59b1585050e1be3b0b194b"
-url = "https://github.com/jdx/jactionlint/releases/download/v1.8.2/jactionlint_1.8.2_windows_amd64.zip"
-url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/611338616"
+checksum = "sha256:5925a118df6db8c5be418acb05bd815d3c14ca98d91a9ecba6156753b87d4ae7"
+url = "https://github.com/jdx/jactionlint/releases/download/v2.1.0/jactionlint_2.1.0_windows_amd64.zip"
+url_api = "https://api.github.com/repos/jdx/jactionlint/releases/assets/628112198"
 provenance = "github-attestations"
 
 [[tools.shellcheck]]
