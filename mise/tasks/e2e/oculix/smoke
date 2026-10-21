@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run the Oculix smoke scenario"
+set -euo pipefail
+
+mise run oculix:run tests/e2e/oculix/smoke.sikuli

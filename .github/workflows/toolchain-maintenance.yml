@@ -14,16 +14,6 @@ on:
 
 permissions: {}
 
-env:
-  GIT_AUTHOR_EMAIL: >-
-    ${{ format('{0}+{1}@users.noreply.github.com',
-        github.actor_id, github.actor) }}
-  GIT_AUTHOR_NAME: ${{ github.actor }}
-  GIT_COMMITTER_EMAIL: >-
-    ${{ format('{0}+{1}@users.noreply.github.com',
-        github.actor_id, github.actor) }}
-  GIT_COMMITTER_NAME: ${{ github.actor }}
-
 concurrency:
   group: toolchain-maintenance
   cancel-in-progress: false
@@ -83,11 +73,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure GitHub authentication
-        run: gh auth setup-git
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Create mise update
         id: prepare
         run: .github/scripts/toolchain-maintenance checked prepare-mise
@@ -106,7 +91,7 @@ jobs:
     if: ${{ needs.prepare_mise.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/cross-platform.yml
+    uses: $/.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_mise.outputs.head_sha }}
 
@@ -197,11 +182,6 @@ jobs:
           install: false
           cache: false
 
-      - name: Configure GitHub authentication
-        run: gh auth setup-git
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Create tool updates
         id: prepare
         run: .github/scripts/toolchain-maintenance checked prepare-tools
@@ -224,7 +204,7 @@ jobs:
     if: ${{ needs.prepare_tools.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/cross-platform.yml
+    uses: $/.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_tools.outputs.head_sha }}
 
@@ -321,11 +301,6 @@ jobs:
           install: false
           cache: false
 
-      - name: Configure GitHub authentication
-        run: gh auth setup-git
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Create oculix extras updates
         id: prepare
         run: .github/scripts/toolchain-maintenance checked prepare-extras-oculix
@@ -353,7 +328,7 @@ jobs:
     if: ${{ needs.prepare_extras_oculix.outputs.changed == 'true' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/cross-platform.yml
+    uses: $/.github/workflows/cross-platform.yml
     with:
       ref: ${{ needs.prepare_extras_oculix.outputs.head_sha }}
 
