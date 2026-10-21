@@ -1,0 +1,58 @@
+[
+  {
+    "version": "v25.3.0",
+    "date": "2026-10-19",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": false
+  },
+  {
+    "version": "v24.23.0",
+    "date": "2026-10-21",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": "Krypton"
+  },
+  {
+    "version": "v24.22.1",
+    "date": "2026-10-18",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": "Krypton"
+  },
+  {
+    "version": "v24.24.0",
+    "date": "2026-10-22",
+    "files": [
+      "headers",
+      "linux-arm64",
+      "linux-x64",
+      "osx-arm64-tar",
+      "src",
+      "win-arm64-zip",
+      "win-x64-zip"
+    ],
+    "lts": "Krypton"
+  }
+]
