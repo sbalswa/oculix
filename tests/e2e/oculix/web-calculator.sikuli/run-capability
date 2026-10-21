@@ -90,6 +90,7 @@ readiness_file="$user_data_directory/DevToolsActivePort"
 browser_binary=""
 browser_pid=""
 cleanup_failed=0
+chromium_sandbox="enabled"
 mkdir -p "$user_data_directory"
 trap cleanup_session EXIT
 trap 'exit 130' INT
@@ -129,23 +130,50 @@ if [[ -z "$browser_binary" ]]; then
   fail "Chromium is required for capability ubuntu-chromium."
 fi
 
+chromium_arguments=(
+  --app="$WEB_CALCULATOR_URL"
+  --disable-background-networking
+  --disable-component-update
+  --disable-default-apps
+  --disable-extensions
+  --disable-gpu
+  --disable-sync
+  --force-device-scale-factor=1
+  --no-default-browser-check
+  --no-first-run
+  --ozone-platform=x11
+  --remote-debugging-address=127.0.0.1
+  --remote-debugging-port=0
+  --user-data-dir="$user_data_directory"
+  "--window-position=0,0"
+  "--window-size=1280,1024"
+)
+
+case "${OCULIX_CHROMIUM_DISABLE_SANDBOX:-}" in
+  "")
+    ;;
+  1)
+    [[ "${GITHUB_ACTIONS:-}" == "true" ]] ||
+      fail \
+        "disabling Chromium's sandbox is allowed only in GitHub Actions." \
+        2
+    # GitHub-hosted Ubuntu 24.04 blocks Chromium's user-namespace sandbox.
+    # This opt-in capability runs in an ephemeral VM and loads only the
+    # repository's loopback fixture.
+    chromium_arguments+=(--no-sandbox)
+    chromium_sandbox="disabled-explicit-github-actions"
+    ;;
+  *)
+    fail \
+      "OCULIX_CHROMIUM_DISABLE_SANDBOX must be unset or 1." \
+      2
+    ;;
+esac
+printf 'chromium_sandbox=%s\n' "$chromium_sandbox" |
+  tee -a "$diagnostics_directory/environment.txt"
+
 "$browser_binary" \
-  --app="$WEB_CALCULATOR_URL" \
-  --disable-background-networking \
-  --disable-component-update \
-  --disable-default-apps \
-  --disable-extensions \
-  --disable-gpu \
-  --disable-sync \
-  --force-device-scale-factor=1 \
-  --no-default-browser-check \
-  --no-first-run \
-  --ozone-platform=x11 \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-debugging-port=0 \
-  --user-data-dir="$user_data_directory" \
-  --window-position=0,0 \
-  --window-size=1280,1024 \
+  "${chromium_arguments[@]}" \
   >"$browser_log" 2>&1 &
 browser_pid=$!
 

@@ -137,6 +137,8 @@ jobs:
       E2E_OS: ${{ matrix.os }}
       MISE_ENV: ${{ matrix.environment }}
       MISE_LOCKED: "1"
+      OCULIX_CHROMIUM_DISABLE_SANDBOX: >-
+        ${{ matrix.oculix_chromium_disable_sandbox || '' }}
 
     strategy:
       fail-fast: false
@@ -183,6 +185,7 @@ jobs:
             environment: oculix,web-e2e
             task: e2e:oculix:web-calculator
             diagnostics: oculix-web-calculator-diagnostics/
+            oculix_chromium_disable_sandbox: "1"
 
     steps:
       - name: Check out repository
