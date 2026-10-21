@@ -73,6 +73,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Create mise update
         id: prepare
         run: .github/scripts/toolchain-maintenance checked prepare-mise
@@ -181,6 +186,11 @@ jobs:
           version: ${{ steps.mise.outputs.version }}
           install: false
           cache: false
+
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Create tool updates
         id: prepare
@@ -300,6 +310,11 @@ jobs:
           version: ${{ steps.mise.outputs.version }}
           install: false
           cache: false
+
+      - name: Configure GitHub authentication
+        run: gh auth setup-git
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Create oculix extras updates
         id: prepare
