@@ -1,0 +1,50 @@
+{
+  "npm": {
+    "cypress": {
+      "name": "cypress",
+      "version": "16.3.0",
+      "dist": {
+        "tarball": "https://registry.npmjs.org/cypress/-/cypress-16.3.0.tgz",
+        "integrity": "sha512-cypress-candidate-integrity"
+      },
+      "engines": {
+        "node": "^22.0.0 || ^24.0.0 || >=26.0.0"
+      },
+      "warnings": []
+    },
+    "axe-core": {
+      "name": "axe-core",
+      "version": "4.15.0",
+      "dist": {
+        "tarball": "https://registry.npmjs.org/axe-core/-/axe-core-4.15.0.tgz",
+        "integrity": "sha512-axe-candidate-integrity"
+      },
+      "engines": {
+        "node": ">=4"
+      },
+      "warnings": []
+    }
+  },
+  "binary": {
+    "current": {
+      "version": "16.2.0",
+      "locator": "binaries/cypress-16.2.0.archive",
+      "warnings": []
+    },
+    "candidate": {
+      "version": "16.3.0",
+      "locator": "binaries/cypress-16.3.0.archive",
+      "warnings": []
+    }
+  },
+  "browser": {
+    "cypress-ubuntu-chrome": {
+      "browser": "chrome",
+      "runner": "ubuntu-latest",
+      "os": "ubuntu",
+      "version": "141.0.7390.54",
+      "path": "browser/google-chrome",
+      "warnings": []
+    }
+  }
+}
