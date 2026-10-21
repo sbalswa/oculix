@@ -1668,6 +1668,113 @@ function ebmlChildren(contents, start, end) {
   return offset === end ? children : null;
 }
 
+const SEGMENT_CHILD_IDS = new Set([
+  "1043a770",
+  "114d9b74",
+  "1254c367",
+  "1549a966",
+  "1654ae6b",
+  "1941a469",
+  "1c53bb6b",
+  "1f43b675",
+  "bf",
+  "ec",
+]);
+const SEGMENT_BOUNDARY_IDS = new Set(
+  [...SEGMENT_CHILD_IDS].filter((id) => !["bf", "ec"].includes(id)),
+);
+const CLUSTER_CHILD_IDS = new Set([
+  "5854",
+  "a0",
+  "a3",
+  "a7",
+  "ab",
+  "af",
+  "bf",
+  "e7",
+  "ec",
+]);
+
+function validSimpleBlock(contents, element) {
+  const track = ebmlVint(contents, element.dataStart);
+  return (
+    track !== null &&
+    track.value !== null &&
+    track.value > 0n &&
+    element.end - element.dataStart >= track.width + 4
+  );
+}
+
+function validateClusterChildren(
+  contents,
+  start,
+  limit,
+  { unknownSize },
+) {
+  const childIds = new Set();
+  let offset = start;
+  while (offset < limit) {
+    const identifier = ebmlVint(contents, offset, { identifier: true });
+    if (identifier === null) {
+      return null;
+    }
+    if (unknownSize && SEGMENT_BOUNDARY_IDS.has(identifier.value)) {
+      break;
+    }
+    const child = ebmlElement(contents, offset, limit);
+    if (
+      child === null ||
+      child.unknownSize ||
+      !CLUSTER_CHILD_IDS.has(child.id) ||
+      (child.id === "a3" && !validSimpleBlock(contents, child))
+    ) {
+      return null;
+    }
+    childIds.add(child.id);
+    offset = child.end;
+  }
+  if (
+    !childIds.has("e7") ||
+    (!childIds.has("a3") && !childIds.has("a0"))
+  ) {
+    return null;
+  }
+  return offset;
+}
+
+function validateSegmentChildren(contents, segment) {
+  const childIds = new Set();
+  let offset = segment.dataStart;
+  while (offset < segment.end) {
+    const child = ebmlElement(contents, offset, segment.end);
+    if (child === null || !SEGMENT_CHILD_IDS.has(child.id)) {
+      return null;
+    }
+    childIds.add(child.id);
+    if (child.id === "1f43b675") {
+      const clusterEnd = validateClusterChildren(
+        contents,
+        child.dataStart,
+        child.end,
+        { unknownSize: child.unknownSize },
+      );
+      if (clusterEnd === null || clusterEnd <= child.dataStart) {
+        return null;
+      }
+      offset = clusterEnd;
+    } else {
+      if (child.unknownSize) {
+        return null;
+      }
+      offset = child.end;
+    }
+  }
+  if (offset !== segment.end) {
+    return null;
+  }
+  return childIds;
+}
+
 function validWebm(contents) {
   const header = ebmlElement(contents, 0);
   if (
@@ -1702,17 +1809,12 @@ function validWebm(contents) {
   ) {
     return false;
   }
-  const segmentChildren = ebmlChildren(
-    contents,
-    segment.dataStart,
-    segment.end,
-  );
-  if (segmentChildren === null) {
+  const segmentChildIds = validateSegmentChildren(contents, segment);
+  if (segmentChildIds === null) {
     return false;
   }
-  const childIds = new Set(segmentChildren.map(({ id }) => id));
   return ["1549a966", "1654ae6b", "1f43b675"].every((id) =>
-    childIds.has(id));
+    segmentChildIds.has(id));
 }
 
 async function validateArtifactSemantics(workspaceRoot, path) {
