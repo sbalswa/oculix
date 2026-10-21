@@ -1,0 +1,18 @@
+# @generated fixture
+
+[[tools."http:oculixide"]]
+version = "4.0.0"
+backend = "http:oculixide"
+specifiers = ["4.0.0"]
+
+[tools."http:oculixide"."platforms.linux-arm64"]
+checksum = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[tools."http:oculixide"."platforms.linux-x64"]
+checksum = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[tools."http:oculixide"."platforms.macos-arm64"]
+checksum = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[tools."http:oculixide"."platforms.windows-x64"]
+checksum = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
