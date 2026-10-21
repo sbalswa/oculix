@@ -24,9 +24,6 @@ CONTROL_LAYOUT = {
     "equals": (145, 240, 137, 52),
 }
 CONTROL_SEARCH_MARGIN = 6
-CALCULATOR_SIDE_MARGIN = 19
-CALCULATOR_HEADER_HEIGHT = 104
-CALCULATOR_BOTTOM_MARGIN = 19
 
 
 def capability():
@@ -93,25 +90,6 @@ def result_region(controls):
     return Region(left, top, right - left, 72)
 
 
-def calculator_region(controls):
-    clear = controls["clear"]
-    multiply = controls["multiply"]
-    equals = controls["equals"]
-    left = clear.getX() - CALCULATOR_SIDE_MARGIN
-    top = clear.getY() - CALCULATOR_HEADER_HEIGHT
-    right = (
-        multiply.getX()
-        + multiply.getW()
-        + CALCULATOR_SIDE_MARGIN
-    )
-    bottom = (
-        equals.getY()
-        + equals.getH()
-        + CALCULATOR_BOTTOM_MARGIN
-    )
-    return Region(left, top, right - left, bottom - top)
-
-
 def wait_for_result(region):
     text = ""
     for _ in range(20):
@@ -173,16 +151,10 @@ try:
             % (EXPECTED_RESULT, text)
         )
 
-    diagnostics = os.environ["OCULIX_WEB_CALCULATOR_DIAGNOSTICS"]
-    desktop = screen.capture().getFile(
-        diagnostics,
-        "desktop",
-    )
-    evidence = screen.capture(calculator_region(controls)).getFile(
-        diagnostics,
+    evidence = screen.capture().getFile(
+        os.environ["OCULIX_WEB_CALCULATOR_DIAGNOSTICS"],
         "result",
     )
-    print("web-calculator: hosted desktop diagnostic = %s" % desktop)
     print("web-calculator: end-user result evidence = %s" % evidence)
     print(
         "web-calculator: %s verified clear, 7 * 34 = %s"
