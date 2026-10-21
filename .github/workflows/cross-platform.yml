@@ -13,7 +13,18 @@ on:
         description: Git commit to validate
         required: true
         type: string
+      run_e2e:
+        description: Run the explicit Phase 1 browser E2E matrix
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: Run the explicit Phase 1 browser E2E matrix
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -52,6 +63,23 @@ jobs:
             exit 1
           fi
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+      - name: Summarize selected Phase 1 E2E capabilities
+        if: ${{ inputs.run_e2e }}
+        shell: bash
+        run: |
+          cat >>"$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### Phase 1 E2E matrix
+
+          Selected 4 explicit capability cells:
+
+          | ID | Tool | Runner | Browser | Task |
+          |---|---|---|---|---|
+          | `selenium-ubuntu-chromium` | Selenium | `ubuntu-latest` | Chromium | `e2e:selenium` |
+          | `cypress-ubuntu-electron` | Cypress | `ubuntu-latest` | Electron | `e2e:cypress` |
+          | `playwright-ubuntu-chromium` | Playwright | `ubuntu-latest` | Chromium | `e2e:playwright` |
+          | `oculix-ubuntu-chromium` | Oculix | `ubuntu-latest` | Chromium | `e2e:oculix:web-calculator` |
+          EOF
 
   checks:
     needs: configuration
@@ -103,6 +131,114 @@ jobs:
         run: mise run ci
         env:
           GH_TOKEN: ${{ github.token }}
+
+  e2e:
+    if: ${{ inputs.run_e2e }}
+    needs: configuration
+    name: E2E ${{ matrix.id }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      E2E_BROWSER: ${{ matrix.browser }}
+      E2E_OS: ${{ matrix.os }}
+      MISE_ENV: ${{ matrix.environment }}
+      MISE_LOCKED: "1"
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - id: selenium-ubuntu-chromium
+            tool: selenium
+            runner: ubuntu-latest
+            os: ubuntu
+            browser: chromium
+            environment: web-e2e
+            task: e2e:selenium
+            diagnostics: tests/e2e/selenium/diagnostics/
+          - id: cypress-ubuntu-electron
+            tool: cypress
+            runner: ubuntu-latest
+            os: ubuntu
+            browser: electron
+            environment: web-e2e
+            task: e2e:cypress
+            diagnostics: tests/e2e/cypress/diagnostics/
+          - id: playwright-ubuntu-chromium
+            tool: playwright
+            runner: ubuntu-latest
+            os: ubuntu
+            browser: chromium
+            environment: web-e2e
+            task: e2e:playwright
+            diagnostics: tests/e2e/playwright/test-results/
+          - id: oculix-ubuntu-chromium
+            tool: oculix
+            runner: ubuntu-latest
+            os: ubuntu
+            browser: chromium
+            environment: oculix,web-e2e
+            task: e2e:oculix:web-calculator
+            diagnostics: oculix-web-calculator-diagnostics/
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.VALIDATION_REF }}
+          persist-credentials: false
+
+      - name: Install pinned toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: ${{ needs.configuration.outputs.mise-version }}
+          install_args: --locked
+
+      - name: Run selected E2E task on Unix
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        env:
+          E2E_TASK: ${{ matrix.task }}
+        run: mise run "$E2E_TASK"
+
+      - name: Run selected E2E task on Windows
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          E2E_TASK: ${{ matrix.task }}
+        run: |
+          & mise run $env:E2E_TASK
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Record capability result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          E2E_BROWSER_NAME: ${{ matrix.browser }}
+          E2E_CAPABILITY_ID: ${{ matrix.id }}
+          E2E_OS_NAME: ${{ matrix.os }}
+          E2E_TASK_NAME: ${{ matrix.task }}
+          E2E_TOOL_NAME: ${{ matrix.tool }}
+        run: |
+          {
+            printf "### \`%s\`\n\n" "$E2E_CAPABILITY_ID"
+            printf -- "- Tool: \`%s\`\n" "$E2E_TOOL_NAME"
+            printf -- "- OS: \`%s\`\n" "$E2E_OS_NAME"
+            printf -- "- Browser: \`%s\`\n" "$E2E_BROWSER_NAME"
+            printf -- "- Task: \`%s\`\n" "$E2E_TASK_NAME"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-${{ matrix.id }}-failure
+          path: ${{ matrix.diagnostics }}
+          if-no-files-found: warn
+          retention-days: 7
 
   oculix:
     needs: configuration

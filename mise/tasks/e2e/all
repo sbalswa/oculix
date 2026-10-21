@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Run the four Phase 1 E2E tool aggregates on Ubuntu"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+
+if [[ "$(uname -s)" != "Linux" ]] ||
+  ! grep -Eq '^ID="?ubuntu"?$' /etc/os-release; then
+  printf 'e2e:all currently supports the Phase 1 Ubuntu capabilities only.\n' >&2
+  exit 2
+fi
+
+E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:selenium
+E2E_OS=ubuntu E2E_BROWSER=electron mise run e2e:cypress
+E2E_OS=ubuntu E2E_BROWSER=chromium mise run e2e:playwright
+E2E_OS=ubuntu E2E_BROWSER=chromium mise -E oculix,web-e2e run e2e:oculix
