@@ -13,18 +13,7 @@ on:
         description: Git commit to validate
         required: true
         type: string
-      run_e2e:
-        description: Run the explicit Phase 1 browser E2E matrix
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
-    inputs:
-      run_e2e:
-        description: Run the explicit Phase 1 browser E2E matrix
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -63,17 +52,6 @@ jobs:
             exit 1
           fi
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
-
-      - name: Summarize selected Phase 1 E2E capabilities
-        if: ${{ inputs.run_e2e }}
-        shell: bash
-        run: |
-          cat >>"$GITHUB_STEP_SUMMARY" <<'EOF'
-          ### Phase 1 E2E matrix
-
-          Selected 4 explicit capability cells. Each matrix job records its
-          stable capability ID, position, task, dimensions, and result.
-          EOF
 
   checks:
     needs: configuration
@@ -125,107 +103,6 @@ jobs:
         run: mise run ci
         env:
           GH_TOKEN: ${{ github.token }}
-
-  e2e:
-    if: ${{ inputs.run_e2e }}
-    needs: configuration
-    name: E2E ${{ matrix.id || 'matrix (opt-in)' }}
-    uses: $/.github/workflows/e2e-executor.yml
-
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        include:
-          - id: selenium-ubuntu-chromium
-            position: 1
-            total: 4
-            tool: selenium
-            runner: ubuntu-latest
-            os: ubuntu
-            browser: chromium
-            environment: web-e2e
-            task: e2e:selenium
-            diagnostics: tests/e2e/selenium/diagnostics/
-            evidence: tests/e2e/selenium/diagnostics/web-calculator/result.png
-            required_files: >-
-              ["tests/e2e/selenium/diagnostics/web-calculator/result.png","tests/e2e/selenium/diagnostics/web-calculator/result.json","tests/e2e/selenium/diagnostics/web-calculator/accessibility.json","tests/e2e/selenium/diagnostics/web-calculator/accessibility-summary.md"]
-            result_reports: >-
-              ["tests/e2e/selenium/diagnostics/web-calculator/result.json"]
-            require_accessibility: true
-          - id: cypress-ubuntu-chrome
-            position: 2
-            total: 4
-            tool: cypress
-            runner: ubuntu-latest
-            os: ubuntu
-            browser: chrome
-            environment: web-e2e
-            task: e2e:cypress
-            diagnostics: tests/e2e/cypress/diagnostics/
-            evidence: >-
-              tests/e2e/cypress/diagnostics/web-calculator/screenshots/web-calculator.cy.mjs/result.png
-            required_files: >-
-              ["tests/e2e/cypress/diagnostics/smoke/run.json","tests/e2e/cypress/diagnostics/smoke/accessibility.json","tests/e2e/cypress/diagnostics/smoke/accessibility.md","tests/e2e/cypress/diagnostics/smoke/screenshots/**/*.png","tests/e2e/cypress/diagnostics/smoke/videos/**/*.mp4","tests/e2e/cypress/diagnostics/web-calculator/run.json","tests/e2e/cypress/diagnostics/web-calculator/accessibility.json","tests/e2e/cypress/diagnostics/web-calculator/accessibility.md","tests/e2e/cypress/diagnostics/web-calculator/screenshots/**/*.png","tests/e2e/cypress/diagnostics/web-calculator/videos/**/*.mp4","tests/e2e/cypress/diagnostics/summary.json","tests/e2e/cypress/diagnostics/summary.md"]
-            result_reports: >-
-              ["tests/e2e/cypress/diagnostics/smoke/run.json","tests/e2e/cypress/diagnostics/web-calculator/run.json"]
-            require_accessibility: true
-          - id: playwright-ubuntu-chromium
-            position: 3
-            total: 4
-            tool: playwright
-            runner: ubuntu-latest
-            os: ubuntu
-            browser: chromium
-            environment: web-e2e
-            task: e2e:playwright
-            diagnostics: tests/e2e/playwright/test-results/
-            evidence: tests/e2e/playwright/test-results/web-calculator/final.png
-            required_files: >-
-              ["tests/e2e/playwright/test-results/smoke/result.json","tests/e2e/playwright/test-results/smoke/playwright-report.json","tests/e2e/playwright/test-results/smoke/html-report/index.html","tests/e2e/playwright/test-results/smoke/artifacts/**/*.webm","tests/e2e/playwright/test-results/web-calculator/result.json","tests/e2e/playwright/test-results/web-calculator/accessibility.json","tests/e2e/playwright/test-results/web-calculator/accessibility-summary.json","tests/e2e/playwright/test-results/web-calculator/accessibility-summary.md","tests/e2e/playwright/test-results/web-calculator/final.png","tests/e2e/playwright/test-results/web-calculator/playwright-report.json","tests/e2e/playwright/test-results/web-calculator/html-report/index.html","tests/e2e/playwright/test-results/web-calculator/artifacts/**/*.webm"]
-            result_reports: >-
-              ["tests/e2e/playwright/test-results/smoke/result.json","tests/e2e/playwright/test-results/web-calculator/result.json"]
-            require_accessibility: true
-          - id: oculix-ubuntu-chromium
-            position: 4
-            total: 4
-            tool: oculix
-            runner: ubuntu-latest
-            os: ubuntu
-            browser: chromium
-            environment: oculix,web-e2e
-            task: e2e:oculix:web-calculator
-            diagnostics: oculix-web-calculator-diagnostics/
-            evidence: oculix-web-calculator-diagnostics/result.png
-            required_files: >-
-              ["oculix-web-calculator-diagnostics/result.png"]
-            result_reports: "[]"
-            require_accessibility: false
-            linux_packages: xdotool
-            oculix_chromium_disable_sandbox: "1"
-            use_xvfb: true
-
-    with:
-      ref: ${{ inputs.ref || github.ref }}
-      mise_version: ${{ needs.configuration.outputs.mise-version }}
-      id: ${{ matrix.id }}
-      position: ${{ matrix.position }}
-      total: ${{ matrix.total }}
-      tool: ${{ matrix.tool }}
-      runner: ${{ matrix.runner }}
-      os: ${{ matrix.os }}
-      browser: ${{ matrix.browser }}
-      environment: ${{ matrix.environment }}
-      task: ${{ matrix.task }}
-      diagnostics: ${{ matrix.diagnostics }}
-      evidence: ${{ matrix.evidence }}
-      required_files: ${{ matrix.required_files }}
-      result_reports: ${{ matrix.result_reports }}
-      require_accessibility: ${{ matrix.require_accessibility }}
-      linux_packages: ${{ matrix.linux_packages || '' }}
-      oculix_chromium_disable_sandbox: >-
-        ${{ matrix.oculix_chromium_disable_sandbox || '' }}
-      use_xvfb: ${{ matrix.use_xvfb || false }}
 
   oculix:
     needs: configuration
