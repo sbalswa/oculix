@@ -23,3 +23,7 @@ run = "hk check --all"
 description = "Run the mocked toolchain-maintenance Bats suite"
 run = "bats tests/toolchain-maintenance"
 run_windows = "echo Toolchain-maintenance Bats tests run on Unix hosts."
+
+[tasks."test:dependency-qualification"]
+description = "Run the dependency qualification contract suite"
+run = "mise -E web-e2e exec -- node --test .github/scripts/dependency-qualification/*.test.mjs"

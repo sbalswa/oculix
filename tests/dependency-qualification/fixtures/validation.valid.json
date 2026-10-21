@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "kind": "validation",
+  "generated_at": "2026-10-21T16:10:00Z",
+  "repository": {
+    "name": "sbalswa/oculix",
+    "revision": "15096fea5e27f02d5cd3e52b31c55df7b263be0a"
+  },
+  "capability_catalog": {
+    "schema_version": 1,
+    "digest": "sha256:8bf5613768ba1f8f6cd2a2ff4ef00f05978f47499c40d99c07692a750ae8ec9b"
+  },
+  "provider_id": "selenium",
+  "candidate_digest": "a281f8eab70277361912dc5ef9202e9a90f2dcd5ff32e19869db5452d23028af",
+  "disposition": {
+    "state": "independently-qualified",
+    "reason_codes": []
+  },
+  "results": [
+    {
+      "capability_id": "selenium-ubuntu-chromium",
+      "status": "pass",
+      "warnings": [],
+      "evidence": [
+        {
+          "type": "github-actions-run",
+          "locator": "https://github.com/sbalswa/oculix/actions/runs/1",
+          "revision": "15096fea5e27f02d5cd3e52b31c55df7b263be0a",
+          "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "started_at": "2026-10-21T16:05:00Z",
+          "completed_at": "2026-10-21T16:09:00Z"
+        }
+      ]
+    }
+  ]
+}
