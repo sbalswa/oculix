@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,6 @@ import {
   buildNodeIndependentValidation,
   collectNodeObservation,
   NODE_CAPABILITY_IDS,
-  nodeValidationEvidence,
   planNodeIndependentValidation,
 } from "./node-collector.mjs";
 import {
@@ -39,9 +38,17 @@ async function fixture(name) {
   return readFile(resolve(FIXTURES, name), "utf8");
 }
 
-function releaseMetadata(index, checksums = new Map()) {
+function releaseMetadata(
+  index,
+  checksums = new Map(),
+  {
+    indexUrl = "https://node.example.test/releases/index.json",
+    releaseBaseUrl = "https://node.example.test/dist",
+  } = {},
+) {
   return {
     calls: [],
+    indexUrl,
     async listReleases() {
       this.calls.push(["listReleases"]);
       return index;
@@ -53,6 +60,7 @@ function releaseMetadata(index, checksums = new Map()) {
       }
       return checksums.get(version);
     },
+    releaseBaseUrl,
   };
 }
 
@@ -183,14 +191,47 @@ test("malformed release metadata fails closed as unavailable", async () => {
     observation);
   });
 
+test("empty, duplicate, conflicting, and unsafe release records are unavailable",
+  async () => {
+    const candidate = JSON.parse(await fixture("releases.candidate.json"))[1];
+    const malformedIndexes = [
+      [],
+      [candidate, structuredClone(candidate)],
+      [
+        candidate,
+        {
+          ...structuredClone(candidate),
+          date: "2026-10-20",
+          files: candidate.files.slice(1),
+        },
+      ],
+      [{
+        ...structuredClone(candidate),
+        version: "v24.9007199254740992.0",
+      }],
+    ];
+
+    for (const index of malformedIndexes) {
+      const observation = await collectWith(
+        releaseMetadata(JSON.stringify(index)),
+      );
+      assert.equal(observation.disposition.state, "unavailable");
+      assert.deepEqual(observation.disposition.reason_codes,
+        ["RELEASE_METADATA_MALFORMED"]);
+      assert.equal(component(observation, "node-runtime").candidate, null);
+    }
+  });
+
 test("release source failures remain unavailable", async () => {
   const source = {
+    indexUrl: "https://node.example.test/releases/index.json",
     async listReleases() {
       throw new Error("simulated release source outage");
     },
     async readChecksums() {
       assert.fail("checksums must not be requested");
     },
+    releaseBaseUrl: "https://node.example.test/dist",
   };
   const observation = await collectWith(source);
 
@@ -218,6 +259,116 @@ test("missing candidate artifact checksums fail closed", async () => {
   assert.deepEqual(observation.disposition.reason_codes,
     ["RELEASE_METADATA_MALFORMED"]);
   assert.equal(component(observation, "node-runtime").candidate, null);
+  });
+
+test("lock platform labels must match unique effective artifacts",
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "node-platform-lock-"));
+    context.after(() => rm(directory, { force: true, recursive: true }));
+    const config = await fixture("config.web-e2e.toml");
+    const lock = await fixture("mise.web-e2e.lock");
+    const source = releaseMetadata(await fixture("releases.current.json"));
+    await writeFile(join(directory, "config.toml"), config);
+
+    const mismatched = lock.replace(
+      'platforms.windows-x64"',
+      'platforms.windows-amd64"',
+    );
+    await writeFile(join(directory, "mismatched.lock"), mismatched);
+    await assert.rejects(
+      collectNodeObservation({
+        capabilityCatalogPath: CAPABILITY_PATH,
+        configPath: "config.toml",
+        generatedAt: GENERATED_AT,
+        lockPath: "mismatched.lock",
+        releaseMetadata: source,
+        repository: REPOSITORY,
+        repositoryRoot: directory,
+      }),
+      /platform windows-amd64 does not match artifact windows-x64/,
+    );
+
+    const linuxX64Block = lock.match(
+      /\[tools\.node\."platforms\.linux-x64"\][\s\S]*?url = "[^"]+"\n/u,
+    )[0];
+    await writeFile(
+      join(directory, "duplicate.lock"),
+      `${lock.trimEnd()}\n\n${linuxX64Block}`,
+    );
+    await assert.rejects(
+      collectNodeObservation({
+        capabilityCatalogPath: CAPABILITY_PATH,
+        configPath: "config.toml",
+        generatedAt: GENERATED_AT,
+        lockPath: "duplicate.lock",
+        releaseMetadata: source,
+        repository: REPOSITORY,
+        repositoryRoot: directory,
+      }),
+      /duplicate Node platforms|duplicate effective Node artifacts/,
+    );
+  });
+
+test("configurable repository paths and release locators remain evidence",
+  async (context) => {
+    const directory = await mkdtemp(join(tmpdir(), "node-locators-"));
+    context.after(() => rm(directory, { force: true, recursive: true }));
+    await mkdir(join(directory, "policy"), { recursive: true });
+    await mkdir(join(directory, "locks"), { recursive: true });
+    await Promise.all([
+      writeFile(
+        join(directory, "policy/runtime.toml"),
+        await fixture("config.web-e2e.toml"),
+      ),
+      writeFile(
+        join(directory, "locks/runtime.lock"),
+        await fixture("mise.web-e2e.lock"),
+      ),
+    ]);
+    const indexUrl = "https://metadata.example.test/node/releases.json";
+    const releaseBaseUrl = "https://artifacts.example.test/node";
+    const observation = await collectNodeObservation({
+      capabilityCatalogPath: CAPABILITY_PATH,
+      configPath: "policy/runtime.toml",
+      generatedAt: GENERATED_AT,
+      lockPath: "locks/runtime.lock",
+      releaseMetadata: releaseMetadata(
+        await fixture("releases.candidate.json"),
+        new Map([[
+          "24.23.0",
+          await fixture("SHASUMS256-v24.23.0.txt"),
+        ]]),
+        { indexUrl, releaseBaseUrl },
+      ),
+      repository: REPOSITORY,
+      repositoryRoot: directory,
+    });
+
+    const channel = component(observation, "node-release-channel");
+    const runtime = component(observation, "node-runtime");
+    assert.equal(channel.current.evidence[0].locator, "policy/runtime.toml");
+    assert.deepEqual(channel.eventual_managed_paths, ["policy/runtime.toml"]);
+    assert.equal(runtime.current.evidence[0].locator, "locks/runtime.lock");
+    assert.deepEqual(runtime.eventual_managed_paths, ["locks/runtime.lock"]);
+    assert.equal(
+      runtime.candidate.evidence.find(
+        ({ type }) => type === "upstream-release-index",
+      ).locator,
+      indexUrl,
+    );
+    assert.equal(
+      runtime.candidate.evidence.find(
+        ({ type }) => type === "upstream-release-checksums",
+      ).locator,
+      `${releaseBaseUrl}/v24.23.0/SHASUMS256.txt`,
+    );
+    assert.ok(
+      runtime.candidate.evidence
+        .filter(({ type }) => type === "upstream-release-artifact")
+        .every(({ locator }) => locator.startsWith(
+          `${releaseBaseUrl}/v24.23.0/`,
+        )),
+    );
   });
 
 test("collection never mutates config, lockfiles, or unrelated files",
@@ -257,7 +408,7 @@ test("collection never mutates config, lockfiles, or unrelated files",
       sentinel);
   });
 
-test("ephemeral validation plans bind candidate, runner, commands, and commit",
+test("qualification rejects every forged prescribed-plan field",
   async () => {
     const observation = await collectWith(
       releaseMetadata(
@@ -298,36 +449,40 @@ test("ephemeral validation plans bind candidate, runner, commands, and commit",
     ]);
     assert.equal(plan.git_state_guard.require_unchanged, true);
 
-    const timestamps = {
+    const execution = {
+      plan,
+      status: "pass",
+      warnings: [],
       startedAt: "2026-10-21T17:01:00Z",
       completedAt: "2026-10-21T17:02:00Z",
     };
-    const evidence = nodeValidationEvidence(plan, observation, timestamps);
     for (const mutation of [
+      (copy) => { copy.unexpected = undefined; },
       (copy) => { copy.runner = "macos-latest"; },
+      (copy) => { copy.candidate.tool = "node@24.22.0"; },
+      (copy) => { copy.candidate.version = "24.22.0"; },
+      (copy) => { copy.candidate.mode = "repository-relock"; },
       (copy) => {
         copy.commands[1].argv[copy.commands[1].argv.length - 1] =
           "e2e:cypress";
       },
+      (copy) => { copy.environment.MISE_NODE_VERSION = "24.22.0"; },
+      (copy) => { copy.environment.EXTRA = "forged"; },
+      (copy) => { copy.git_state_guard.require_unchanged = false; },
+      (copy) => { copy.git_state_guard.argv = ["git", "status", "--short"]; },
       (copy) => { copy.repository.revision = "1".repeat(40); },
       (copy) => { copy.candidate_digest = "2".repeat(64); },
     ]) {
-      const changed = structuredClone(plan);
-      mutation(changed);
-      if (
-        changed.repository.revision === plan.repository.revision &&
-        changed.candidate_digest === plan.candidate_digest
-      ) {
-        assert.notEqual(
-          nodeValidationEvidence(changed, observation, timestamps).digest,
-          evidence.digest,
-        );
-      } else {
-        assert.throws(
-          () => nodeValidationEvidence(changed, observation, timestamps),
-          /does not bind the Node observation/,
-        );
-      }
+      const forged = structuredClone(execution);
+      mutation(forged.plan);
+      await assert.rejects(
+        buildNodeIndependentValidation(observation, [forged], {
+          capabilityCatalogPath: CAPABILITY_PATH,
+          generatedAt: "2026-10-21T17:20:00Z",
+          repositoryRoot: REPOSITORY_ROOT,
+        }),
+        /does not match the prescribed plan/,
+      );
     }
   });
 

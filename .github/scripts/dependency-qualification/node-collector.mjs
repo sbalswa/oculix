@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import {
   readCapabilityCatalog,
@@ -58,12 +59,26 @@ function metadataError(message) {
   throw new NodeReleaseMetadataError(message);
 }
 
+function compareLexically(left, right) {
+  if (left < right) {
+    return -1;
+  }
+  if (left > right) {
+    return 1;
+  }
+  return 0;
+}
+
 function parseSemver(value, context) {
   const match = SEMVER_PATTERN.exec(value);
   if (match === null) {
     throw new Error(`${context} must be a stable semantic version`);
   }
-  return match.slice(1).map(Number);
+  const components = match.slice(1).map(Number);
+  if (components.some((component) => !Number.isSafeInteger(component))) {
+    throw new Error(`${context} contains an unsafe numeric component`);
+  }
+  return components;
 }
 
 function compareSemver(left, right) {
@@ -77,7 +92,7 @@ function compareSemver(left, right) {
   return 0;
 }
 
-function parseRequestedChannel(config) {
+function parseRequestedChannel(config, configRepositoryPath) {
   const lines = config.split(/\r?\n/u);
   let inTools = false;
   const values = [];
@@ -101,7 +116,12 @@ function parseRequestedChannel(config) {
   }
   if (values.length !== 1 || !/^[1-9]\d*$/u.test(values[0])) {
     throw new Error(
-      `${NODE_CONFIG_PATH} must contain one numeric Node release channel`,
+      `${configRepositoryPath} must contain one numeric Node release channel`,
+    );
+  }
+  if (!Number.isSafeInteger(Number(values[0]))) {
+    throw new Error(
+      `${configRepositoryPath} contains an unsafe Node release channel`,
     );
   }
   return values[0];
@@ -119,52 +139,61 @@ function parseTomlString(block, key, context) {
   return match[1];
 }
 
-function parseSpecifierArray(block) {
+function parseSpecifierArray(block, lockRepositoryPath) {
   const match = /^\s*specifiers\s*=\s*(\[[^\n]+\])\s*(?:#.*)?$/mu.exec(
     block,
   );
   if (match === null) {
-    throw new Error(`${NODE_LOCK_PATH} must contain Node specifiers`);
+    throw new Error(`${lockRepositoryPath} must contain Node specifiers`);
   }
   let specifiers;
   try {
     specifiers = JSON.parse(match[1]);
   } catch {
-    throw new Error(`${NODE_LOCK_PATH} contains invalid Node specifiers`);
+    throw new Error(`${lockRepositoryPath} contains invalid Node specifiers`);
   }
   if (
     !Array.isArray(specifiers) ||
     specifiers.length === 0 ||
     specifiers.some((specifier) => typeof specifier !== "string")
   ) {
-    throw new Error(`${NODE_LOCK_PATH} contains invalid Node specifiers`);
+    throw new Error(`${lockRepositoryPath} contains invalid Node specifiers`);
   }
   return specifiers;
 }
 
-function releaseToken(filename) {
+function artifactIdentity(filename, lockRepositoryPath) {
   let match = /^node-v\d+\.\d+\.\d+-(linux)-(arm64|x64)\.tar\.gz$/u.exec(
     filename,
   );
   if (match !== null) {
-    return `${match[1]}-${match[2]}`;
+    return {
+      platform: `${match[1]}-${match[2]}`,
+      releaseToken: `${match[1]}-${match[2]}`,
+    };
   }
   match = /^node-v\d+\.\d+\.\d+-darwin-(arm64|x64)\.tar\.gz$/u.exec(
     filename,
   );
   if (match !== null) {
-    return `osx-${match[1]}-tar`;
+    return {
+      platform: `macos-${match[1]}`,
+      releaseToken: `osx-${match[1]}-tar`,
+    };
   }
   match = /^node-v\d+\.\d+\.\d+-win-(arm64|x64)\.zip$/u.exec(filename);
   if (match !== null) {
-    return `win-${match[1]}-zip`;
+    return {
+      platform: `windows-${match[1]}`,
+      releaseToken: `win-${match[1]}-zip`,
+    };
   }
   throw new Error(
-    `${NODE_LOCK_PATH} contains an unsupported Node artifact ${filename}`,
+    `${lockRepositoryPath} contains an unsupported Node artifact ${filename}`,
   );
 }
 
-function parseLock(lock, requestedChannel) {
+function parseLock(lock, requestedChannel, lockRepositoryPath) {
   const toolHeader = "[[tools.node]]";
   const starts = [];
   let offset = lock.indexOf(toolHeader);
@@ -173,7 +202,9 @@ function parseLock(lock, requestedChannel) {
     offset = lock.indexOf(toolHeader, offset + toolHeader.length);
   }
   if (starts.length !== 1) {
-    throw new Error(`${NODE_LOCK_PATH} must contain one Node tool record`);
+    throw new Error(
+      `${lockRepositoryPath} must contain one Node tool record`,
+    );
   }
 
   const toolStart = starts[0] + toolHeader.length;
@@ -182,21 +213,31 @@ function parseLock(lock, requestedChannel) {
     toolStart,
     nextHeader === -1 ? lock.length : nextHeader,
   );
-  const version = parseTomlString(toolBlock, "version", NODE_LOCK_PATH);
-  parseSemver(version, `${NODE_LOCK_PATH} Node version`);
-  const backend = parseTomlString(toolBlock, "backend", NODE_LOCK_PATH);
+  const version = parseTomlString(
+    toolBlock,
+    "version",
+    lockRepositoryPath,
+  );
+  parseSemver(version, `${lockRepositoryPath} Node version`);
+  const backend = parseTomlString(
+    toolBlock,
+    "backend",
+    lockRepositoryPath,
+  );
   if (backend !== "core:node") {
-    throw new Error(`${NODE_LOCK_PATH} Node backend must be core:node`);
+    throw new Error(`${lockRepositoryPath} Node backend must be core:node`);
   }
-  const specifiers = parseSpecifierArray(toolBlock);
+  const specifiers = parseSpecifierArray(toolBlock, lockRepositoryPath);
   if (!specifiers.includes(requestedChannel)) {
     throw new Error(
-      `${NODE_LOCK_PATH} does not resolve requested channel ${requestedChannel}`,
+      `${lockRepositoryPath} does not resolve requested channel ` +
+        requestedChannel,
     );
   }
   if (String(parseSemver(version, version)[0]) !== requestedChannel) {
     throw new Error(
-      `${NODE_LOCK_PATH} resolved version is outside channel ${requestedChannel}`,
+      `${lockRepositoryPath} resolved version is outside channel ` +
+        requestedChannel,
     );
   }
 
@@ -207,7 +248,9 @@ function parseLock(lock, requestedChannel) {
   for (const [index, match] of matches.entries()) {
     const platform = match[1];
     if (!PLATFORM_PATTERN.test(platform)) {
-      throw new Error(`${NODE_LOCK_PATH} contains invalid platform ${platform}`);
+      throw new Error(
+        `${lockRepositoryPath} contains invalid platform ${platform}`,
+      );
     }
     const blockStart = match.index + match[0].length;
     const blockEnd =
@@ -216,41 +259,66 @@ function parseLock(lock, requestedChannel) {
     const checksum = parseTomlString(block, "checksum", platform);
     if (!checksum.startsWith("sha256:") ||
         !SHA256_PATTERN.test(checksum.slice("sha256:".length))) {
-      throw new Error(`${NODE_LOCK_PATH} contains invalid ${platform} checksum`);
+      throw new Error(
+        `${lockRepositoryPath} contains invalid ${platform} checksum`,
+      );
     }
     const url = parseTomlString(block, "url", platform);
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
     } catch {
-      throw new Error(`${NODE_LOCK_PATH} contains invalid ${platform} URL`);
+      throw new Error(
+        `${lockRepositoryPath} contains invalid ${platform} URL`,
+      );
     }
     const filename = parsedUrl.pathname.split("/").at(-1);
     if (
       parsedUrl.protocol !== "https:" ||
       parsedUrl.hostname !== "nodejs.org" ||
       !parsedUrl.pathname.includes(`/dist/v${version}/`) ||
-      !filename.includes(`node-v${version}-`)
+      !filename.includes(`node-v${version}-`) ||
+      parsedUrl.search !== "" ||
+      parsedUrl.hash !== ""
     ) {
       throw new Error(
-        `${NODE_LOCK_PATH} ${platform} URL does not bind Node ${version}`,
+        `${lockRepositoryPath} ${platform} URL does not bind Node ${version}`,
+      );
+    }
+    const identity = artifactIdentity(filename, lockRepositoryPath);
+    if (identity.platform !== platform) {
+      throw new Error(
+        `${lockRepositoryPath} platform ${platform} does not match ` +
+          `artifact ${identity.platform}`,
       );
     }
     platforms.push({
       checksum,
       filename,
       platform,
-      releaseToken: releaseToken(filename),
+      releaseToken: identity.releaseToken,
       url,
     });
   }
   if (platforms.length === 0) {
-    throw new Error(`${NODE_LOCK_PATH} must contain Node platform records`);
+    throw new Error(
+      `${lockRepositoryPath} must contain Node platform records`,
+    );
   }
-  platforms.sort((left, right) => left.platform.localeCompare(right.platform));
+  platforms.sort((left, right) =>
+    compareLexically(left.platform, right.platform),
+  );
   if (new Set(platforms.map(({ platform }) => platform)).size !==
       platforms.length) {
-    throw new Error(`${NODE_LOCK_PATH} contains duplicate Node platforms`);
+    throw new Error(
+      `${lockRepositoryPath} contains duplicate Node platforms`,
+    );
+  }
+  if (new Set(platforms.map(({ filename }) => filename)).size !==
+      platforms.length) {
+    throw new Error(
+      `${lockRepositoryPath} contains duplicate effective Node artifacts`,
+    );
   }
   return { platforms, version };
 }
@@ -280,6 +348,10 @@ function parseReleaseIndex(raw) {
   if (!Array.isArray(releases)) {
     metadataError("Node release index must be an array");
   }
+  if (releases.length === 0) {
+    metadataError("Node release index must not be empty");
+  }
+  const seenVersions = new Set();
   return releases.map((release) => {
     if (release === null || typeof release !== "object" ||
         Array.isArray(release)) {
@@ -295,6 +367,10 @@ function parseReleaseIndex(raw) {
     } catch {
       metadataError("Node release version is malformed");
     }
+    if (seenVersions.has(version)) {
+      metadataError(`Node release index duplicates v${version}`);
+    }
+    seenVersions.add(version);
     if (
       !Array.isArray(release.files) ||
       release.files.some((file) => typeof file !== "string" || file === "") ||
@@ -318,17 +394,67 @@ function parseReleaseIndex(raw) {
   });
 }
 
-function candidateArtifact(platform, currentVersion, candidateVersion) {
+function normalizeBaseUrl(value, context) {
+  let locator;
+  try {
+    locator = new URL(value);
+  } catch {
+    metadataError(`${context} is not a valid URL`);
+  }
+  if (
+    !["http:", "https:"].includes(locator.protocol) ||
+    locator.search !== "" ||
+    locator.hash !== ""
+  ) {
+    metadataError(`${context} must be an HTTP(S) base URL`);
+  }
+  return locator.href.replace(/\/+$/u, "");
+}
+
+function normalizeIndexUrl(value) {
+  let locator;
+  try {
+    locator = new URL(value);
+  } catch {
+    metadataError("Node release index locator is not a valid URL");
+  }
+  if (!["http:", "https:"].includes(locator.protocol)) {
+    metadataError("Node release index locator must be HTTP(S)");
+  }
+  return locator.href;
+}
+
+function normalizeReleaseSource(releaseMetadata) {
+  if (
+    releaseMetadata === null ||
+    typeof releaseMetadata !== "object" ||
+    typeof releaseMetadata.listReleases !== "function" ||
+    typeof releaseMetadata.readChecksums !== "function"
+  ) {
+    metadataError("Node release metadata source is malformed");
+  }
+  return {
+    indexUrl: normalizeIndexUrl(releaseMetadata.indexUrl),
+    listReleases: releaseMetadata.listReleases.bind(releaseMetadata),
+    readChecksums: releaseMetadata.readChecksums.bind(releaseMetadata),
+    releaseBaseUrl: normalizeBaseUrl(
+      releaseMetadata.releaseBaseUrl,
+      "Node release base locator",
+    ),
+  };
+}
+
+function candidateArtifact(
+  platform,
+  currentVersion,
+  candidateVersion,
+  releaseBaseUrl,
+) {
   const filename = platform.filename.replace(
     `node-v${currentVersion}-`,
     `node-v${candidateVersion}-`,
   );
-  const url = platform.url
-    .replace(`/v${currentVersion}/`, `/v${candidateVersion}/`)
-    .replace(
-      `node-v${currentVersion}-`,
-      `node-v${candidateVersion}-`,
-    );
+  const url = `${releaseBaseUrl}/v${candidateVersion}/${filename}`;
   return { ...platform, filename, url };
 }
 
@@ -366,8 +492,31 @@ function selectCandidate(releases, requestedChannel, currentVersion, platforms,
       release.date <= generatedAt.slice(0, 10) &&
       [...expectedTokens].every((token) => release.files.includes(token)),
     )
-    .sort((left, right) => compareSemver(right.version, left.version))[0] ??
+    .sort((left, right) => {
+      const precedence = compareSemver(right.version, left.version);
+      return precedence === 0
+        ? compareLexically(left.version, right.version)
+        : precedence;
+    })[0] ??
     null;
+}
+
+function repositoryFileLocation(repositoryRoot, configuredPath, name) {
+  if (typeof configuredPath !== "string" || configuredPath === "") {
+    throw new Error(`${name} must be a nonempty path`);
+  }
+  const root = resolve(repositoryRoot);
+  const absolutePath = resolve(root, configuredPath);
+  const repositoryPath = relative(root, absolutePath).split(sep).join("/");
+  if (
+    repositoryPath === "" ||
+    repositoryPath === ".." ||
+    repositoryPath.startsWith("../") ||
+    isAbsolute(repositoryPath)
+  ) {
+    throw new Error(`${name} must resolve inside the repository`);
+  }
+  return { absolutePath, repositoryPath };
 }
 
 function repositoryFileEvidence(path, content, revision, observedAt) {
@@ -394,8 +543,10 @@ function buildComponents({
   candidate,
   candidateEvidence,
   config,
+  configRepositoryPath,
   generatedAt,
   lock,
+  lockRepositoryPath,
   repository,
   requestedChannel,
   resolved,
@@ -409,7 +560,7 @@ function buildComponents({
         version: requestedChannel,
         evidence: [
           repositoryFileEvidence(
-            NODE_CONFIG_PATH,
+            configRepositoryPath,
             config,
             repository.revision,
             generatedAt,
@@ -417,7 +568,7 @@ function buildComponents({
         ],
       },
       candidate: null,
-      eventual_managed_paths: [NODE_CONFIG_PATH],
+      eventual_managed_paths: [configRepositoryPath],
       affected_capabilities: [...NODE_CAPABILITY_IDS],
     },
     {
@@ -428,7 +579,7 @@ function buildComponents({
         version: resolved.version,
         evidence: [
           repositoryFileEvidence(
-            NODE_LOCK_PATH,
+            lockRepositoryPath,
             lock,
             repository.revision,
             generatedAt,
@@ -445,7 +596,7 @@ function buildComponents({
               version: candidate.version,
               evidence: candidateEvidence,
             },
-      eventual_managed_paths: [NODE_LOCK_PATH],
+      eventual_managed_paths: [lockRepositoryPath],
       affected_capabilities: [...NODE_CAPABILITY_IDS],
     },
   ];
@@ -456,9 +607,11 @@ function buildObservation({
   candidate,
   candidateEvidence,
   config,
+  configRepositoryPath,
   disposition,
   generatedAt,
   lock,
+  lockRepositoryPath,
   repository,
   requestedChannel,
   resolved,
@@ -478,8 +631,10 @@ function buildObservation({
       candidate,
       candidateEvidence,
       config,
+      configRepositoryPath,
       generatedAt,
       lock,
+      lockRepositoryPath,
       repository,
       requestedChannel,
       resolved,
@@ -535,14 +690,20 @@ export function createNodeReleaseMetadataSource({
   if (typeof fetchImpl !== "function") {
     throw new Error("fetchImpl must be a function");
   }
+  const normalizedIndexUrl = normalizeIndexUrl(indexUrl);
+  const normalizedReleaseBaseUrl = normalizeBaseUrl(
+    releaseBaseUrl,
+    "Node release base locator",
+  );
   return {
-    indexUrl,
-    listReleases: () => fetchText(fetchImpl, indexUrl),
+    indexUrl: normalizedIndexUrl,
+    listReleases: () => fetchText(fetchImpl, normalizedIndexUrl),
     readChecksums: (version) =>
       fetchText(
         fetchImpl,
-        `${releaseBaseUrl}/v${version}/SHASUMS256.txt`,
+        `${normalizedReleaseBaseUrl}/v${version}/SHASUMS256.txt`,
       ),
+    releaseBaseUrl: normalizedReleaseBaseUrl,
   };
 }
 
@@ -556,9 +717,19 @@ export async function collectNodeObservation({
   repositoryRoot = process.cwd(),
 } = {}) {
   const normalizedRepository = normalizeRepository(repository);
+  const configLocation = repositoryFileLocation(
+    repositoryRoot,
+    configPath,
+    "configPath",
+  );
+  const lockLocation = repositoryFileLocation(
+    repositoryRoot,
+    lockPath,
+    "lockPath",
+  );
   const [config, lock, capabilityCatalog] = await Promise.all([
-    readFile(resolve(repositoryRoot, configPath), "utf8"),
-    readFile(resolve(repositoryRoot, lockPath), "utf8"),
+    readFile(configLocation.absolutePath, "utf8"),
+    readFile(lockLocation.absolutePath, "utf8"),
     readCapabilityCatalog(resolve(repositoryRoot, capabilityCatalogPath)),
   ]);
   for (const capabilityId of NODE_CAPABILITY_IDS) {
@@ -566,18 +737,37 @@ export async function collectNodeObservation({
       throw new Error(`capability catalog is missing ${capabilityId}`);
     }
   }
-  const requestedChannel = parseRequestedChannel(config);
-  const resolved = parseLock(lock, requestedChannel);
+  const requestedChannel = parseRequestedChannel(
+    config,
+    configLocation.repositoryPath,
+  );
+  const resolved = parseLock(
+    lock,
+    requestedChannel,
+    lockLocation.repositoryPath,
+  );
+  const observationInput = {
+    capabilityCatalog,
+    config,
+    configRepositoryPath: configLocation.repositoryPath,
+    generatedAt,
+    lock,
+    lockRepositoryPath: lockLocation.repositoryPath,
+    repository: normalizedRepository,
+    requestedChannel,
+    resolved,
+  };
 
   let releases;
+  let source;
   try {
-    releases = parseReleaseIndex(await releaseMetadata.listReleases());
+    source = normalizeReleaseSource(releaseMetadata);
+    releases = parseReleaseIndex(await source.listReleases());
   } catch (error) {
     return buildObservation({
-      capabilityCatalog,
+      ...observationInput,
       candidate: null,
       candidateEvidence: null,
-      config,
       disposition: {
         state: "unavailable",
         reason_codes: [
@@ -586,11 +776,6 @@ export async function collectNodeObservation({
             : "RELEASE_SOURCE_UNAVAILABLE",
         ],
       },
-      generatedAt,
-      lock,
-      repository: normalizedRepository,
-      requestedChannel,
-      resolved,
     });
   }
 
@@ -603,34 +788,27 @@ export async function collectNodeObservation({
   );
   if (candidate === null) {
     return buildObservation({
-      capabilityCatalog,
+      ...observationInput,
       candidate: null,
       candidateEvidence: null,
-      config,
       disposition: {
         state: "current",
         reason_codes: ["NO_CANDIDATE"],
       },
-      generatedAt,
-      lock,
-      repository: normalizedRepository,
-      requestedChannel,
-      resolved,
     });
   }
 
   let checksums;
   try {
     checksums = parseChecksums(
-      await releaseMetadata.readChecksums(candidate.version),
+      await source.readChecksums(candidate.version),
       candidate.version,
     );
   } catch (error) {
     return buildObservation({
-      capabilityCatalog,
+      ...observationInput,
       candidate: null,
       candidateEvidence: null,
-      config,
       disposition: {
         state: "unavailable",
         reason_codes: [
@@ -639,39 +817,33 @@ export async function collectNodeObservation({
             : "RELEASE_SOURCE_UNAVAILABLE",
         ],
       },
-      generatedAt,
-      lock,
-      repository: normalizedRepository,
-      requestedChannel,
-      resolved,
     });
   }
 
   const artifacts = resolved.platforms.map((platform) =>
-    candidateArtifact(platform, resolved.version, candidate.version),
+    candidateArtifact(
+      platform,
+      resolved.version,
+      candidate.version,
+      source.releaseBaseUrl,
+    ),
   );
   const missing = artifacts.filter(({ filename }) => !checksums.has(filename));
   if (missing.length > 0) {
     return buildObservation({
-      capabilityCatalog,
+      ...observationInput,
       candidate: null,
       candidateEvidence: null,
-      config,
       disposition: {
         state: "unavailable",
         reason_codes: ["RELEASE_METADATA_MALFORMED"],
       },
-      generatedAt,
-      lock,
-      repository: normalizedRepository,
-      requestedChannel,
-      resolved,
     });
   }
 
-  const releaseEvidence = {
-    type: "upstream-release",
-    locator: `${NODE_RELEASE_BASE_URL}/v${candidate.version}/`,
+  const releaseIndexEvidence = {
+    type: "upstream-release-index",
+    locator: source.indexUrl,
     revision: `v${candidate.version}`,
     digest: stableDigest({
       date: candidate.date,
@@ -679,6 +851,17 @@ export async function collectNodeObservation({
       lts: candidate.lts,
       version: `v${candidate.version}`,
     }),
+    observed_at: generatedAt,
+  };
+  const checksumsEvidence = {
+    type: "upstream-release-checksums",
+    locator:
+      `${source.releaseBaseUrl}/v${candidate.version}/SHASUMS256.txt`,
+    revision: `v${candidate.version}`,
+    digest: stableDigest(
+      [...checksums.entries()]
+        .sort(([left], [right]) => compareLexically(left, right)),
+    ),
     observed_at: generatedAt,
   };
   const artifactEvidence = artifacts.map((artifact) => ({
@@ -690,19 +873,17 @@ export async function collectNodeObservation({
   }));
 
   return buildObservation({
-    capabilityCatalog,
+    ...observationInput,
     candidate,
-    candidateEvidence: [releaseEvidence, ...artifactEvidence],
-    config,
+    candidateEvidence: [
+      releaseIndexEvidence,
+      checksumsEvidence,
+      ...artifactEvidence,
+    ],
     disposition: {
       state: "candidate",
       reason_codes: ["CANDIDATE_AVAILABLE"],
     },
-    generatedAt,
-    lock,
-    repository: normalizedRepository,
-    requestedChannel,
-    resolved,
   });
 }
 
@@ -720,53 +901,18 @@ function validationPlanDigest(plan) {
   return stableDigest(plan);
 }
 
-function assertValidationPlan(plan, observation) {
-  if (
-    plan?.kind !== "node-independent-validation-plan" ||
-    plan.provider_id !== NODE_PROVIDER_ID ||
-    plan.candidate_digest !== subjectDigest(observation) ||
-    plan.repository?.name !== observation.repository.name ||
-    plan.repository?.revision !== observation.repository.revision
-  ) {
-    throw new Error("validation plan does not bind the Node observation");
+function assertExactValidationPlan(plan, expected) {
+  if (!isDeepStrictEqual(plan, expected)) {
+    throw new Error("validation plan does not match the prescribed plan");
   }
 }
 
-export async function planNodeIndependentValidation(
-  observation,
-  {
-    capabilityCatalogPath = "tests/e2e/capabilities.json",
-    capabilityId,
-    repositoryRoot = process.cwd(),
-  } = {},
-) {
-  const catalogPath = resolve(repositoryRoot, capabilityCatalogPath);
-  const [capabilityCatalog, catalogDocument] = await Promise.all([
-    readCapabilityCatalog(catalogPath),
-    readFile(catalogPath, "utf8").then(JSON.parse),
-  ]);
-  validateDocument(observation, {
-    capabilityIds: capabilityCatalog.ids,
-    capabilityCatalogDigest: capabilityCatalog.digest,
-  });
-  if (observation.disposition.state !== "candidate") {
-    throw new Error("independent validation requires a candidate observation");
-  }
+function prescribedValidationPlan(observation, capability) {
   const component = nodeRuntimeCandidate(observation);
-  if (!component.affected_capabilities.includes(capabilityId)) {
-    throw new Error(`Node candidate does not affect ${capabilityId}`);
-  }
-  const capability = catalogDocument.capabilities.find(
-    ({ id }) => id === capabilityId,
-  );
-  if (capability === undefined) {
-    throw new Error(`capability catalog does not contain ${capabilityId}`);
+  if (!component.affected_capabilities.includes(capability.id)) {
+    throw new Error(`Node candidate does not affect ${capability.id}`);
   }
   const candidateVersion = component.candidate.version;
-  const environment = {
-    MISE_LOCKED: "0",
-    MISE_NODE_VERSION: candidateVersion,
-  };
   const tool = `node@${candidateVersion}`;
   return {
     schema_version: 1,
@@ -781,7 +927,10 @@ export async function planNodeIndependentValidation(
       version: candidateVersion,
       mode: "mise-exec-override",
     },
-    environment,
+    environment: {
+      MISE_LOCKED: "0",
+      MISE_NODE_VERSION: candidateVersion,
+    },
     commands: [
       {
         id: "repository-policy",
@@ -816,12 +965,39 @@ export async function planNodeIndependentValidation(
   };
 }
 
-export function nodeValidationEvidence(
-  plan,
+export async function planNodeIndependentValidation(
   observation,
+  {
+    capabilityCatalogPath = "tests/e2e/capabilities.json",
+    capabilityId,
+    repositoryRoot = process.cwd(),
+  } = {},
+) {
+  const catalogPath = resolve(repositoryRoot, capabilityCatalogPath);
+  const [capabilityCatalog, catalogDocument] = await Promise.all([
+    readCapabilityCatalog(catalogPath),
+    readFile(catalogPath, "utf8").then(JSON.parse),
+  ]);
+  validateDocument(observation, {
+    capabilityIds: capabilityCatalog.ids,
+    capabilityCatalogDigest: capabilityCatalog.digest,
+  });
+  if (observation.disposition.state !== "candidate") {
+    throw new Error("independent validation requires a candidate observation");
+  }
+  const capability = catalogDocument.capabilities.find(
+    ({ id }) => id === capabilityId,
+  );
+  if (capability === undefined) {
+    throw new Error(`capability catalog does not contain ${capabilityId}`);
+  }
+  return prescribedValidationPlan(observation, capability);
+}
+
+function nodeValidationEvidence(
+  plan,
   { completedAt, startedAt },
 ) {
-  assertValidationPlan(plan, observation);
   return {
     type: "independent-validation-plan",
     locator: `${plan.runner}:${plan.capability_id}`,
@@ -841,9 +1017,11 @@ export async function buildNodeIndependentValidation(
     repositoryRoot = process.cwd(),
   } = {},
 ) {
-  const capabilityCatalog = await readCapabilityCatalog(
-    resolve(repositoryRoot, capabilityCatalogPath),
-  );
+  const catalogPath = resolve(repositoryRoot, capabilityCatalogPath);
+  const [capabilityCatalog, catalogDocument] = await Promise.all([
+    readCapabilityCatalog(catalogPath),
+    readFile(catalogPath, "utf8").then(JSON.parse),
+  ]);
   validateDocument(observation, {
     capabilityIds: capabilityCatalog.ids,
     capabilityCatalogDigest: capabilityCatalog.digest,
@@ -852,19 +1030,31 @@ export async function buildNodeIndependentValidation(
     throw new Error("executions must be a nonempty array");
   }
   const results = executions.map((execution) => {
-    assertValidationPlan(execution.plan, observation);
+    const capability = catalogDocument.capabilities.find(
+      ({ id }) => id === execution.plan?.capability_id,
+    );
+    if (capability === undefined) {
+      throw new Error(
+        `capability catalog does not contain ` +
+          `${execution.plan?.capability_id}`,
+      );
+    }
+    const expectedPlan = prescribedValidationPlan(observation, capability);
+    assertExactValidationPlan(execution.plan, expectedPlan);
     return {
-      capability_id: execution.plan.capability_id,
+      capability_id: expectedPlan.capability_id,
       status: execution.status,
       warnings: [...(execution.warnings ?? [])],
       evidence: [
-        nodeValidationEvidence(execution.plan, observation, {
+        nodeValidationEvidence(expectedPlan, {
           completedAt: execution.completedAt,
           startedAt: execution.startedAt,
         }),
       ],
     };
-  });
+  }).sort((left, right) =>
+    compareLexically(left.capability_id, right.capability_id),
+  );
   const qualified = results.every(
     ({ status, warnings }) => status === "pass" && warnings.length === 0,
   );
