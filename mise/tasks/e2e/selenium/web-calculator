@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#MISE description="Run the Selenium web calculator scenario"
+set -euo pipefail
+
+cd "${MISE_PROJECT_ROOT:?MISE_PROJECT_ROOT is required}"
+mise -E web-e2e exec -- npm ci --prefix tests/e2e/selenium
+mise -E web-e2e exec -- \
+  npm --prefix tests/e2e/selenium run setup -- "$@"
+exec mise -E web-e2e exec -- \
+  node tests/e2e/fixtures/web-calculator/lifecycle.mjs \
+  npm --prefix tests/e2e/selenium run web-calculator -- "$@"
