@@ -479,7 +479,7 @@ update_hk_packages() {
 }
 
 plan() {
-  local base_sha open_prs open_count held_prs current candidate
+  local base_sha open_prs open_count held_prs current candidate carried_over
 
   if [[ ! "$minimum_age_days" =~ ^[0-9]+$ ]]; then
     printf 'Release age must be a non-negative whole number.\n' >&2
@@ -515,6 +515,11 @@ plan() {
           "- [#\(.number)](\(.url)): \(.title)"' \
         <<<"$open_prs"
     )"
+    # Read before ensure_issue, which creates the very issue checked below and
+    # would otherwise turn every block into a failure. A triage issue that was
+    # already open when this run started means an earlier run reported a problem
+    # that nobody has resolved.
+    carried_over="$(triage_issue_number "$maintenance_issue_title")"
     if [[ -n "$held_prs" ]]; then
       ensure_issue "$maintenance_issue_title" "Toolchain maintenance is paused by an update that was not made ready:
 
@@ -522,6 +527,19 @@ ${held_prs}"
     fi
     set_output blocked true
     set_output mise_candidate ""
+    # A block on its own is the hold working: a human has not marked the update
+    # ready yet, and a green run keeps that quiet. A block carrying an unresolved
+    # triage issue is the opposite, and reporting success for it is what let a
+    # halted lane hide behind consecutive green runs. Outputs are set first so
+    # the dependent jobs still see the block.
+    if [[ -n "$carried_over" ]]; then
+      printf 'Toolchain maintenance is blocked with triage #%s still open.\n' \
+        "$carried_over" >&2
+      if [[ -n "$held_prs" ]]; then
+        printf '%s\n' "$held_prs" >&2
+      fi
+      return 1
+    fi
     return
   fi
 

@@ -271,9 +271,28 @@ case "$command" in
       repos/oculix-org/Oculix/contents/*)
         emit_workflow_file "$endpoint" "$@"
         ;;
+      repos/jdx/mise/releases)
+        # plan() filters this through --jq, so an empty release feed yields no
+        # output and no eligible candidate. Enough for the unblocked lane.
+        ;;
       *)
         printf 'Unexpected gh api endpoint: %s\n' "$endpoint" >&2
         exit 93
+        ;;
+    esac
+    ;;
+  pr)
+    subcommand="${1:-}"
+    shift || true
+    case "$subcommand" in
+      list)
+        # plan() asks for raw JSON and pipes it to jq itself, so emit the array
+        # verbatim. Defaults to none open, which is the unblocked lane.
+        printf '%s\n' "${GH_OPEN_PULL_REQUESTS:-[]}"
+        ;;
+      *)
+        printf 'Unsupported gh pr subcommand: %s\n' "$subcommand" >&2
+        exit 64
         ;;
     esac
     ;;
@@ -283,8 +302,11 @@ case "$command" in
     case "$subcommand" in
       list)
         if [[ -s "${GH_STATE:?}" ]]; then
+          # The title is parameterised because triage_issue_number matches on it
+          # exactly, and the maintenance lane and the JDK watch use different
+          # issues. Defaults to the JDK title so existing callers are unchanged.
           printf '%s\t%s\n' "$(cat "$GH_STATE")" \
-            "Oculix JDK major drift detected"
+            "${GH_OPEN_ISSUE_TITLE:-Oculix JDK major drift detected}"
         fi
         ;;
       create)
