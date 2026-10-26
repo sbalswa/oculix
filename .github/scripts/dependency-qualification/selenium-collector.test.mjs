@@ -526,19 +526,74 @@ async function localNpmCandidates() {
 }
 
 async function materializeInstalledPackages(packageRoot) {
-  for (const [name, version] of [
-    ["@axe-core/webdriverjs", "4.15.0"],
-    ["axe-core", "4.15.0"],
-    ["selenium-webdriver", "4.52.0"],
-  ]) {
-    const directory = join(packageRoot, "node_modules", ...name.split("/"));
+  const lock = JSON.parse(
+    await readFile(join(packageRoot, "package-lock.json"), "utf8"),
+  );
+  const packageName = (path, entry) => {
+    if (entry.name !== undefined) {
+      return entry.name;
+    }
+    const remainder = path.slice(path.lastIndexOf("node_modules/") + 13);
+    const parts = remainder.split("/");
+    return parts[0].startsWith("@")
+      ? parts.slice(0, 2).join("/")
+      : parts[0];
+  };
+  for (const [path, entry] of Object.entries(lock.packages)) {
+    if (path === "" || path.includes("node_modules/")) {
+      continue;
+    }
+    const directory = join(packageRoot, ...path.split("/"));
+    try {
+      await access(join(directory, "package.json"));
+    } catch {
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        join(directory, "package.json"),
+        `${JSON.stringify({
+          name: packageName(path, entry),
+          version: entry.version,
+        })}\n`,
+        "utf8",
+      );
+    }
+  }
+  const installedEntries = Object.entries(lock.packages)
+    .filter(([path]) =>
+      path.startsWith("node_modules/") ||
+      path.includes("/node_modules/"));
+  for (const [path, entry] of installedEntries) {
+    const directory = join(packageRoot, ...path.split("/"));
+    await mkdir(dirname(directory), { recursive: true });
+    if (entry.link === true) {
+      await symlink(
+        join(packageRoot, ...entry.resolved.split("/")),
+        directory,
+        "dir",
+      );
+      continue;
+    }
     await mkdir(directory, { recursive: true });
     await writeFile(
       join(directory, "package.json"),
-      `${JSON.stringify({ name, version })}\n`,
+      `${JSON.stringify({
+        name: packageName(path, entry),
+        version: entry.version,
+      })}\n`,
       "utf8",
     );
   }
+  await writeFile(
+    join(packageRoot, "node_modules", ".package-lock.json"),
+    `${JSON.stringify({
+      name: lock.name,
+      version: lock.version,
+      lockfileVersion: lock.lockfileVersion,
+      requires: lock.requires,
+      packages: Object.fromEntries(installedEntries),
+    }, null, 2)}\n`,
+    "utf8",
+  );
 }
 
 async function writeCapabilityArtifacts(
@@ -745,6 +800,7 @@ async function qualify(
     requestConsumer,
     requestFreshness,
     runCommand = async () => rawResult({ exitCode: 1 }),
+    seal = sealQualificationEnvelope,
     trustedAuthority,
     ...qualificationOverrides
   } = overrides;
@@ -754,7 +810,7 @@ async function qualify(
     {
       ...identity,
       id: "test-disposable-executor",
-      seal: sealQualificationEnvelope,
+      seal,
       async execute(step, context) {
         const result = await runCommand(step, context);
         const attestation = createSeleniumExecutorAttestation({
@@ -1826,6 +1882,17 @@ test("cross-job artifact strictly validates authority, execution, results, and r
         value.executor.policy.isolation.network =
           "candidate-registry-only";
       }],
+      ["tampered generated closure", (value) => {
+        value.executor.generated_lock_closure.canonical_lock
+          .packages["node_modules/axe-core"].version = "4.14.0";
+      }],
+      ["tampered generated closure digest", (value) => {
+        value.executor.generated_lock_closure.closure_digest =
+          `sha256:${"0".repeat(64)}`;
+      }],
+      ["missing generated closure", (value) => {
+        value.executor.generated_lock_closure = null;
+      }],
       ["execution after expiry", (value) => {
         value.executor.executions[0].completed_at =
           value.executor.request.expires_at;
@@ -2406,6 +2473,25 @@ test("real npm creates and installs the candidate manifest and lock", async () =
       "@axe-core/webdriverjs": "4.15.0",
       "selenium-webdriver": "4.52.0",
     });
+    assert.equal(
+      result.executor.generated_lock_closure.kind,
+      "selenium-generated-npm-lock-closure",
+    );
+    assert.ok(
+      result.executor.generated_lock_closure.closure_manifest.packages
+        .length > 3,
+    );
+    assert.deepEqual(
+      result.executor.generated_lock_closure.closure_manifest.packages
+        .map(({ path }) => path),
+      Object.keys(generatedLock.packages).sort(),
+    );
+    assert.ok(
+      result.validation.results.every(({ evidence }) =>
+        evidence.some(
+          ({ type }) => type === "qualification-npm-lock-closure",
+        )),
+    );
     for (const [name, metadata] of Object.entries(localRegistry.metadata)) {
       const locked = generatedLock.packages[`node_modules/${name}`];
       if (name !== "axe-core") {
@@ -2426,6 +2512,276 @@ test("real npm creates and installs the candidate manifest and lock", async () =
     );
   } finally {
     await localRegistry.cleanup();
+    await repository.cleanup();
+  }
+});
+
+test("generated and installed closures preserve npm workspace link metadata", async () => {
+  const repository = await createRepository();
+  try {
+    const packageRoot = join(repository.root, "tests", "e2e", "selenium");
+    const manifestPath = join(packageRoot, "package.json");
+    const lockPath = join(packageRoot, "package-lock.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    const lock = JSON.parse(await readFile(lockPath, "utf8"));
+    manifest.workspaces = ["packages/*"];
+    lock.packages[""].workspaces = ["packages/*"];
+    lock.packages["packages/workspace-helper"] = {
+      name: "workspace-helper",
+      version: "1.0.0",
+    };
+    lock.packages["node_modules/workspace-helper"] = {
+      resolved: "packages/workspace-helper",
+      link: true,
+    };
+    const workspacePackage = join(
+      packageRoot,
+      "packages",
+      "workspace-helper",
+    );
+    await mkdir(workspacePackage, { recursive: true });
+    await Promise.all([
+      writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`),
+      writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`),
+      writeFile(
+        join(workspacePackage, "package.json"),
+        `${JSON.stringify({
+          name: "workspace-helper",
+          version: "1.0.0",
+        }, null, 2)}\n`,
+      ),
+    ]);
+    await execFileAsync("git", ["add", "--all"], { cwd: repository.root });
+    await execFileAsync(
+      "git",
+      ["commit", "--quiet", "-m", "add workspace fixture"],
+      { cwd: repository.root },
+    );
+
+    const observation = await collectQualificationCandidate(repository);
+    const result = await qualify(repository, observation, {
+      runCommand: passingRunner([]),
+    });
+
+    assert.equal(
+      result.validation.disposition.state,
+      "independently-qualified",
+    );
+    assert.deepEqual(
+      result.executor.generated_lock_closure.closure_manifest.packages
+        .find(({ path }) => path === "node_modules/workspace-helper"),
+      {
+        path: "node_modules/workspace-helper",
+        name: "workspace-helper",
+        version: null,
+        resolved: "packages/workspace-helper",
+        integrity: null,
+        link: true,
+      },
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("rogue transitive package-lock entries cannot enter the signed closure", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const observed = [];
+    const runner = passingRunner(observed);
+    const result = await qualify(repository, observation, {
+      runCommand: async (step, context) => {
+        const raw = await runner(step, context);
+        if (step.id === "apply-selenium-tarballs") {
+          const lockPath = join(context.packageRoot, "package-lock.json");
+          const lock = JSON.parse(await readFile(lockPath, "utf8"));
+          lock.packages["node_modules/rogue-transitive"] = {
+            version: "1.0.0",
+            resolved:
+              "https://registry.npmjs.org/rogue-transitive/-/rogue-transitive-1.0.0.tgz",
+            integrity: "sha512-cm9ndWU=",
+          };
+          await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+        }
+        return raw;
+      },
+    });
+
+    assert.deepEqual(result.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["LOCK_VERIFICATION_FAILED"],
+    });
+    assert.equal(result.executor.generated_lock_closure, null);
+    assert.ok(
+      observed.every(
+        ({ step }) => step.id !== "install-selenium-candidate",
+      ),
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("npm ci cannot change the package-lock after closure signing", async () => {
+  for (const mutation of ["bytes", "canonical"]) {
+    const repository = await createRepository();
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      const runner = passingRunner([]);
+      const result = await qualify(repository, observation, {
+        runCommand: async (step, context) => {
+          if (step.id === "install-selenium-candidate") {
+            const lockPath = join(context.packageRoot, "package-lock.json");
+            const lock = JSON.parse(await readFile(lockPath, "utf8"));
+            if (mutation === "canonical") {
+              lock.packages["node_modules/axe-core"].version = "4.14.0";
+            }
+            await writeFile(
+              lockPath,
+              mutation === "bytes"
+                ? JSON.stringify(lock)
+                : `${JSON.stringify(lock, null, 2)}\n`,
+            );
+          }
+          return runner(step, context);
+        },
+      });
+
+      assert.deepEqual(
+        result.validation.disposition,
+        {
+          state: "blocked",
+          reason_codes: ["INSTALLED_PACKAGE_MISMATCH"],
+        },
+        mutation,
+      );
+    } finally {
+      await repository.cleanup();
+    }
+  }
+});
+
+test("installed closure rejects extra and missing transitive packages", async () => {
+  for (const mutation of ["extra", "missing"]) {
+    const repository = await createRepository();
+    try {
+      const observation = await collectQualificationCandidate(repository);
+      const runner = passingRunner([]);
+      const result = await qualify(repository, observation, {
+        runCommand: async (step, context) => {
+          const raw = await runner(step, context);
+          if (step.id === "install-selenium-candidate") {
+            if (mutation === "extra") {
+              const rogue = join(
+                context.packageRoot,
+                "node_modules",
+                "rogue-installed",
+              );
+              await mkdir(rogue, { recursive: true });
+              await writeFile(
+                join(rogue, "package.json"),
+                `${JSON.stringify({
+                  name: "rogue-installed",
+                  version: "1.0.0",
+                })}\n`,
+              );
+            } else {
+              await rm(
+                join(
+                  context.packageRoot,
+                  "node_modules",
+                  "axe-core",
+                ),
+                { force: true, recursive: true },
+              );
+            }
+          }
+          return raw;
+        },
+      });
+
+      assert.deepEqual(
+        result.validation.disposition,
+        {
+          state: "blocked",
+          reason_codes: ["INSTALLED_PACKAGE_MISMATCH"],
+        },
+        mutation,
+      );
+    } finally {
+      await repository.cleanup();
+    }
+  }
+});
+
+test("stale generated closure evidence cannot be replayed", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const first = await qualify(repository, observation, {
+      runCommand: passingRunner([]),
+    });
+    const staleClosure =
+      structuredClone(first.executor.generated_lock_closure);
+    const observed = [];
+    const second = await qualify(repository, observation, {
+      requestFreshness: {
+        challenge: "d".repeat(64),
+        run_id: "workflow-123-attempt-2-selenium",
+        issued_at: "2026-10-21T18:09:00.000Z",
+        expires_at: "2026-10-21T18:24:00.000Z",
+      },
+      runCommand: passingRunner(observed),
+      seal(document) {
+        return document.kind === "selenium-generated-npm-lock-closure"
+          ? structuredClone(staleClosure)
+          : sealQualificationEnvelope(document);
+      },
+    });
+
+    assert.deepEqual(second.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["LOCK_VERIFICATION_FAILED"],
+    });
+    assert.equal(second.executor.generated_lock_closure, null);
+    assert.ok(
+      observed.every(
+        ({ step }) => step.id !== "install-selenium-candidate",
+      ),
+    );
+  } finally {
+    await repository.cleanup();
+  }
+});
+
+test("generated closure changes after signing fail closed before installation", async () => {
+  const repository = await createRepository();
+  try {
+    const observation = await collectQualificationCandidate(repository);
+    const observed = [];
+    const result = await qualify(repository, observation, {
+      runCommand: passingRunner(observed),
+      seal(document) {
+        const signed = sealQualificationEnvelope(document);
+        if (document.kind === "selenium-generated-npm-lock-closure") {
+          signed.closure_manifest.packages[0].name = "substituted-root";
+        }
+        return signed;
+      },
+    });
+
+    assert.deepEqual(result.validation.disposition, {
+      state: "blocked",
+      reason_codes: ["LOCK_VERIFICATION_FAILED"],
+    });
+    assert.equal(result.executor.generated_lock_closure, null);
+    assert.ok(
+      observed.every(
+        ({ step }) => step.id !== "install-selenium-candidate",
+      ),
+    );
+  } finally {
     await repository.cleanup();
   }
 });

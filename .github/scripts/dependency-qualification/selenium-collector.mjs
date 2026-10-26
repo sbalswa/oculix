@@ -113,6 +113,10 @@ const MUTABLE_SEED_MANIFEST_KIND =
   "repository-mutable-seed-manifest";
 const TRUSTED_INPUT_MANIFEST_KIND =
   "repository-trusted-input-manifest";
+const GENERATED_LOCK_CLOSURE_KIND =
+  "selenium-generated-npm-lock-closure";
+const LOCK_CLOSURE_MANIFEST_KIND =
+  "npm-package-lock-closure-manifest";
 const EXECUTOR_CANDIDATE_CODE = "untrusted";
 const EXECUTOR_NETWORK =
   "pinned-candidate-registry-plus-loopback-only";
@@ -3326,6 +3330,403 @@ function lockPackage(lock, name) {
   return lock.packages?.[`node_modules/${name}`];
 }
 
+function normalizeLockPackagePath(value, label) {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a string`);
+  }
+  if (
+    value.includes("\\") ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.includes("//") ||
+    value.split("/").some((part) => part === "." || part === "..")
+  ) {
+    throw new Error(`${label} must be a canonical relative package path`);
+  }
+  return value;
+}
+
+function packageNameFromLockPath(path, entry, label) {
+  if (entry.name !== undefined) {
+    return assertString(entry.name, `${label}.name`);
+  }
+  const marker = "node_modules/";
+  const markerIndex = path.lastIndexOf(marker);
+  if (markerIndex === -1) {
+    throw new Error(`${label}.name is required outside node_modules`);
+  }
+  const remainder = path.slice(markerIndex + marker.length);
+  const parts = remainder.split("/");
+  const name = parts[0]?.startsWith("@")
+    ? parts.slice(0, 2).join("/")
+    : parts[0];
+  return assertString(name, `${label} derived name`);
+}
+
+function optionalLockString(value, label) {
+  return value === undefined ? null : assertString(value, label);
+}
+
+function isInstalledLockPath(path) {
+  return path.startsWith("node_modules/") ||
+    path.includes("/node_modules/");
+}
+
+function canonicalPackageLockClosure(lock, label = "generated package-lock") {
+  const document = assertObject(lock, label);
+  const lockfileVersion = document.lockfileVersion;
+  if (
+    !Number.isInteger(lockfileVersion) ||
+    lockfileVersion < 2 ||
+    lockfileVersion > 3
+  ) {
+    throw new Error(`${label}.lockfileVersion must be 2 or 3`);
+  }
+  const packages = assertObject(document.packages, `${label}.packages`);
+  const entries = Object.entries(packages)
+    .map(([rawPath, rawEntry]) => {
+      const path = normalizeLockPackagePath(
+        rawPath,
+        `${label} package path`,
+      );
+      const entry = assertObject(
+        rawEntry,
+        `${label}.packages[${JSON.stringify(path)}]`,
+      );
+      if (
+        entry.link !== undefined &&
+        typeof entry.link !== "boolean"
+      ) {
+        throw new Error(`${label} ${path || "<root>"} link must be boolean`);
+      }
+      const link = entry.link === true;
+      const version = optionalLockString(
+        entry.version,
+        `${label} ${path || "<root>"} version`,
+      );
+      const resolved = optionalLockString(
+        entry.resolved,
+        `${label} ${path || "<root>"} resolved`,
+      );
+      const integrity = optionalLockString(
+        entry.integrity,
+        `${label} ${path || "<root>"} integrity`,
+      );
+      if (isInstalledLockPath(path) && !link && version === null) {
+        throw new Error(
+          `${label} installed package ${path} must declare a version`,
+        );
+      }
+      if (link && resolved === null) {
+        throw new Error(
+          `${label} linked package ${path} must declare its target`,
+        );
+      }
+      return {
+        path,
+        name: packageNameFromLockPath(
+          path,
+          entry,
+          `${label}.packages[${JSON.stringify(path)}]`,
+        ),
+        version,
+        resolved,
+        integrity,
+        link,
+      };
+    })
+    .sort(({ path: left }, { path: right }) => compareText(left, right));
+  if (entries.length === 0 || entries[0].path !== "") {
+    throw new Error(`${label} must contain its root package entry`);
+  }
+  return {
+    schema_version: 1,
+    kind: LOCK_CLOSURE_MANIFEST_KIND,
+    lockfile_version: lockfileVersion,
+    packages: entries,
+  };
+}
+
+function packageDependencyRecords(entry) {
+  return [
+    ["dependencies", true],
+    ["devDependencies", true],
+    ["optionalDependencies", false],
+    ["peerDependencies", false],
+  ].flatMap(([field, required]) => {
+    const dependencies = entry[field];
+    if (dependencies === undefined) {
+      return [];
+    }
+    return Object.keys(
+      assertObject(dependencies, `package-lock entry ${field}`),
+    ).map((name) => ({ name, required }));
+  }).sort(({ name: left }, { name: right }) => compareText(left, right));
+}
+
+function packageAncestorPaths(path) {
+  const ancestors = [path];
+  let current = path;
+  while (current.includes("node_modules/")) {
+    const marker = current.lastIndexOf("node_modules/");
+    current = current.slice(0, marker).replace(/\/$/u, "");
+    ancestors.push(current);
+  }
+  if (!ancestors.includes("")) {
+    ancestors.push("");
+  }
+  return ancestors;
+}
+
+function dependencyLockPath(packages, fromPath, dependencyName) {
+  for (const ancestor of packageAncestorPaths(fromPath)) {
+    const candidate = `${ancestor === "" ? "" : `${ancestor}/`}node_modules/${dependencyName}`;
+    if (Object.hasOwn(packages, candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function workspacePatterns(rootEntry) {
+  const raw = rootEntry.workspaces;
+  const patterns = Array.isArray(raw)
+    ? raw
+    : raw === undefined
+      ? []
+      : assertObject(raw, "package-lock root workspaces").packages;
+  if (!Array.isArray(patterns)) {
+    throw new Error("package-lock root workspaces must be an array");
+  }
+  return patterns.map((pattern) => {
+    assertString(pattern, "package-lock workspace pattern");
+    if (
+      pattern.includes("\\") ||
+      pattern.startsWith("/") ||
+      pattern.split("/").some((part) => part === "." || part === "..")
+    ) {
+      throw new Error(
+        "package-lock workspace patterns must be canonical relative paths",
+      );
+    }
+    return pattern;
+  });
+}
+
+function workspacePatternMatches(pattern, path) {
+  const patternParts = pattern.split("/");
+  const pathParts = path.split("/");
+  function matches(patternIndex, pathIndex) {
+    if (patternIndex === patternParts.length) {
+      return pathIndex === pathParts.length;
+    }
+    const part = patternParts[patternIndex];
+    if (part === "**") {
+      return matches(patternIndex + 1, pathIndex) ||
+        (pathIndex < pathParts.length &&
+          matches(patternIndex, pathIndex + 1));
+    }
+    if (pathIndex >= pathParts.length) {
+      return false;
+    }
+    return (
+      (part === "*" || part === pathParts[pathIndex]) &&
+      matches(patternIndex + 1, pathIndex + 1)
+    );
+  }
+  return matches(0, 0);
+}
+
+function validateReachableLockClosure(lock, manifest) {
+  const packages = lock.packages;
+  const reachable = new Set([""]);
+  const queue = [""];
+  const patterns = workspacePatterns(packages[""]);
+  for (const [path, entry] of Object.entries(packages)) {
+    if (
+      path !== "" &&
+      !isInstalledLockPath(path) &&
+      patterns.some((pattern) => workspacePatternMatches(pattern, path))
+    ) {
+      reachable.add(path);
+      queue.push(path);
+      for (const [linkPath, linkEntry] of Object.entries(packages)) {
+        if (linkEntry.link === true && linkEntry.resolved === path) {
+          reachable.add(linkPath);
+          queue.push(linkPath);
+        }
+      }
+    }
+  }
+  while (queue.length > 0) {
+    const path = queue.shift();
+    const entry = packages[path];
+    for (const { name: dependencyName, required } of
+      packageDependencyRecords(entry)) {
+      const dependencyPath = dependencyLockPath(
+        packages,
+        path,
+        dependencyName,
+      );
+      if (dependencyPath === null && required) {
+        throw new Error(
+          `Generated package-lock lacks required dependency ${dependencyName} from ${path || "<root>"}`,
+        );
+      }
+      if (dependencyPath !== null && !reachable.has(dependencyPath)) {
+        reachable.add(dependencyPath);
+        queue.push(dependencyPath);
+      }
+    }
+    if (entry.link === true) {
+      const target = normalizeLockPackagePath(
+        assertString(entry.resolved, `linked package ${path} target`),
+        `linked package ${path} target`,
+      );
+      if (!Object.hasOwn(packages, target)) {
+        throw new Error(`Linked package ${path} target is absent from lock`);
+      }
+      if (!reachable.has(target)) {
+        reachable.add(target);
+        queue.push(target);
+      }
+    }
+  }
+  const unreachable = manifest.packages
+    .filter(({ path }) => path !== "" && !reachable.has(path))
+    .map(({ path }) => path);
+  if (unreachable.length > 0) {
+    throw new Error(
+      `Generated package-lock contains unreachable package entries: ${unreachable.join(", ")}`,
+    );
+  }
+}
+
+function generatedLockClosureUnsigned({
+  applyAttestation,
+  capturedAt,
+  lock,
+  lockByteDigest,
+  plan,
+  policy,
+  request,
+}) {
+  const canonicalLock = stableValue(lock);
+  const closureManifest = canonicalPackageLockClosure(canonicalLock);
+  validateReachableLockClosure(canonicalLock, closureManifest);
+  return {
+    schema_version: 1,
+    kind: GENERATED_LOCK_CLOSURE_KIND,
+    authority_digest: request.authority_digest,
+    candidate_digest: plan.candidate_digest,
+    repository_revision: plan.repository.revision,
+    plan_digest: hash(plan),
+    policy_digest: hash(policy),
+    request_digest: request.request_digest,
+    apply_attestation_digest: hash(applyAttestation),
+    captured_at: capturedAt,
+    lock_byte_digest: assertDigest(
+      lockByteDigest,
+      "Selenium generated lock byte digest",
+    ),
+    lock_canonical_digest: hash(canonicalLock),
+    closure_digest: hash(closureManifest),
+    canonical_lock: canonicalLock,
+    closure_manifest: closureManifest,
+  };
+}
+
+function validateGeneratedLockClosure(
+  signedClosure,
+  {
+    applyAttestation,
+    authority,
+    plan,
+    policy,
+    request,
+  },
+) {
+  assertExactObjectKeys(
+    signedClosure,
+    new Set([
+      "apply_attestation_digest",
+      "authority_digest",
+      "candidate_digest",
+      "canonical_lock",
+      "captured_at",
+      "closure_digest",
+      "closure_manifest",
+      "kind",
+      "lock_byte_digest",
+      "lock_canonical_digest",
+      "plan_digest",
+      "policy_digest",
+      "repository_revision",
+      "request_digest",
+      "schema_version",
+      "signature",
+    ]),
+    "Selenium generated lock closure",
+  );
+  const { signature, ...unsigned } = signedClosure;
+  const expected = generatedLockClosureUnsigned({
+    applyAttestation,
+    capturedAt: signedClosure.captured_at,
+    lock: signedClosure.canonical_lock,
+    lockByteDigest: signedClosure.lock_byte_digest,
+    plan,
+    policy,
+    request,
+  });
+  assertArtifactTimeWithinRequest(
+    signedClosure.captured_at,
+    signedClosure.captured_at,
+    request,
+    "Selenium generated lock closure",
+  );
+  if (
+    stableJson(unsigned) !== stableJson(expected) ||
+    !verifyEd25519Signature(unsigned, signature, authority.public_key)
+  ) {
+    throw new Error(
+      "Selenium generated lock closure is missing, stale, tampered, or unsigned",
+    );
+  }
+  return structuredClone(signedClosure);
+}
+
+async function captureGeneratedLockClosure(
+  plan,
+  workspaceRoot,
+  {
+    applyAttestation,
+    executor,
+    now,
+    policy,
+    request,
+  },
+) {
+  const lockBytes = await readFile(resolve(workspaceRoot, LOCK_PATH));
+  const lock = parseJson(lockBytes, LOCK_PATH);
+  const unsigned = generatedLockClosureUnsigned({
+    applyAttestation,
+    capturedAt: timestamp(now()),
+    lock,
+    lockByteDigest: hash(lockBytes),
+    plan,
+    policy,
+    request,
+  });
+  const signed = await executor.seal(structuredClone(unsigned));
+  return validateGeneratedLockClosure(signed, {
+    applyAttestation,
+    authority: executor.authority,
+    plan,
+    policy,
+    request,
+  });
+}
+
 async function verifyAppliedLock(plan, workspaceRoot) {
   const [manifest, lock] = await Promise.all([
     readFile(resolve(workspaceRoot, PACKAGE_PATH), "utf8").then(
@@ -3339,6 +3740,22 @@ async function verifyAppliedLock(plan, workspaceRoot) {
     lock.packages?.[""],
     'candidate package-lock packages[""]',
   );
+  const expectedDirectDependencies = Object.fromEntries(
+    plan.packages
+      .filter(({ name }) => DIRECT_PACKAGE_NAMES.includes(name))
+      .map(({ name, version }) => [name, version])
+      .sort(([left], [right]) => compareText(left, right)),
+  );
+  if (
+    stableJson(manifest.dependencies) !==
+      stableJson(expectedDirectDependencies) ||
+    stableJson(root.dependencies) !==
+      stableJson(expectedDirectDependencies)
+  ) {
+    throw new Error(
+      "Candidate manifest and lock root dependencies must exactly match the selected direct packages",
+    );
+  }
   for (const expected of plan.packages) {
     const direct = DIRECT_PACKAGE_NAMES.includes(expected.name);
     if (
@@ -3410,28 +3827,212 @@ async function verifyAppliedLock(plan, workspaceRoot) {
   }
 }
 
-async function verifyInstalledPackages(plan, workspaceRoot) {
-  for (const expected of plan.packages) {
+async function discoverInstalledPackagePaths(
+  packageRoot,
+  workspacePackagePaths,
+) {
+  const discovered = [];
+  async function visit(nodeModulesPath, relativeNodeModulesPath) {
+    const entries = await readdir(nodeModulesPath, { withFileTypes: true });
+    for (const entry of entries.sort(({ name: left }, { name: right }) =>
+      compareText(left, right))) {
+      if (entry.name === ".bin" || entry.name === ".package-lock.json") {
+        continue;
+      }
+      if (entry.name.startsWith("@")) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) {
+          throw new Error(`Installed scope ${entry.name} must be a directory`);
+        }
+        const scopePath = join(nodeModulesPath, entry.name);
+        const scopedEntries = await readdir(scopePath, {
+          withFileTypes: true,
+        });
+        for (const scoped of scopedEntries.sort(
+          ({ name: left }, { name: right }) => compareText(left, right),
+        )) {
+          if (!scoped.isDirectory() && !scoped.isSymbolicLink()) {
+            throw new Error(
+              `Installed scoped package ${entry.name}/${scoped.name} has unsupported type`,
+            );
+          }
+          const packagePath =
+            `${relativeNodeModulesPath}/${entry.name}/${scoped.name}`;
+          discovered.push(packagePath);
+          if (scoped.isDirectory() && !scoped.isSymbolicLink()) {
+            const nested = join(scopePath, scoped.name, "node_modules");
+            try {
+              await visit(nested, `${packagePath}/node_modules`);
+            } catch (error) {
+              if (error.code !== "ENOENT") {
+                throw error;
+              }
+            }
+          }
+        }
+        continue;
+      }
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+        throw new Error(
+          `Installed node_modules entry ${entry.name} has unsupported type`,
+        );
+      }
+      const packagePath = `${relativeNodeModulesPath}/${entry.name}`;
+      discovered.push(packagePath);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        const nested = join(nodeModulesPath, entry.name, "node_modules");
+        try {
+          await visit(nested, `${packagePath}/node_modules`);
+        } catch (error) {
+          if (error.code !== "ENOENT") {
+            throw error;
+          }
+        }
+      }
+    }
+  }
+  await visit(join(packageRoot, "node_modules"), "node_modules");
+  for (const workspacePath of workspacePackagePaths) {
+    const nested = join(
+      packageRoot,
+      ...workspacePath.split("/"),
+      "node_modules",
+    );
+    try {
+      await visit(nested, `${workspacePath}/node_modules`);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+  return discovered.sort(compareText);
+}
+
+async function verifyInstalledPackages(lockClosure, workspaceRoot) {
+  const packageRoot = resolve(
+    workspaceRoot,
+    SELENIUM_PACKAGE_DIRECTORY,
+  );
+  const currentLockBytes = await readFile(resolve(workspaceRoot, LOCK_PATH));
+  const currentLock = parseJson(currentLockBytes, LOCK_PATH);
+  const currentClosure = canonicalPackageLockClosure(currentLock);
+  if (
+    hash(currentLockBytes) !== lockClosure.lock_byte_digest ||
+    hash(stableValue(currentLock)) !== lockClosure.lock_canonical_digest ||
+    hash(currentClosure) !== lockClosure.closure_digest ||
+    stableJson(currentClosure) !==
+      stableJson(lockClosure.closure_manifest)
+  ) {
+    throw new Error("npm ci changed the signed generated package-lock");
+  }
+
+  const hiddenLockPath = join(
+    packageRoot,
+    "node_modules",
+    ".package-lock.json",
+  );
+  const hiddenLock = parseJson(
+    await readFile(hiddenLockPath),
+    "installed node_modules/.package-lock.json",
+  );
+  const expectedHiddenPackages = Object.fromEntries(
+    Object.entries(lockClosure.canonical_lock.packages)
+      .filter(([path]) => isInstalledLockPath(path))
+      .sort(([left], [right]) => compareText(left, right)),
+  );
+  if (
+    stableJson(hiddenLock.packages) !==
+      stableJson(expectedHiddenPackages)
+  ) {
+    throw new Error(
+      "Installed hidden lock package entries do not exactly match the signed generated lock",
+    );
+  }
+  const hiddenClosure = canonicalPackageLockClosure({
+    ...hiddenLock,
+    packages: {
+      "": currentLock.packages[""],
+      ...hiddenLock.packages,
+    },
+  }, "installed node_modules hidden lock");
+  const expectedInstalled = lockClosure.closure_manifest.packages
+    .filter(({ path }) => isInstalledLockPath(path));
+  const observedInstalled = hiddenClosure.packages
+    .filter(({ path }) => isInstalledLockPath(path));
+  if (stableJson(observedInstalled) !== stableJson(expectedInstalled)) {
+    throw new Error(
+      "Installed hidden lock does not exactly match generated dependency closure",
+    );
+  }
+
+  const workspacePackagePaths = lockClosure.closure_manifest.packages
+    .filter(
+      ({ path }) => path !== "" && !isInstalledLockPath(path),
+    )
+    .map(({ path }) => path);
+  const discovered = await discoverInstalledPackagePaths(
+    packageRoot,
+    workspacePackagePaths,
+  );
+  const expectedPaths = expectedInstalled.map(({ path }) => path);
+  if (stableJson(discovered) !== stableJson(expectedPaths)) {
+    throw new Error(
+      "Installed node_modules contains extra or missing package entries",
+    );
+  }
+  const byPath = new Map(
+    lockClosure.closure_manifest.packages.map((entry) => [
+      entry.path,
+      entry,
+    ]),
+  );
+  for (const expected of expectedInstalled) {
+    const absolute = join(packageRoot, ...expected.path.split("/"));
+    const metadata = await lstat(absolute);
+    if (expected.link) {
+      if (!metadata.isSymbolicLink()) {
+        throw new Error(`Installed ${expected.path} must be a link`);
+      }
+      const target = normalizeLockPackagePath(
+        expected.resolved,
+        `Installed ${expected.path} link target`,
+      );
+      const targetEntry = byPath.get(target);
+      if (targetEntry === undefined) {
+        throw new Error(
+          `Installed ${expected.path} link target is absent from closure`,
+        );
+      }
+      const actualTarget = await realpath(absolute);
+      const expectedTarget = await realpath(join(packageRoot, ...target.split("/")));
+      if (actualTarget !== expectedTarget) {
+        throw new Error(`Installed ${expected.path} link target was substituted`);
+      }
+      const installed = parseJson(
+        await readFile(join(absolute, "package.json"), "utf8"),
+        `installed ${expected.path}`,
+      );
+      if (
+        installed.name !== targetEntry.name ||
+        (targetEntry.version !== null &&
+          installed.version !== targetEntry.version)
+      ) {
+        throw new Error(`Installed ${expected.path} linked package was substituted`);
+      }
+      continue;
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error(`Installed ${expected.path} must be a real directory`);
+    }
     const installed = parseJson(
-      await readFile(
-        resolve(
-          workspaceRoot,
-          SELENIUM_PACKAGE_DIRECTORY,
-          "node_modules",
-          ...expected.name.split("/"),
-          "package.json",
-        ),
-        "utf8",
-      ),
-      `installed ${expected.name}`,
+      await readFile(join(absolute, "package.json"), "utf8"),
+      `installed ${expected.path}`,
     );
     if (
       installed.name !== expected.name ||
       installed.version !== expected.version
     ) {
-      throw new Error(
-        `Installed ${expected.name} does not match immutable npm evidence`,
-      );
+      throw new Error(`Installed ${expected.path} package was substituted`);
     }
   }
 }
@@ -3443,6 +4044,7 @@ function internalCheckEvidence(
   message,
   startedAt,
   completedAt,
+  additionalEvidence = [],
 ) {
   return {
     id,
@@ -3468,7 +4070,24 @@ function internalCheckEvidence(
         started_at: startedAt,
         completed_at: completedAt,
       },
+      ...additionalEvidence,
     ],
+  };
+}
+
+function generatedLockClosureEvidence(
+  lockClosure,
+  plan,
+  startedAt,
+  completedAt,
+) {
+  return {
+    type: "qualification-npm-lock-closure",
+    locator: "selenium-lock:generated-closure",
+    revision: plan.repository.revision,
+    digest: hash(lockClosure),
+    started_at: startedAt,
+    completed_at: completedAt,
   };
 }
 
@@ -3791,6 +4410,7 @@ function qualificationEnvelope({
   checks,
   executions,
   failures,
+  lockClosure,
   plan,
   policy,
   request,
@@ -3821,6 +4441,8 @@ function qualificationEnvelope({
     executions_digest: hash(executions),
     checks_digest: hash(checks),
     failures_digest: hash(failures),
+    lock_closure_digest:
+      lockClosure === null ? null : hash(lockClosure),
     validation_digest: hash(validation),
     evidence_digest: hash(
       validation.results.map(({ capability_id: capabilityId, evidence }) => ({
@@ -4323,6 +4945,7 @@ function validateArtifactEnvelope(artifact) {
     checks: artifact.checks,
     executions: artifact.executor.executions,
     failures: artifact.executor.failures,
+    lockClosure: artifact.executor.generated_lock_closure,
     plan: artifact.executor.plan,
     policy: artifact.executor.policy,
     request: artifact.executor.request,
@@ -4411,6 +5034,7 @@ export function validateSeleniumQualificationArtifact(
       "attestations",
       "executions",
       "failures",
+      "generated_lock_closure",
       "mutable_seed",
       "plan",
       "policy",
@@ -4494,6 +5118,11 @@ export function validateSeleniumQualificationArtifact(
     !Array.isArray(artifact.executor.executions) ||
     !Array.isArray(artifact.executor.attestations) ||
     !Array.isArray(artifact.executor.failures) ||
+    !(
+      artifact.executor.generated_lock_closure === null ||
+      (typeof artifact.executor.generated_lock_closure === "object" &&
+        !Array.isArray(artifact.executor.generated_lock_closure))
+    ) ||
     artifact.executor.failures.some(
       (failure) =>
         typeof failure !== "string" ||
@@ -4562,6 +5191,55 @@ export function validateSeleniumQualificationArtifact(
       "Selenium qualification artifact attestation list does not exactly match signed executions",
     );
   }
+  const applyAttestation = validatedAttestations.find(
+    ({ step_id: stepId }) => stepId === "apply-selenium-tarballs",
+  );
+  let validatedLockClosure = null;
+  if (artifact.executor.generated_lock_closure !== null) {
+    if (applyAttestation === undefined) {
+      throw new Error(
+        "Selenium generated lock closure lacks its package-lock generation attestation",
+      );
+    }
+    validatedLockClosure = validateGeneratedLockClosure(
+      artifact.executor.generated_lock_closure,
+      {
+        applyAttestation,
+        authority: artifact.authority,
+        plan,
+        policy,
+        request,
+      },
+    );
+    const applyExecution = executionsById.get("apply-selenium-tarballs");
+    const installExecution = executionsById.get(
+      "install-selenium-candidate",
+    );
+    if (
+      applyExecution === undefined ||
+      installExecution === undefined ||
+      timestampMilliseconds(
+        validatedLockClosure.captured_at,
+        "Selenium generated lock closure captured_at",
+      ) <
+        timestampMilliseconds(
+          applyExecution.completed_at,
+          "Selenium package-lock generation completed_at",
+        ) ||
+      timestampMilliseconds(
+        validatedLockClosure.captured_at,
+        "Selenium generated lock closure captured_at",
+      ) >
+        timestampMilliseconds(
+          installExecution.started_at,
+          "Selenium package installation started_at",
+        )
+    ) {
+      throw new Error(
+        "Selenium generated lock closure must be signed after generation and before installation",
+      );
+    }
+  }
   const allowedInternalChecks = new Set([
     "verify-selenium-lock",
     "verify-installed-selenium-packages",
@@ -4578,6 +5256,48 @@ export function validateSeleniumQualificationArtifact(
         `Selenium qualification artifact contains unknown check ${check.id}`,
       );
     }
+  }
+  const lockCheck = checksById.get("verify-selenium-lock");
+  if (lockCheck !== undefined) {
+    const closureEvidence = lockCheck.evidence.filter(
+      ({ type }) => type === "qualification-npm-lock-closure",
+    );
+    if (
+      lockCheck.status === "pass" &&
+      (validatedLockClosure === null ||
+        closureEvidence.length !== 1 ||
+        stableJson(closureEvidence[0]) !==
+          stableJson(generatedLockClosureEvidence(
+            validatedLockClosure,
+            plan,
+            closureEvidence[0].started_at,
+            closureEvidence[0].completed_at,
+          )))
+    ) {
+      throw new Error(
+        "Passing Selenium lock verification must exactly bind the signed generated closure",
+      );
+    }
+    if (
+      lockCheck.status !== "pass" &&
+      (validatedLockClosure !== null || closureEvidence.length !== 0)
+    ) {
+      throw new Error(
+        "Failed Selenium lock verification must not publish closure evidence",
+      );
+    }
+  } else if (validatedLockClosure !== null) {
+    throw new Error(
+      "Selenium generated lock closure lacks its verification check",
+    );
+  }
+  if (
+    artifact.validation.disposition.state === "independently-qualified" &&
+    validatedLockClosure === null
+  ) {
+    throw new Error(
+      "Independent Selenium qualification requires a signed generated lock closure",
+    );
   }
   const globalChecks = artifact.checks.filter(
     ({ capability_id: capabilityId }) => capabilityId === null,
@@ -4832,6 +5552,7 @@ export async function qualifySeleniumCandidate(
     const executions = [];
     const checks = [];
     const failures = [];
+    let generatedLockClosure = null;
     for (const id of [
       "verify-executor-node",
       "verify-executor-npm",
@@ -4861,12 +5582,58 @@ export async function qualifySeleniumCandidate(
     }
 
     if (failures.length === 0) {
-      const lockResult = await runInternalCheck(
-        "verify-selenium-lock",
-        plan,
-        now,
-        () => verifyAppliedLock(plan, workspaceRoot),
-      );
+      const startedAt = timestamp(now());
+      let lockResult;
+      try {
+        await verifyAppliedLock(plan, workspaceRoot);
+        const applyAttestation = attestations.find(
+          ({ step_id: stepId }) => stepId === "apply-selenium-tarballs",
+        );
+        if (applyAttestation === undefined) {
+          throw new Error(
+            "Generated package-lock lacks its executor attestation",
+          );
+        }
+        generatedLockClosure = await captureGeneratedLockClosure(
+          plan,
+          workspaceRoot,
+          {
+            applyAttestation,
+            executor: isolatedExecutor,
+            now,
+            policy,
+            request,
+          },
+        );
+        const completedAt = timestamp(now());
+        lockResult = internalCheckEvidence(
+          "verify-selenium-lock",
+          plan,
+          true,
+          "verified",
+          startedAt,
+          completedAt,
+          [
+            generatedLockClosureEvidence(
+              generatedLockClosure,
+              plan,
+              startedAt,
+              completedAt,
+            ),
+          ],
+        );
+      } catch (error) {
+        generatedLockClosure = null;
+        const completedAt = timestamp(now());
+        lockResult = internalCheckEvidence(
+          "verify-selenium-lock",
+          plan,
+          false,
+          error.message,
+          startedAt,
+          completedAt,
+        );
+      }
       checks.push(lockResult);
       if (lockResult.status !== "pass") {
         failures.push("LOCK_VERIFICATION_FAILED");
@@ -4898,7 +5665,10 @@ export async function qualifySeleniumCandidate(
         "verify-installed-selenium-packages",
         plan,
         now,
-        () => verifyInstalledPackages(plan, workspaceRoot),
+        () => verifyInstalledPackages(
+          generatedLockClosure,
+          workspaceRoot,
+        ),
       );
       checks.push(installedResult);
       if (installedResult.status !== "pass") {
@@ -5121,6 +5891,7 @@ export async function qualifySeleniumCandidate(
       checks,
       executions,
       failures,
+      generatedLockClosure,
       immutableInputsDigest: immutableBefore,
       plan,
       policy,
@@ -5206,6 +5977,7 @@ export async function qualifySeleniumCandidate(
     checks: execution.checks,
     executions: execution.executions,
     failures: execution.failures,
+    lockClosure: execution.generatedLockClosure,
     plan: execution.plan,
     policy: execution.policy,
     request: execution.request,
@@ -5243,6 +6015,7 @@ export async function qualifySeleniumCandidate(
       attestations: execution.attestations,
       executions: execution.executions,
       failures: execution.failures,
+      generated_lock_closure: execution.generatedLockClosure,
       plan: execution.plan,
       policy: execution.policy,
       request: execution.request,
