@@ -24,6 +24,12 @@ on a branch, not `main` — `hk` enforces both on commit. See
 [Development](README.md#development) and [Mise layout](README.md#mise-layout)
 for the full toolchain layout and task syntax.
 
+## End-to-end testing
+
+The [human E2E runbook](docs/e2e-runbook.md) explains how to start an exact
+capability or the full E2E suite, watch its GitHub Actions jobs, and download
+the resulting screenshots, recordings, traces, and reports.
+
 ### Optional: brooks-lint review
 
 [brooks-lint](https://github.com/hyhmrright/brooks-lint) runs code review inside

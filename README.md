@@ -153,6 +153,9 @@ mise -E oculix,web-e2e run e2e:all
 
 ## CI execution and evidence
 
+For the click-by-click GitHub UI and CLI procedure, see
+[Run and watch E2E tests](docs/e2e-runbook.md).
+
 Remote E2E selection uses `ci:e2e:*` pull-request labels or the
 `Demand-driven E2E selectors` workflow's manual inputs. It is separate from
 the local `e2e:*` task syntax.
