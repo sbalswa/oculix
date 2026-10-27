@@ -20,5 +20,6 @@ requirement sentence.
   Rationale: pins are deliberate; updates go through maintenance or review.
 - WHEN editing a cross-platform `mise/tasks/` entry that has a `.ps1` sibling,
   the agent shall change both files in the same change.
-- The agent shall not add non-deterministic steps to `hk.pkl` (including LLM
-  reviewers; see #91).
+- WHEN changing `hk.pkl`, the agent shall add only deterministic steps.
+  Rationale: LLM reviewers are non-deterministic; keep them out of `hk` (see
+  #91).
