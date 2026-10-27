@@ -8,7 +8,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { promisify } from "node:util";
 
@@ -44,6 +45,8 @@ import {
   selectNewestOculixRc,
 } from "./oculix-rc-collector.mjs";
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPOSITORY_ROOT = resolve(HERE, "../../..");
 const FIXTURE_ROOT = new URL(
   "../../../tests/dependency-qualification/fixtures/oculix-rc/",
   import.meta.url,
@@ -51,9 +54,6 @@ const FIXTURE_ROOT = new URL(
 const CAPABILITY_PATH = new URL(
   "../../../tests/e2e/capabilities.json",
   import.meta.url,
-);
-const REPOSITORY_ROOT = resolve(
-  new URL("../../..", import.meta.url).pathname,
 );
 const REPOSITORY = {
   name: "sbalswa/oculix",
@@ -839,6 +839,9 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
     await git("init", "--quiet");
     await git("config", "user.name", "Oculix RC test");
     await git("config", "user.email", "oculix-rc@example.invalid");
+    // Match repository policy and keep git archive byte-identical to the
+    // committed blob. With autocrlf=true, Windows git archive emits CRLF.
+    await git("config", "core.autocrlf", "false");
     await writeFile(trackedPath, "claimed revision\n");
     await writeFile(
       misePath,
