@@ -317,7 +317,9 @@ maintenance leaves the existing issue state unchanged.
 ## Development
 
 Prerequisite: install [mise](https://mise.jdx.dev/installing-mise.html) once per
-development environment.
+development environment. See [CONTRIBUTING.md](CONTRIBUTING.md) for commit
+policy, optional review tooling, and mise troubleshooting. Agent-facing
+conventions live in [AGENTS.md](AGENTS.md).
 
 After cloning:
 
