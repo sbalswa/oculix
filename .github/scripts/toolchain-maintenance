@@ -1002,6 +1002,7 @@ prepare_extras_oculix() {
   local bottom_pr="${BOTTOM_PR:-}"
   local branch digest existing_sha expected_diff
   local pr body head_sha current_oculix
+  local java_lock_log java_lock_status java_lock_root
 
   checkout_base "$base"
   if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
@@ -1025,7 +1026,50 @@ prepare_extras_oculix() {
     update_oculix_pin "$current_oculix" "$extras_oculix_candidate"
   fi
   if [[ -n "$extras_java_candidate" ]]; then
-    refresh_oculix_lock --bump-java
+    # Dry-run bump can propose a point release whose platform metadata is
+    # incomplete (e.g. no windows-x64). Capture mise output so a skipped
+    # incomplete candidate does not leak WARN lines into `checked` (which
+    # treats warnings as failures and opens triage).
+    java_lock_root="${RUNNER_TEMP:-${HOME}/tmp}"
+    mkdir -p "$java_lock_root"
+    java_lock_log="$(mktemp "${java_lock_root}/java-lock.XXXXXX")"
+    set +e
+    refresh_oculix_lock --bump-java >"$java_lock_log" 2>&1
+    java_lock_status=$?
+    set -e
+    if ((java_lock_status == 0)); then
+      cat "$java_lock_log"
+      rm -f "$java_lock_log"
+    elif grep -Eq \
+      'no metadata found for version|refusing to replace locked version' \
+      "$java_lock_log"; then
+      printf \
+        'Skipping Java candidate %s: cannot lock all platforms.\n' \
+        "$extras_java_candidate"
+      rm -f "$java_lock_log"
+      extras_java_candidate=""
+      extras_oculix_summary="$(
+        printf '%s\n' "$extras_oculix_summary" |
+          grep -v '^java ' || true
+      )"
+      extras_oculix_summary="${extras_oculix_summary%$'\n'}"
+      git checkout -- "${oculix_lock_path}"
+      if [[ -z "$extras_oculix_summary" ]]; then
+        git checkout -- "${oculix_config_path}"
+        set_output changed false
+        set_output base_branch "$base"
+        set_output base_sha "$base_sha"
+        set_output branch ""
+        set_output head_sha ""
+        set_output pr_number ""
+        return
+      fi
+      refresh_oculix_lock
+    else
+      cat "$java_lock_log" >&2
+      rm -f "$java_lock_log"
+      return "$java_lock_status"
+    fi
   else
     refresh_oculix_lock
   fi
