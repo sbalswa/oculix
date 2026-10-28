@@ -879,9 +879,11 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
         workspace.mise_environment.MISE_TRUSTED_CONFIG_PATHS,
         workspace.path,
       );
+      // --json avoids shell-specific export syntax (bash KEY=val vs
+      // PowerShell ${Env:KEY}='val') that mise env defaults to on Windows.
       const miseEnvironment = await execFile(
         "mise",
-        ["-C", workspace.path, "env"],
+        ["-C", workspace.path, "env", "--json"],
         {
           env: {
             ...process.env,
@@ -890,14 +892,8 @@ test("ephemeral workspaces archive the exact clean Git revision", async (context
           },
         },
       );
-      assert.match(
-        miseEnvironment.stdout,
-        /ARCHIVED_REVISION=claimed/u,
-      );
-      assert.doesNotMatch(
-        miseEnvironment.stdout,
-        /ARCHIVED_REVISION=newer/u,
-      );
+      const archivedEnv = JSON.parse(miseEnvironment.stdout);
+      assert.equal(archivedEnv.ARCHIVED_REVISION, "claimed");
     } finally {
       await workspace.dispose();
     }
