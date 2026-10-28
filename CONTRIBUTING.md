@@ -39,8 +39,7 @@ Then `/brooks-review`, `/brooks-audit`, `/brooks-debt`, `/brooks-test`,
 
 To turn a live scan into burn-down issues (propose only; human approves each
 action), run `/brooks-triage` with a mode or `all`. See
-[`.claude/commands/brooks-triage.md`](.claude/commands/brooks-triage.md) and
-#91.
+[`.claude/commands/brooks-triage.md`](.claude/commands/brooks-triage.md).
 
 ## Troubleshooting
 
