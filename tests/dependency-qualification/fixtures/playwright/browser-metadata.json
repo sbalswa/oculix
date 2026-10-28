@@ -1,0 +1,22 @@
+{
+  "1.64.1": {
+    "browsers": [
+      {
+        "name": "chromium",
+        "revision": "1194",
+        "browserVersion": "141.0.7390.0",
+        "installByDefault": true
+      }
+    ]
+  },
+  "1.65.0": {
+    "browsers": [
+      {
+        "name": "chromium",
+        "revision": "1200",
+        "browserVersion": "142.0.7400.0",
+        "installByDefault": true
+      }
+    ]
+  }
+}
