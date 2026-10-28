@@ -1426,6 +1426,20 @@ export async function createEphemeralOculixWorkspace({
     await runCommand({
       command: "git",
       args: [
+        // `git archive` applies the effective end-of-line attributes, so the
+        // archive stops being the exact revision on any host that rewrites them.
+        // Two independent settings do that, and both are covered by tests:
+        //   core.autocrlf=true  -- set system-wide on GitHub's windows-latest
+        //   core.eol=crlf       -- applies when the source marks files as text
+        //                          without pinning `eol` itself
+        // Pinned here rather than relied upon from the source repository's
+        // .gitattributes, because qualification digests and the before/after byte
+        // comparison in applyOculixCandidate must not depend on the config of
+        // whatever machine happens to run them.
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
         "archive",
         "--format=tar",
         `--output=${archivePath}`,

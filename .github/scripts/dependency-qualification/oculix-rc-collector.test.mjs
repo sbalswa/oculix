@@ -826,6 +826,86 @@ test("generated lock evidence must be structural and exact", async (context) => 
   }
 });
 
+test("ephemeral workspaces archive bytes unchanged under core.autocrlf", async () => {
+  // GitHub's windows-latest runners set core.autocrlf=true system-wide, which Git
+  // treats as text=auto plus core.eol=crlf. `git archive` honours those effective
+  // attributes, so a source repository that does not pin `eol` itself gets LF
+  // rewritten to CRLF on export — and the archive is then not the exact revision.
+  // Setting the config locally reproduces that on every platform; without it this
+  // regression is invisible outside Windows.
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-crlf-"));
+  const sourcePath = join(temporaryRoot, "source");
+  const trackedPath = join(sourcePath, "tracked.txt");
+  async function git(...args) {
+    return execFile("git", args, { cwd: sourcePath });
+  }
+  try {
+    await mkdir(sourcePath);
+    await git("init", "--quiet");
+    await git("config", "user.name", "Oculix RC test");
+    await git("config", "user.email", "oculix-rc@example.invalid");
+    await git("config", "core.autocrlf", "true");
+    await writeFile(trackedPath, "claimed revision\n");
+    await git("add", "tracked.txt");
+    await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "first");
+    const revision = (await git("rev-parse", "HEAD")).stdout.trim();
+
+    const workspace = await createEphemeralOculixWorkspace({
+      repositoryRoot: sourcePath,
+      revision,
+    });
+    try {
+      assert.equal(
+        await readFile(join(workspace.path, "tracked.txt"), "utf8"),
+        "claimed revision\n",
+      );
+    } finally {
+      await workspace.dispose();
+    }
+  } finally {
+    await rm(temporaryRoot, { force: true, recursive: true });
+  }
+});
+
+test("ephemeral workspaces archive bytes unchanged under core.eol", async () => {
+  // A source repository that marks files as text without pinning `eol` leaves the
+  // line ending to core.eol. This repository pins `eol=lf` in .gitattributes, but a
+  // qualification target need not, so the archive must not inherit the host setting.
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-eol-"));
+  const sourcePath = join(temporaryRoot, "source");
+  const trackedPath = join(sourcePath, "tracked.txt");
+  async function git(...args) {
+    return execFile("git", args, { cwd: sourcePath });
+  }
+  try {
+    await mkdir(sourcePath);
+    await git("init", "--quiet");
+    await git("config", "user.name", "Oculix RC test");
+    await git("config", "user.email", "oculix-rc@example.invalid");
+    await git("config", "core.eol", "crlf");
+    await writeFile(join(sourcePath, ".gitattributes"), "* text=auto\n");
+    await writeFile(trackedPath, "claimed revision\n");
+    await git("add", ".gitattributes", "tracked.txt");
+    await git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "first");
+    const revision = (await git("rev-parse", "HEAD")).stdout.trim();
+
+    const workspace = await createEphemeralOculixWorkspace({
+      repositoryRoot: sourcePath,
+      revision,
+    });
+    try {
+      assert.equal(
+        await readFile(join(workspace.path, "tracked.txt"), "utf8"),
+        "claimed revision\n",
+      );
+    } finally {
+      await workspace.dispose();
+    }
+  } finally {
+    await rm(temporaryRoot, { force: true, recursive: true });
+  }
+});
+
 test("ephemeral workspaces archive the exact clean Git revision", async (context) => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "oculix-rc-source-"));
   const sourcePath = join(temporaryRoot, "source");
