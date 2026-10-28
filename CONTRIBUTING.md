@@ -37,6 +37,10 @@ your own Claude Code session — no API key, nothing to configure:
 Then `/brooks-review`, `/brooks-audit`, `/brooks-debt`, `/brooks-test`,
 `/brooks-health`, or `/brooks-sweep`.
 
+To turn a live scan into burn-down issues (propose only; human approves each
+action), run `/brooks-triage` with a mode or `all`. See
+[`.claude/commands/brooks-triage.md`](.claude/commands/brooks-triage.md).
+
 ## Troubleshooting
 
 ### `mise install --locked` reports tools this repo does not use
